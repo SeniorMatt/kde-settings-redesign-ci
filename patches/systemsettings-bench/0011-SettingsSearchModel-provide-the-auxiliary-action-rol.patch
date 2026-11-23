@@ -1,7 +1,7 @@
 From b5d3438366fd769e95f05b5ff11137b6eb841648 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 09:03:41 +0500
-Subject: [PATCH 11/34] SettingsSearchModel: provide the auxiliary action role
+Subject: [PATCH 11/35] SettingsSearchModel: provide the auxiliary action role
  the delegate requires
 
 Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>

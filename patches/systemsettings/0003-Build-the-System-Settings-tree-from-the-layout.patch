@@ -1,7 +1,7 @@
 From f66fdab6ff75915a9e89537079a1366285f47bb1 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 08:15:50 +0500
-Subject: [PATCH 03/22] Build the System Settings tree from the layout
+Subject: [PATCH 03/23] Build the System Settings tree from the layout
 
 Groups, categories and pages come from settingslayout_p.h in layout order.
 Pages the layout does not list are placed through its fallback table, so

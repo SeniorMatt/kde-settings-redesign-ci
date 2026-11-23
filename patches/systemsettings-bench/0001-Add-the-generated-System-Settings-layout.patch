@@ -1,7 +1,7 @@
 From 74b15d78691238f4cf4224fbb2640002545d99f1 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 08:15:50 +0500
-Subject: [PATCH 01/34] Add the generated System Settings layout
+Subject: [PATCH 01/35] Add the generated System Settings layout
 
 Generated from ia/layout.json by scripts/gen_layout.py. Also extract the
 strings of headers, since the layout is a constexpr table of kli18nc().

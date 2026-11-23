@@ -1,7 +1,7 @@
 From 92f33f4c43c5c7eab6702e1ae1b0e159b6ac2032 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 18:07:17 +0500
-Subject: [PATCH 30/34] Preload: build fix (qualify SettingsLayout names);
+Subject: [PATCH 30/35] Preload: build fix (qualify SettingsLayout names);
  preload lists generated from ia/layout.json; layout and search index
  regenerated for the reworked pages' new labels
 

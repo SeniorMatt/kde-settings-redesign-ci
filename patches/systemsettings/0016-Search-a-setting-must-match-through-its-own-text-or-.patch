@@ -1,7 +1,7 @@
 From 0aaff79a35950602a1d86115487d3535e7efbfa6 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 09:10:49 +0500
-Subject: [PATCH 16/22] Search: a setting must match through its own text or
+Subject: [PATCH 16/23] Search: a setting must match through its own text or
  section, not its page's keywords
 
 Every setting of the Mouse page matched "mouse pointer speed" because the words

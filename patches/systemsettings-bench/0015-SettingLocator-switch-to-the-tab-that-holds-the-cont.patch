@@ -1,7 +1,7 @@
 From 2edbbb933dc0dc0f23a7370467db4e442b17ffb6 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 09:07:19 +0500
-Subject: [PATCH 15/34] SettingLocator: switch to the tab that holds the
+Subject: [PATCH 15/35] SettingLocator: switch to the tab that holds the
  control
 
 Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>

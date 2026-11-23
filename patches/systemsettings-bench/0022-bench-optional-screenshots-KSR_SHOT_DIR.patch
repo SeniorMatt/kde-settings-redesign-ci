@@ -1,7 +1,7 @@
 From b5af8bdf9ebac5565e92757bc12b5440eab31b06 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 08:00:14 +0500
-Subject: [PATCH 22/34] bench: optional screenshots (KSR_SHOT_DIR)
+Subject: [PATCH 22/35] bench: optional screenshots (KSR_SHOT_DIR)
 
 ---
  app/SidebarMode.cpp | 10 ++++++++++

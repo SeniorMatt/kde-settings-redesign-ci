@@ -1,7 +1,7 @@
 From ccdf36418af79edde3e0dafed74cc6460d0235cd Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 08:21:23 +0500
-Subject: [PATCH 05/22] System Settings: accordion sidebar, page cache, search
+Subject: [PATCH 05/23] System Settings: accordion sidebar, page cache, search
  with breadcrumbs
 
 The sidebar is one column. SidebarModel flattens group headers, categories

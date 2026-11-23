@@ -1,7 +1,7 @@
 From 65a136cdc3ba4f2481416478d094cc5861333528 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 09:04:46 +0500
-Subject: [PATCH 12/22] Search results and the sidebar share the roles their
+Subject: [PATCH 12/23] Search results and the sidebar share the roles their
  delegates need
 
 The list switches between the two models and their delegates one after the

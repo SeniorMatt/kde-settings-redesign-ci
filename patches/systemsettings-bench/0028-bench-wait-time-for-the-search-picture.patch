@@ -1,7 +1,7 @@
 From 376a1642c3850116a540375020aaea4ed35c4da4 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 09:03:41 +0500
-Subject: [PATCH 28/34] bench: wait time for the search picture
+Subject: [PATCH 28/35] bench: wait time for the search picture
 
 ---
  app/SidebarMode.cpp | 2 +-

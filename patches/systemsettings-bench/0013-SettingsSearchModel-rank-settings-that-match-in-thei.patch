@@ -1,7 +1,7 @@
 From c118ff18225df8076eaa8b33ccc4531c240e14f6 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 09:05:18 +0500
-Subject: [PATCH 13/34] SettingsSearchModel: rank settings that match in their
+Subject: [PATCH 13/35] SettingsSearchModel: rank settings that match in their
  own text above those that only match by page
 
 Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>

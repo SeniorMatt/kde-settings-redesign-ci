@@ -1,7 +1,7 @@
 From aa99debd426bea3d28e5568f2a5dd0d2aeb4c77d Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sun, 22 Nov 2026 01:36:17 +0500
-Subject: [PATCH 21/22] Regenerate layout and search index (batch 6 aliases and
+Subject: [PATCH 21/23] Regenerate layout and search index (batch 6 aliases and
  relabels)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

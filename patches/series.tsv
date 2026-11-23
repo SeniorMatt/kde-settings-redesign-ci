@@ -26,5 +26,5 @@ plymouth-kcm	plasma/plymouth-kcm	77e9c085e0e0b1c9e1cb906922a0180e6d352c5f	ksr-pa
 powerdevil	plasma/powerdevil	cc2603b1553b505aa9cc57a0bbde93a51796119e	ksr-pages	1
 print-manager	utilities/print-manager	b93c7236f298040f5fc2b5268b1927b3a751dc4e	ksr-pages	1
 sddm-kcm	plasma/sddm-kcm	9a8acbbc6ff1fa67dfd201d7dfd6ab73bdbfa6de	ksr-pages	2
-systemsettings	plasma/systemsettings	dc7d40dff7f0e7835899cb83ca7ed83a923aa0d8	ksr-shell	22
-systemsettings-bench	plasma/systemsettings	dc7d40dff7f0e7835899cb83ca7ed83a923aa0d8	ksr-shell-bench	34
+systemsettings	plasma/systemsettings	dc7d40dff7f0e7835899cb83ca7ed83a923aa0d8	ksr-shell	23
+systemsettings-bench	plasma/systemsettings	dc7d40dff7f0e7835899cb83ca7ed83a923aa0d8	ksr-shell-bench	35

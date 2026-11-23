@@ -1,7 +1,7 @@
 From 446c6b8e5434bc0586bd759926d8834cfc6d1206 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Mon, 23 Nov 2026 15:07:06 +0500
-Subject: [PATCH 33/34] bench: a preloaded page counts as on screen at its
+Subject: [PATCH 33/35] bench: a preloaded page counts as on screen at its
  first widget paint (no new scene-graph frame fires)
 
 KSR_BENCH_HOVER runs left frame_ms at -1 for pages the preloader had already rendered.

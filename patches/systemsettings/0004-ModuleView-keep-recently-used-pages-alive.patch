@@ -1,7 +1,7 @@
 From 54fd7bbce584d660b4c5ca06e1f25668a12db866 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 08:21:23 +0500
-Subject: [PATCH 04/22] ModuleView: keep recently used pages alive
+Subject: [PATCH 04/23] ModuleView: keep recently used pages alive
 
 An LRU of pages (setPageCacheSize()) so that returning to a page does not
 rebuild it. The least recently used page beyond the size is destroyed the

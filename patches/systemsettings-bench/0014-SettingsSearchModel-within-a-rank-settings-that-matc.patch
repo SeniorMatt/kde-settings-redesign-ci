@@ -1,7 +1,7 @@
 From 61407fa92532ead8c521383b31ccfe92d6585aab Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 09:05:44 +0500
-Subject: [PATCH 14/34] SettingsSearchModel: within a rank, settings that match
+Subject: [PATCH 14/35] SettingsSearchModel: within a rank, settings that match
  more words themselves come first
 
 Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>

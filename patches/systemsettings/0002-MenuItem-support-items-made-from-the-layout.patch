@@ -1,7 +1,7 @@
 From a62457d1607fc9a3ede23f5fb003bbfe4099a1a4 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 08:15:50 +0500
-Subject: [PATCH 02/22] MenuItem: support items made from the layout
+Subject: [PATCH 02/23] MenuItem: support items made from the layout
 
 Setters for synthetic categories, name and description overrides, extra
 keywords, breadcrumb and visibility in the sidebar and in search. The

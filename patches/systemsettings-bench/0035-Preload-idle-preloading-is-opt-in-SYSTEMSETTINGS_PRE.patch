@@ -1,0 +1,43 @@
+From 5f899acae91c6a286b8439c928cb7ab4e8c7c2d9 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 17:49:27 +0500
+Subject: [PATCH 35/35] Preload: idle preloading is opt-in
+ (SYSTEMSETTINGS_PRELOAD_IDLE=1); hover preloading stays on
+
+Bench 2026-11-23, 13 pages x 3 rounds, frame median fast/slow CPU: none 285/657 ms, idle 229/1004, hover 65/195.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ app/PagePreloader.cpp | 4 +++-
+ app/PagePreloader.h   | 2 +-
+ 2 files changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/app/PagePreloader.cpp b/app/PagePreloader.cpp
+index 79b4fbd..923500f 100644
+--- a/app/PagePreloader.cpp
++++ b/app/PagePreloader.cpp
+@@ -135,7 +135,9 @@ void PagePreloader::runHint()
+ 
+ void PagePreloader::startIdle()
+ {
+-    if (m_idleStarted || !qEnvironmentVariableIsEmpty("SYSTEMSETTINGS_PRELOAD_NOIDLE")) {
++    // off by default: the 2026-11-23 bench (build/bench/preload/) showed no gain on a fast CPU and slower pages on a
++    // throttled one (frame median 1004 vs 657 ms without), while hover preloading cut it to 195 ms
++    if (m_idleStarted || qEnvironmentVariableIntValue("SYSTEMSETTINGS_PRELOAD_IDLE") != 1) {
+         return;
+     }
+     m_idleStarted = true;
+diff --git a/app/PagePreloader.h b/app/PagePreloader.h
+index 1c36899..f9d192c 100644
+--- a/app/PagePreloader.h
++++ b/app/PagePreloader.h
+@@ -17,7 +17,7 @@ class ModuleView;
+  * @brief Builds pages before the user clicks them, so that the click only has to show a finished page.
+  *
+  * Signals, cheapest first: the pointer rests on a sidebar row, a row gets the keyboard focus, a search result is
+- * highlighted, and (when the app is idle after start) the targets of the common tasks of the Home page.
++ * highlighted, and (only with SYSTEMSETTINGS_PRELOAD_IDLE=1, when the app is idle after start) the targets of the common tasks of the Home page.
+  * One page at a time. A page is built in one go on the event loop (loading the plugin cannot be split), but only
+  * after the hint has been stable for hoverDelay and only while the user is not using the mouse or keyboard; any
+  * click or key press cancels what is waiting. The pages go into ModuleView's separate preload budget, so they never

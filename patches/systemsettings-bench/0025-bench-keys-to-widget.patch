@@ -1,7 +1,7 @@
 From 0aac5771515d6aebcf9d46764e52c2bb6c7a1706 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 08:34:38 +0500
-Subject: [PATCH 25/34] bench: keys to widget
+Subject: [PATCH 25/35] bench: keys to widget
 
 ---
  app/SidebarMode.cpp | 2 +-

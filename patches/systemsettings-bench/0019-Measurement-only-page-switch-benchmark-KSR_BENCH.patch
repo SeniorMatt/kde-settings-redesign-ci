@@ -1,7 +1,7 @@
 From 52ad8f1a4667355b3da72abcb3d7d0a006fd8e2e Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 07:58:23 +0500
-Subject: [PATCH 19/34] Measurement-only page-switch benchmark (KSR_BENCH)
+Subject: [PATCH 19/35] Measurement-only page-switch benchmark (KSR_BENCH)
 
 ---
  app/SidebarMode.cpp | 104 ++++++++++++++++++++++++++++++++++++++++++++

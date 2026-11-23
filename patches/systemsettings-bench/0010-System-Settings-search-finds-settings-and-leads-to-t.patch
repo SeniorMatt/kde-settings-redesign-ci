@@ -1,7 +1,7 @@
 From 6c9458debbc13a6d60ec15401b11b405eb6c2a02 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 08:59:49 +0500
-Subject: [PATCH 10/34] System Settings: search finds settings and leads to the
+Subject: [PATCH 10/35] System Settings: search finds settings and leads to the
  control
 
 The search field now also matches the settings inside pages. A result shows

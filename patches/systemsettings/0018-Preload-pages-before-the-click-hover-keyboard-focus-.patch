@@ -1,7 +1,7 @@
 From 47b83830b4f2d84ae8d2d732caf75448b7bd7f5d Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 13:26:40 +0500
-Subject: [PATCH 18/22] Preload pages before the click: hover, keyboard focus,
+Subject: [PATCH 18/23] Preload pages before the click: hover, keyboard focus,
  search results, idle common tasks (not built yet)
 
 Built into a separate preload budget of ModuleView, one at a time, cancelled by any input.

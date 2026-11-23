@@ -1,7 +1,7 @@
 From d099ab1f03282c82278e329a20cdce9fe5487872 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 08:56:34 +0500
-Subject: [PATCH 08/34] ModuleView: use the page name of the layout for the
+Subject: [PATCH 08/35] ModuleView: use the page name of the layout for the
  header and window caption
 
 The sidebar shows the name the layout gives a page (e.g. Displays), so the

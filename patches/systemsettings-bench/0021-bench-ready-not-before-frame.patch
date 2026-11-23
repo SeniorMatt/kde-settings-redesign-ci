@@ -1,7 +1,7 @@
 From c8ae3ac85508a34429f26573a9f3347d0217b664 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 07:59:20 +0500
-Subject: [PATCH 21/34] bench: ready not before frame
+Subject: [PATCH 21/35] bench: ready not before frame
 
 ---
  app/SidebarMode.cpp | 2 +-

@@ -1,7 +1,7 @@
 From f0fcb5de989340de22fecbcf9bcf448ddfc68442 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 08:53:34 +0500
-Subject: [PATCH 07/22] SettingsLayoutTree: read the old category files once
+Subject: [PATCH 07/23] SettingsLayoutTree: read the old category files once
  for unlisted pages
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

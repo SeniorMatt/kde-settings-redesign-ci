@@ -1,7 +1,7 @@
 From 48af53b2de267d489ebf377b298e3c8b16ad688a Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 09:00:31 +0500
-Subject: [PATCH 27/34] bench: open a given search result
+Subject: [PATCH 27/35] bench: open a given search result
 
 ---
  app/SidebarMode.cpp | 4 ++--

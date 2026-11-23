@@ -1,7 +1,7 @@
 From f0a262e2ee7de85782acb921081052109f54a0d8 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 08:39:17 +0500
-Subject: [PATCH 06/34] ModuleView: re-read a cached page's settings when it is
+Subject: [PATCH 06/35] ModuleView: re-read a cached page's settings when it is
  shown again
 
 Another page, an applet or an app may have changed them meanwhile. The page is shown first and reloaded right after,

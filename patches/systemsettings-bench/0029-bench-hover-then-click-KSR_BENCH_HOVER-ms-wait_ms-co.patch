@@ -1,7 +1,7 @@
 From 8cc18e51f2394dc3186de8810f8d17f18e8c771d Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 13:30:31 +0500
-Subject: [PATCH 29/34] bench: hover-then-click (KSR_BENCH_HOVER=ms), wait_ms
+Subject: [PATCH 29/35] bench: hover-then-click (KSR_BENCH_HOVER=ms), wait_ms
  column (not built yet)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

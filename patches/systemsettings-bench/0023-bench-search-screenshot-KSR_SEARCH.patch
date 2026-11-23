@@ -1,7 +1,7 @@
 From 657d96e44210c88b55ef2b36c3e216889230a6f8 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 08:21:46 +0500
-Subject: [PATCH 23/34] bench: search screenshot (KSR_SEARCH)
+Subject: [PATCH 23/35] bench: search screenshot (KSR_SEARCH)
 
 ---
  app/SidebarMode.cpp        | 22 ++++++++++++++++++++++

@@ -1,7 +1,7 @@
 From 5f09ec5eb8bfb5be01c91b97b1b93bf670237e16 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Mon, 23 Nov 2026 16:01:05 +0500
-Subject: [PATCH 34/34] Also list the KCMs in plasma/kcms/desktop
+Subject: [PATCH 34/35] Also list the KCMs in plasma/kcms/desktop
  (kcm_krunnersettings), which the layout places as Search Box Behavior
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
