@@ -1,0 +1,48 @@
+From b5d3438366fd769e95f05b5ff11137b6eb841648 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 09:03:41 +0500
+Subject: [PATCH 11/22] SettingsSearchModel: provide the auxiliary action role
+ the delegate requires
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ app/SettingsSearchModel.cpp | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/app/SettingsSearchModel.cpp b/app/SettingsSearchModel.cpp
+index 2a603b0..c8bb14e 100644
+--- a/app/SettingsSearchModel.cpp
++++ b/app/SettingsSearchModel.cpp
+@@ -10,9 +10,11 @@
+ #include "MenuModel.h"
+ #include "settingsindex_p.h"
+ 
++#include <KCModuleData>
+ #include <KLocalizedString>
+ #include <KPluginMetaData>
+ 
++#include <QAction>
+ #include <QChar>
+ #include <QHash>
+ #include <QRegularExpression>
+@@ -188,6 +190,7 @@ QHash<int, QByteArray> SettingsSearchModel::roleNames() const
+     names[MenuModel::DefaultIndicatorRole] = "showDefaultIndicator";
+     names[MenuModel::IconNameRole] = "iconName";
+     names[MenuModel::BreadcrumbRole] = "breadcrumb";
++    names[MenuModel::AuxiliaryActionRole] = "auxiliaryAction";
+     names[MenuModel::DescriptionRole] = "description";
+     names[ResultKindRole] = "resultKind";
+     return names;
+@@ -233,6 +236,11 @@ QVariant SettingsSearchModel::data(const QModelIndex &index, int role) const
+         return true;
+     case MenuModel::DefaultIndicatorRole:
+         return item->showDefaultIndicator();
++    case MenuModel::AuxiliaryActionRole:
++        if (!isSetting && item->moduleData()) {
++            return QVariant::fromValue(item->moduleData()->auxiliaryAction());
++        }
++        return {};
+     case ResultKindRole:
+         return result.kind;
+     default:

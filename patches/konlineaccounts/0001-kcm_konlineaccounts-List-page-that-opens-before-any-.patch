@@ -1,0 +1,568 @@
+From f505fe0ed548b0ed2b87c6f2670b0ef57b7ad924 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 14:28:21 +0500
+Subject: [PATCH] kcm_konlineaccounts: List page that opens before any D-Bus
+ call is answered
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Page type: List (docs/page-design.md): account list, "Add Account…" page action, per-account sub-page. Stored
+settings, D-Bus API and the account setup flow are unchanged.
+
+Moved / renamed:
+- Empty state "No accounts configured" now has an "Add Account…" button (kcm_konlineaccounts/AccountList,
+  kcm_konlineaccounts/AddAccount). The empty/"service not running" messages wait for the first reply, so
+  they do not flash while loading; a spinner shows only after 150 ms.
+- The Create Account dialog (kcm_konlineaccounts/createBuilder) is built by a Loader only when opened (button,
+  or the "add" launch argument). It referenced main.qml's id addAccountDialog to close itself; now uses its own root.
+- The account page gets the name from the row (accountName), the blocking lookup is only a fallback.
+- Markers only (no label change) for Finish, OK, SuggestedApp, AddAccount so --strict can prove them.
+- inventory/relabel/kcm_konlineaccounts.tsv (outer repo); 8 rows, 0 lost with --strict.
+
+Speed cause (read from code, kcm/kcm.cpp + kcm/accountsmodel.cpp):
+- serviceRunning() was a blocking isServiceRegistered() call evaluated by QML bindings on the first frame, and the
+  AccountsModel constructor did the same; now async NameHasOwner + QDBusServiceWatcher.
+- AccountsModel::data() made a blocking Properties.Get per role per row (name, types, icon: 3 calls/account, and a
+  missing service means a D-Bus timeout per call). Now one async GetAll per account, cached, with dataChanged on reply.
+- removeAccount() is async too.
+- AddAccountDialog (provider plugin enumeration in AvailableAccountsModel) was created with the page.
+After: pending, manager will measure.
+
+HIG: HIG-001, HIG-005, HIG-006, HIG-020 (empty state with action).
+
+Not built yet. Things to check at build: QDBusPendingReply<QVariantMap> from GetAll gives the "types" entry as QStringList
+(the old Get call relied on the same unwrapping); model rows now show empty text until the reply arrives; reply order
+for "service not running" relies on the KCM's NameHasOwner call being sent before the model's (same connection).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcm/accountsmodel.cpp       | 157 ++++++++++++++++++++++--------------
+ kcm/accountsmodel.h         |  22 +++++
+ kcm/kcm.cpp                 |  29 ++++++-
+ kcm/kcm.h                   |   4 +
+ kcm/ui/Account.qml          |   8 +-
+ kcm/ui/AddAccountDialog.qml |   4 +-
+ kcm/ui/App.qml              |   2 +
+ kcm/ui/Error.qml            |   1 +
+ kcm/ui/main.qml             |  53 +++++++++---
+ 9 files changed, 205 insertions(+), 75 deletions(-)
+
+diff --git a/kcm/accountsmodel.cpp b/kcm/accountsmodel.cpp
+index acd53c6..e970e09 100644
+--- a/kcm/accountsmodel.cpp
++++ b/kcm/accountsmodel.cpp
+@@ -13,6 +13,8 @@
+ #include <QDBusConnection>
+ #include <QDBusConnectionInterface>
+ #include <QDBusMessage>
++#include <QDBusPendingCallWatcher>
++#include <QDBusPendingReply>
+ #include <QDBusReply>
+ 
+ #include "debug.h"
+@@ -24,9 +26,23 @@ AccountsModel::AccountsModel(QObject *parent)
+ {
+     m_config = KSharedConfig::openConfig(u"konlineaccountsrc"_s);
+ 
+-    if (QDBusConnection::sessionBus().interface()->isServiceRegistered(u"org.kde.KOnlineAccounts"_s)) {
+-        m_accountIds = m_config->group(u"Accounts"_s).readEntry("accounts", QStringList());
+-    }
++    // Ask the bus daemon asynchronously whether the service runs; the list stays empty until the reply arrives
++    // so the page can be shown first (the old code made a blocking call here).
++    QDBusMessage nameHasOwner = QDBusMessage::createMethodCall(u"org.freedesktop.DBus"_s,
++                                                               u"/org/freedesktop/DBus"_s,
++                                                               u"org.freedesktop.DBus"_s,
++                                                               u"NameHasOwner"_s);
++    nameHasOwner.setArguments({u"org.kde.KOnlineAccounts"_s});
++    auto ownerWatcher = new QDBusPendingCallWatcher(QDBusConnection::sessionBus().asyncCall(nameHasOwner), this);
++    connect(ownerWatcher, &QDBusPendingCallWatcher::finished, this, [this](QDBusPendingCallWatcher *w) {
++        QDBusPendingReply<bool> reply = *w;
++        w->deleteLater();
++        if (reply.isValid() && reply.value()) {
++            loadIds();
++        }
++        m_ready = true;
++        Q_EMIT readyChanged();
++    });
+ 
+     bool ret = QDBusConnection::sessionBus().connect(u"org.kde.private.KOnlineAccounts"_s,
+                                                      u"/org/kde/KOnlineAccounts/private"_s,
+@@ -50,64 +66,84 @@ int AccountsModel::rowCount(const QModelIndex & /*parent*/) const
+     return m_accountIds.count();
+ }
+ 
+-QVariant AccountsModel::data(const QModelIndex &index, int role) const
++bool AccountsModel::ready() const
+ {
+-    const QString id = m_accountIds[index.row()];
+-
+-    KConfigGroup accountGroup = m_config->group(u"Accounts"_s).group(id);
+-
+-    switch (static_cast<Roles>(role)) {
+-    case NameRole: {
+-        QDBusMessage msg = QDBusMessage::createMethodCall(u"org.kde.KOnlineAccounts"_s,
+-                                                          u"/org/kde/KOnlineAccounts/Accounts/" + id,
+-                                                          u"org.freedesktop.DBus.Properties"_s,
+-                                                          u"Get"_s);
+-        msg.setArguments({u"org.kde.KOnlineAccounts.Account"_s, u"displayName"_s});
++    return m_ready;
++}
+ 
+-        QDBusReply<QVariant> reply = QDBusConnection::sessionBus().call(msg);
++void AccountsModel::reload()
++{
++    loadIds();
++}
+ 
+-        if (!reply.isValid()) {
+-            qCWarning(LOG_KONLINEACCOUNTS_KCM) << "Error reading account name" << reply.error().message();
+-            return {};
+-        }
++void AccountsModel::loadIds()
++{
++    beginResetModel();
++    m_config->reparseConfiguration();
++    m_accountIds = m_config->group(u"Accounts"_s).readEntry("accounts", QStringList());
++    m_info.clear();
++    endResetModel();
++}
+ 
+-        return reply.value().toString();
+-    }
+-    case IdRole: {
+-        return id;
++void AccountsModel::requestInfo(const QString &id) const
++{
++    AccountInfo &info = m_info[id];
++    if (info.requested) {
++        return;
+     }
+-    case TypesRole: {
+-        QDBusMessage msg = QDBusMessage::createMethodCall(u"org.kde.KOnlineAccounts"_s,
+-                                                          u"/org/kde/KOnlineAccounts/Accounts/" + id,
+-                                                          u"org.freedesktop.DBus.Properties"_s,
+-                                                          u"Get"_s);
+-        msg.setArguments({u"org.kde.KOnlineAccounts.Account"_s, u"types"_s});
+-
+-        QDBusReply<QVariant> reply = QDBusConnection::sessionBus().call(msg);
+-
++    info.requested = true;
++
++    QDBusMessage msg = QDBusMessage::createMethodCall(u"org.kde.KOnlineAccounts"_s,
++                                                      u"/org/kde/KOnlineAccounts/Accounts/" + id,
++                                                      u"org.freedesktop.DBus.Properties"_s,
++                                                      u"GetAll"_s);
++    msg.setArguments({u"org.kde.KOnlineAccounts.Account"_s});
++
++    auto watcher = new QDBusPendingCallWatcher(QDBusConnection::sessionBus().asyncCall(msg));
++    QObject::connect(watcher, &QDBusPendingCallWatcher::finished, this, [this, id](QDBusPendingCallWatcher *w) {
++        QDBusPendingReply<QVariantMap> reply = *w;
++        w->deleteLater();
+         if (!reply.isValid()) {
+-            qCWarning(LOG_KONLINEACCOUNTS_KCM) << "Error reading account type" << reply.error().message();
+-            return {};
++            qCWarning(LOG_KONLINEACCOUNTS_KCM) << "Error reading account properties" << reply.error().message();
++            return;
+         }
++        const QVariantMap props = reply.value();
++        AccountInfo &info = m_info[id];
++        info.name = props.value(u"displayName"_s).toString();
++        info.iconName = props.value(u"icon"_s).toString();
++        info.types = props.value(u"types"_s).toStringList();
++
++        const int row = m_accountIds.indexOf(id);
++        if (row >= 0) {
++            Q_EMIT const_cast<AccountsModel *>(this)->dataChanged(index(row), index(row));
++        }
++    });
++}
+ 
+-        return reply.value().toStringList();
++QVariant AccountsModel::data(const QModelIndex &index, int role) const
++{
++    if (!index.isValid() || index.row() >= m_accountIds.size()) {
++        return {};
+     }
+-    case IconNameRole: {
+-        QDBusMessage msg = QDBusMessage::createMethodCall(u"org.kde.KOnlineAccounts"_s,
+-                                                          u"/org/kde/KOnlineAccounts/Accounts/" + id,
+-                                                          u"org.freedesktop.DBus.Properties"_s,
+-                                                          u"Get"_s);
+-        msg.setArguments({u"org.kde.KOnlineAccounts.Account"_s, u"icon"_s});
++    const QString id = m_accountIds[index.row()];
+ 
+-        QDBusReply<QVariant> reply = QDBusConnection::sessionBus().call(msg);
++    if (static_cast<Roles>(role) == IdRole) {
++        return id;
++    }
+ 
+-        if (!reply.isValid()) {
+-            qCWarning(LOG_KONLINEACCOUNTS_KCM) << "Error reading account icon" << reply.error().message();
+-            return {};
+-        }
++    // Name, types and icon come from the service over D-Bus: asked once, asynchronously, per account.
++    requestInfo(id);
++    const AccountInfo &info = m_info[id];
+ 
+-        return reply.value().toString();
+-    }
++    switch (static_cast<Roles>(role)) {
++    case NameRole:
++        return info.name;
++    case TypesRole:
++        return info.types;
++    case IconNameRole:
++        return info.iconName;
++    default:
++        break;
+     }
+     return {};
+ }
+@@ -120,11 +156,14 @@ void AccountsModel::removeAccount(const QString &id)
+                                                       u"removeAccount"_s);
+     msg.setArguments({id});
+ 
+-    QDBusReply<void> reply = QDBusConnection::sessionBus().call(msg);
+-
+-    if (!reply.isValid()) {
+-        qCWarning(LOG_KONLINEACCOUNTS_KCM) << "Error removing account" << reply.error().message();
+-    }
++    auto watcher = new QDBusPendingCallWatcher(QDBusConnection::sessionBus().asyncCall(msg), this);
++    connect(watcher, &QDBusPendingCallWatcher::finished, this, [](QDBusPendingCallWatcher *w) {
++        QDBusPendingReply<void> reply = *w;
++        w->deleteLater();
++        if (!reply.isValid()) {
++            qCWarning(LOG_KONLINEACCOUNTS_KCM) << "Error removing account" << reply.error().message();
++        }
++    });
+ }
+ 
+ bool AccountsModel::hasAccount(const QString &id)
+@@ -135,19 +174,13 @@ bool AccountsModel::hasAccount(const QString &id)
+ void AccountsModel::slotAccountAdded(const QString &id)
+ {
+     qCDebug(LOG_KONLINEACCOUNTS_KCM) << "Account" << id << "was added";
+-    beginResetModel();
+-    m_config->reparseConfiguration();
+-    m_accountIds = m_config->group(u"Accounts"_s).readEntry("accounts", QStringList());
+-    endResetModel();
++    loadIds();
+ }
+ 
+ void AccountsModel::slotAccountRemoved(const QString &id)
+ {
+     qCDebug(LOG_KONLINEACCOUNTS_KCM) << "Account" << id << "was removed";
+-    beginResetModel();
+-    m_config->reparseConfiguration();
+-    m_accountIds = m_config->group(u"Accounts"_s).readEntry("accounts", QStringList());
+-    endResetModel();
++    loadIds();
+ }
+ 
+ QHash<int, QByteArray> AccountsModel::roleNames() const
+diff --git a/kcm/accountsmodel.h b/kcm/accountsmodel.h
+index aa97f4b..c145ee4 100644
+--- a/kcm/accountsmodel.h
++++ b/kcm/accountsmodel.h
+@@ -7,6 +7,8 @@
+ #pragma once
+ 
+ #include <QAbstractListModel>
++#include <QHash>
++#include <QStringList>
+ 
+ #include <KSharedConfig>
+ 
+@@ -17,6 +19,8 @@ class ACCOUNTS_EXPORT AccountsModel : public QAbstractListModel
+ {
+     Q_OBJECT
+     QML_ELEMENT
++    // false until the first asynchronous check of the service and the account list has finished
++    Q_PROPERTY(bool ready READ ready NOTIFY readyChanged)
+ 
+ public:
+     enum Roles {
+@@ -35,11 +39,29 @@ public:
+     Q_INVOKABLE void removeAccount(const QString &id);
+     Q_INVOKABLE bool hasAccount(const QString &id);
+ 
++    // Re-read the account list (used when the service appears after the page was opened)
++    Q_INVOKABLE void reload();
++
++    bool ready() const;
++    Q_SIGNAL void readyChanged();
++
+ public Q_SLOTS:
+     void slotAccountAdded(const QString &id);
+     void slotAccountRemoved(const QString &id);
+ 
+ private:
++    struct AccountInfo {
++        QString name;
++        QString iconName;
++        QStringList types;
++        bool requested = false;
++    };
++    void loadIds();
++    void requestInfo(const QString &id) const;
++
+     KSharedConfig::Ptr m_config;
+     QStringList m_accountIds;
++    // Properties of each account, filled by one asynchronous GetAll per account (never a blocking call in data())
++    mutable QHash<QString, AccountInfo> m_info;
++    bool m_ready = false;
+ };
+diff --git a/kcm/kcm.cpp b/kcm/kcm.cpp
+index 3084b63..4efaa67 100644
+--- a/kcm/kcm.cpp
++++ b/kcm/kcm.cpp
+@@ -9,6 +9,9 @@
+ #include <QDBusConnection>
+ #include <QDBusConnectionInterface>
+ #include <QDBusMessage>
++#include <QDBusPendingCallWatcher>
++#include <QDBusPendingReply>
++#include <QDBusServiceWatcher>
+ #include <QDBusReply>
+ #include <QDesktopServices>
+ #include <QNetworkAccessManager>
+@@ -50,6 +53,22 @@ AccountsSettings::AccountsSettings(QObject *parent, const KPluginMetaData &data,
+ 
+     setButtons(KQuickConfigModule::NoAdditionalButton);
+ 
++    auto serviceWatcher = new QDBusServiceWatcher(u"org.kde.KOnlineAccounts"_s, QDBusConnection::sessionBus(), QDBusServiceWatcher::WatchForOwnerChange, this);
++    connect(serviceWatcher, &QDBusServiceWatcher::serviceRegistered, this, [this] {
++        setServiceRunning(true);
++    });
++    connect(serviceWatcher, &QDBusServiceWatcher::serviceUnregistered, this, [this] {
++        setServiceRunning(false);
++    });
++    QDBusMessage nameHasOwner = QDBusMessage::createMethodCall(u"org.freedesktop.DBus"_s, u"/org/freedesktop/DBus"_s, u"org.freedesktop.DBus"_s, u"NameHasOwner"_s);
++    nameHasOwner.setArguments({u"org.kde.KOnlineAccounts"_s});
++    auto ownerWatcher = new QDBusPendingCallWatcher(QDBusConnection::sessionBus().asyncCall(nameHasOwner), this);
++    connect(ownerWatcher, &QDBusPendingCallWatcher::finished, this, [this](QDBusPendingCallWatcher *w) {
++        QDBusPendingReply<bool> reply = *w;
++        w->deleteLater();
++        setServiceRunning(reply.isValid() && reply.value());
++    });
++
+     connect(
+         this,
+         &KQuickConfigModule::mainUiReady,
+@@ -120,7 +139,15 @@ QString AccountsSettings::accountName(const QString &accountId)
+ 
+ bool AccountsSettings::serviceRunning() const
+ {
+-    return QDBusConnection::sessionBus().interface()->isServiceRegistered(u"org.kde.KOnlineAccounts"_s);
++    return m_serviceRunning;
++}
++
++void AccountsSettings::setServiceRunning(bool running)
++{
++    if (m_serviceRunning != running) {
++        m_serviceRunning = running;
++        Q_EMIT serviceRunningChanged();
++    }
+ }
+ 
+ #include "kcm.moc"
+diff --git a/kcm/kcm.h b/kcm/kcm.h
+index b480be2..4b9d2c1 100644
+--- a/kcm/kcm.h
++++ b/kcm/kcm.h
+@@ -7,6 +7,7 @@
+ #ifndef ACCOUNTSSETTINGS_H
+ #define ACCOUNTSSETTINGS_H
+ 
++#include <QDBusServiceWatcher>
+ #include <QObject>
+ #include <QQuickItem>
+ #include <QVariant>
+@@ -43,6 +44,9 @@ public:
+ private:
+     QStringList m_requestedTypes;
+     QString m_requestedAccount;
++    // Filled asynchronously (NameHasOwner + QDBusServiceWatcher) so opening the page never blocks on the bus
++    bool m_serviceRunning = false;
++    void setServiceRunning(bool running);
+ };
+ 
+ #endif // ACCOUNTSSETTINGS_H
+diff --git a/kcm/ui/Account.qml b/kcm/ui/Account.qml
+index cffbdaf..0138670 100644
+--- a/kcm/ui/Account.qml
++++ b/kcm/ui/Account.qml
+@@ -22,7 +22,13 @@ KCM.ScrollViewKCM {
+     required property string accountId
+     required property var accountsModel
+ 
+-    property string accountName: kcm.accountName(accountId)
++    // Passed by the list row; the (blocking) lookup is only a fallback for the "show account" launch argument
++    property string accountName: ""
++    Component.onCompleted: {
++        if (accountName === "") {
++            accountName = kcm.accountName(accountId);
++        }
++    }
+ 
+     title: accountName
+ 
+diff --git a/kcm/ui/AddAccountDialog.qml b/kcm/ui/AddAccountDialog.qml
+index dbddc66..00aa48c 100644
+--- a/kcm/ui/AddAccountDialog.qml
++++ b/kcm/ui/AddAccountDialog.qml
+@@ -94,7 +94,7 @@ Kirigami.Dialog {
+                             message: message
+                         });
+                         stack.currentItem.finished.connect(function () {
+-                            addAccountDialog.close();
++                            root.close();
+                         });
+                     });
+ 
+@@ -106,7 +106,7 @@ Kirigami.Dialog {
+                         });
+                         stack.currentItem.finished.connect(function () {
+                             kcm.finishSetup(accountDelegate, builder)
+-                            addAccountDialog.close();
++                            root.close();
+                         });
+                     });
+                 }
+diff --git a/kcm/ui/App.qml b/kcm/ui/App.qml
+index b3a2adc..01d3c44 100644
+--- a/kcm/ui/App.qml
++++ b/kcm/ui/App.qml
+@@ -25,6 +25,7 @@ ColumnLayout {
+     property list<string> apps
+ 
+     Controls.Label {
++        // ksr: kcm_konlineaccounts/SuggestedApp
+         text: i18nc("as in 'allow relevant apps to access your account'", "Give access to relevant apps:")
+         leftPadding: Kirigami.Units.largeSpacing
+     }
+@@ -71,6 +72,7 @@ ColumnLayout {
+     }
+ 
+     Controls.Button {
++        // ksr: kcm_konlineaccounts/Finish
+         text: i18nc("@action:button", "Finish")
+ 
+         Layout.alignment: Qt.AlignRight
+diff --git a/kcm/ui/Error.qml b/kcm/ui/Error.qml
+index caa3879..4c05b52 100644
+--- a/kcm/ui/Error.qml
++++ b/kcm/ui/Error.qml
+@@ -26,6 +26,7 @@ ColumnLayout {
+     }
+ 
+     Controls.Button {
++        // ksr: kcm_konlineaccounts/OK
+         text: i18nc("@action:button", "OK")
+ 
+         Layout.alignment: Qt.AlignRight
+diff --git a/kcm/ui/main.qml b/kcm/ui/main.qml
+index 644d3f6..e1dfbfb 100644
+--- a/kcm/ui/main.qml
++++ b/kcm/ui/main.qml
+@@ -23,15 +23,20 @@ KCM.ScrollViewKCM {
+ 
+     actions: [
+         Kirigami.Action {
++            // ksr: kcm_konlineaccounts/AddAccount
+             text: i18n("Add Account…")
+             icon.name: "list-add-symbolic"
+             enabled: kcm.serviceRunning
+-            onTriggered: {
+-                addAccountDialog.open();
+-            }
++            onTriggered: kaccountsRoot.openAddAccount()
+         }
+     ]
+ 
++    // The Create Account dialog (it enumerates every provider plugin) is only built when asked for
++    function openAddAccount() {
++        addAccountLoader.active = true;
++        addAccountLoader.item.open();
++    }
++
+     headerPaddingEnabled: false // Let the InlineMessage touch the edges
+     header: Kirigami.InlineMessage {
+         readonly property url bugReportURL: "https://invent.kde.org/system/konlineaccounts/-/work_items"
+@@ -58,14 +63,34 @@ KCM.ScrollViewKCM {
+             width: parent.width - Kirigami.Units.largeSpacing * 2
+             icon.name: "data-warning"
+             text: i18n("Online accounts service is not running")
+-            visible: !kcm.serviceRunning
++            visible: accModel.ready && !kcm.serviceRunning
+         }
+ 
+         Kirigami.PlaceholderMessage {
+             anchors.centerIn: parent
+             width: parent.width - Kirigami.Units.largeSpacing * 2
++            // ksr: kcm_konlineaccounts/AccountList
+             text: i18n("No accounts configured")
+-            visible: kcm.serviceRunning && accountsList.count === 0
++            visible: accModel.ready && kcm.serviceRunning && accountsList.count === 0
++            helpfulAction: Kirigami.Action {
++                text: i18n("Add Account…")
++                icon.name: "list-add-symbolic"
++                onTriggered: kaccountsRoot.openAddAccount()
++            }
++        }
++
++        // The account list is read after the first frame; a spinner shows only if that takes longer than 150 ms
++        Controls.BusyIndicator {
++            anchors.centerIn: parent
++            running: visible
++            visible: !accModel.ready && busyDelay.elapsed
++        }
++        Timer {
++            id: busyDelay
++            property bool elapsed: false
++            interval: 150
++            running: !accModel.ready
++            onTriggered: elapsed = true
+         }
+ 
+         delegate: Controls.ItemDelegate {
+@@ -83,6 +108,7 @@ KCM.ScrollViewKCM {
+             onClicked: kcm.push("Account.qml", {
+                 accountId: id,
+                 accountsModel: accModel,
++                accountName: name,
+             })
+         }
+     }
+@@ -92,7 +118,13 @@ KCM.ScrollViewKCM {
+ 
+         function onRequestedTypesChanged() {
+             if (kcm.requestedTypes.length > 0) {
+-                addAccountDialog.open();
++                kaccountsRoot.openAddAccount();
++            }
++        }
++
++        function onServiceRunningChanged() {
++            if (kcm.serviceRunning) {
++                accModel.reload();
+             }
+         }
+ 
+@@ -110,8 +142,11 @@ KCM.ScrollViewKCM {
+         }
+     }
+ 
+-    AddAccountDialog {
+-        id: addAccountDialog
+-        requestedTypes: kcm.requestedTypes
++    Loader {
++        id: addAccountLoader
++        active: false
++        sourceComponent: AddAccountDialog {
++            requestedTypes: kcm.requestedTypes
++        }
+     }
+ }

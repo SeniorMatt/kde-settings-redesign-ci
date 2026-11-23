@@ -1,0 +1,22 @@
+From c8ae3ac85508a34429f26573a9f3347d0217b664 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 07:59:20 +0500
+Subject: [PATCH 21/34] bench: ready not before frame
+
+---
+ app/SidebarMode.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/app/SidebarMode.cpp b/app/SidebarMode.cpp
+index 5f9bbef..0662049 100644
+--- a/app/SidebarMode.cpp
++++ b/app/SidebarMode.cpp
+@@ -997,7 +997,7 @@ void SidebarMode::ksrBench()
+             }
+             if (now - *last < 8 && *tFrame >= 0) {
+                 if (*quiet == 0) {
+-                    *quietStart = *last;
++                    *quietStart = qMax(*last, *tFrame);
+                 }
+                 ++*quiet;
+             } else {

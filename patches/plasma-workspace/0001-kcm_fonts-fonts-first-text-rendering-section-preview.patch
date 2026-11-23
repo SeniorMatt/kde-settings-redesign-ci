@@ -1,0 +1,291 @@
+From 0dd0c506c9833804628c6860384f547fd9aacee4 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 11:06:19 +0500
+Subject: [PATCH 01/24] kcm_fonts: fonts first, text rendering section,
+ previews only when asked
+
+Page type: Form (docs/page-design.md). Config keys, KConfigXT, D-Bus and behaviour unchanged.
+
+Moved / renamed:
+- The six font rows now open the page (General, Fixed width, Small, Toolbar, Menu, Window title).
+  "Adjust All Fonts..." moved below them into a "Change all:" row, next to a new "Adjust Global Scale..." button
+  (link to Display, which owns scale; kcm_fonts/AdjustGlobalScale). The header warning action still exists.
+- Untitled separator replaced by a section titled "Text rendering": Anti-aliasing ("Enable" -> "Smooth font edges"),
+  exclude range (indented under it, disabled not hidden), Sub-pixel rendering, Hinting.
+- Scale link uses KCMLauncher.openSystemSettings instead of open.
+- Buddies for combos, accessible names for the two spin boxes.
+- Relabel table: inventory/relabel/kcm_fonts.tsv (outer repo). 14 inventory rows kept.
+
+Speed cause: PreviewImageProvider builds a PreviewRenderEngine(true) per image, whose constructor calls
+FcInitReinitialize() (previewrenderengine.cpp), i.e. rescans all font directories, and the provider also writes
+and re-reads the fontconfig file twice per image (previewimageprovider.cpp). The sub-pixel and hinting combo
+delegates (9 images) requested these as soon as the page loaded, so on open the fontconfig rescan ran nine
+times while the GUI thread needed fontconfig to lay out the six font rows. Fix: each combo requests its previews
+only once its popup is first opened (aboutToShow), delegates have an empty source until then.
+Not changed: the QtWidgets KFontChooserDialog still loads QFontDatabase on first click.
+Numbers: before (0.5 CPU) in build/bench/clean/before-slow.tsv; after: pending, manager will measure.
+
+HIG: HIG-001, HIG-005, HIG-006, HIG-017, HIG-023, HIG-047, HIG-057, HIG-058, HIG-062.
+
+Not built yet (freeze).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/fonts/ui/main.qml | 102 +++++++++++++++++++++++++++++++++--------
+ 1 file changed, 82 insertions(+), 20 deletions(-)
+
+diff --git a/kcms/fonts/ui/main.qml b/kcms/fonts/ui/main.qml
+index 7ffa9ec..de02257 100644
+--- a/kcms/fonts/ui/main.qml
++++ b/kcms/fonts/ui/main.qml
+@@ -43,7 +43,7 @@ KCM.SimpleKCM {
+         visible: KAuthorized.authorizeControlModule("kcm_kscreen")
+         text: i18n("Adjust Global Scale…")
+         icon.name: "preferences-desktop-display"
+-        onTriggered: KCM.KCMLauncher.open("kcm_kscreen")
++        onTriggered: KCM.KCMLauncher.openSystemSettings("kcm_kscreen")
+     }
+ 
+     headerPaddingEnabled: false // Let the InlineMessages touch the edges
+@@ -130,23 +130,11 @@ KCM.SimpleKCM {
+         id: formLayout
+         readonly property int maxImplicitWidth: Math.max(adjustAllFontsButton.implicitWidth, excludeField.implicitWidth, subPixelCombo.implicitWidth, hintingCombo.implicitWidth)
+ 
+-        QtControls.Button {
+-            id: adjustAllFontsButton
+-            Layout.preferredWidth: formLayout.maxImplicitWidth
+-            icon.name: "font-select-symbolic"
+-            text: i18n("&Adjust All Fonts…")
+-
+-            onClicked: kcm.adjustAllFonts();
+-            enabled: !kcm.fontsSettings.isImmutable("font")
+-                    || !kcm.fontsSettings.isImmutable("fixed")
+-                    || !kcm.fontsSettings.isImmutable("smallestReadableFont")
+-                    || !kcm.fontsSettings.isImmutable("toolBarFont")
+-                    || !kcm.fontsSettings.isImmutable("menuFont")
+-                    || !kcm.fontsSettings.isImmutable("activeFont")
+-        }
+-
++        // The six fonts come first: they are what people open this page for (HIG-001, HIG-005).
++        // The first section has no title (docs/page-design.md 2.3).
+         FontWidget {
+             id: generalFontWidget
++            // ksr: kcm_fonts/font
+             label: i18n("General:")
+             tooltipText: i18n("Select general font")
+             category: "font"
+@@ -159,6 +147,7 @@ KCM.SimpleKCM {
+         }
+         FontWidget {
+             id: fixedWidthFontWidget
++            // ksr: kcm_fonts/fixed
+             label: i18n("Fixed width:")
+             tooltipText: i18n("Select fixed width font")
+             category: "fixed"
+@@ -171,6 +160,7 @@ KCM.SimpleKCM {
+         }
+         FontWidget {
+             id: smallFontWidget
++            // ksr: kcm_fonts/smallestReadableFont
+             label: i18n("Small:")
+             tooltipText: i18n("Select small font")
+             category: "smallestReadableFont"
+@@ -183,6 +173,7 @@ KCM.SimpleKCM {
+         }
+         FontWidget {
+             id: toolbarFontWidget
++            // ksr: kcm_fonts/toolBarFont
+             label: i18n("Toolbar:")
+             tooltipText: i18n("Select toolbar font")
+             category: "toolBarFont"
+@@ -195,6 +186,7 @@ KCM.SimpleKCM {
+         }
+         FontWidget {
+             id: menuFontWidget
++            // ksr: kcm_fonts/menuFont
+             label: i18n("Menu:")
+             tooltipText: i18n("Select menu font")
+             category: "menuFont"
+@@ -206,6 +198,7 @@ KCM.SimpleKCM {
+             }
+         }
+         FontWidget {
++            // ksr: kcm_fonts/activeFont
+             label: i18n("Window title:")
+             tooltipText: i18n("Select window title font")
+             category: "activeFont"
+@@ -217,17 +210,50 @@ KCM.SimpleKCM {
+             }
+         }
+ 
++        // Links out, at the end of the section (docs/page-design.md 2.4). Scale itself is owned by Display
++        // (ia/duplicates.md "Display Scale & Text Size"), so this is only a link.
++        RowLayout {
++            Kirigami.FormData.label: i18n("Change all:")
++            Kirigami.FormData.buddyFor: adjustAllFontsButton
++            spacing: Kirigami.Units.smallSpacing
++
++            QtControls.Button {
++                id: adjustAllFontsButton
++                // ksr: kcm_fonts/adjustAllFonts
++                icon.name: "font-select-symbolic"
++                text: i18n("&Adjust All Fonts…")
++
++                onClicked: kcm.adjustAllFonts();
++                enabled: !kcm.fontsSettings.isImmutable("font")
++                        || !kcm.fontsSettings.isImmutable("fixed")
++                        || !kcm.fontsSettings.isImmutable("smallestReadableFont")
++                        || !kcm.fontsSettings.isImmutable("toolBarFont")
++                        || !kcm.fontsSettings.isImmutable("menuFont")
++                        || !kcm.fontsSettings.isImmutable("activeFont")
++            }
++
++            QtControls.Button {
++                // ksr: kcm_fonts/AdjustGlobalScale
++                visible: kscreenAction.visible
++                icon.name: kscreenAction.icon.name
++                text: kscreenAction.text
++                onClicked: kscreenAction.trigger()
++            }
++        }
++
+         Kirigami.Separator {
+             Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18nc("@title:group Section title: how text is drawn on screen", "Text rendering")
+         }
+ 
+         RowLayout {
+-            Kirigami.FormData.label: i18n("Anti-Aliasing:")
++            Kirigami.FormData.label: i18n("Anti-aliasing:")
+             QtControls.CheckBox {
+                 id: antiAliasingCheckBox
++                // ksr: kcm_fonts/antiAliasing
+                 checked: kcm.fontsAASettings.antiAliasing
+                 onToggled: kcm.fontsAASettings.antiAliasing = checked
+-                text: i18n("Enable")
++                text: i18nc("@option:check Anti-aliasing, no 'Enable' prefix", "Smooth font edges")
+                 Layout.fillWidth: true
+             }
+             Kirigami.ContextualHelpButton {
+@@ -241,8 +267,11 @@ KCM.SimpleKCM {
+             }
+         }
+ 
++        // Dependent options: indented under the parent and disabled (not hidden) while it is off.
+         QtControls.CheckBox {
+             id: excludeCheckBox
++            // ksr: kcm_fonts/exclude
++            Layout.leftMargin: Kirigami.Units.gridUnit
+             checked: kcm.fontsAASettings.exclude
+             onToggled: kcm.fontsAASettings.exclude = checked;
+             text: i18n("Exclude range from anti-aliasing")
+@@ -257,17 +286,20 @@ KCM.SimpleKCM {
+ 
+         RowLayout {
+             id: excludeField
++            Layout.leftMargin: Kirigami.Units.gridUnit
+             Layout.preferredWidth: formLayout.maxImplicitWidth
+             enabled: antiAliasingCheckBox.enabled && antiAliasingCheckBox.checked
+ 
+             QtControls.SpinBox {
+                 id: excludeFromSpinBox
++                // ksr: kcm_fonts/excludeFrom
+                 stepSize: 1
+                 onValueModified: kcm.fontsAASettings.excludeFrom = value
+                 textFromValue: function(value, locale) { return i18n("%1 pt", value)}
+                 valueFromText: function(text, locale) { return parseInt(text) }
+                 editable: true
+                 value: kcm.fontsAASettings.excludeFrom
++                Accessible.name: i18nc("@label accessible name", "Exclude anti-aliasing from size")
+ 
+                 KCM.SettingStateBinding {
+                     configObject: kcm.fontsAASettings
+@@ -286,12 +318,14 @@ KCM.SimpleKCM {
+ 
+             QtControls.SpinBox {
+                 id: excludeToSpinBox
++                // ksr: kcm_fonts/excludeTo
+                 stepSize: 1
+                 onValueModified: kcm.fontsAASettings.excludeTo = value
+                 textFromValue: function(value, locale) { return i18n("%1 pt", value)}
+                 valueFromText: function(text, locale) { return parseInt(text) }
+                 editable: true
+                 value: kcm.fontsAASettings.excludeTo
++                Accessible.name: i18nc("@label accessible name", "Exclude anti-aliasing up to size")
+ 
+                 KCM.SettingStateBinding {
+                     configObject: kcm.fontsAASettings
+@@ -312,8 +346,15 @@ KCM.SimpleKCM {
+ 
+         RowLayout {
+             Kirigami.FormData.label: i18nc("Used as a noun, and precedes a combobox full of options", "Sub-pixel rendering:")
++            Kirigami.FormData.buddyFor: subPixelCombo
+             QtControls.ComboBox {
+                 id: subPixelCombo
++                // ksr: kcm_fonts/subPixel
++
++                // The delegate previews are rendered by PreviewImageProvider, which re-initialises fontconfig
++                // for every image (previewrenderengine.cpp). Only ask for them once the list is first opened.
++                property bool previewsWanted: false
++
+                 Layout.preferredWidth: formLayout.maxImplicitWidth
+                 currentIndex: kcm.subPixelCurrentIndex
+                 onActivated: (index) => {
+@@ -336,12 +377,19 @@ KCM.SimpleKCM {
+                             id: subPixelComboImage
+                             Layout.preferredWidth: implicitWidth / dprHelper.devicePixelRatio
+                             Layout.preferredHeight: implicitHeight / dprHelper.devicePixelRatio
+-                            source: kcm.imageProviderReady ? "image://preview/" + model.index + "_" + kcm.hintingCurrentIndex + "_" + dprHelper.devicePixelRatio : ""
++                            source: subPixelCombo.previewsWanted && kcm.imageProviderReady ? "image://preview/" + model.index + "_" + kcm.hintingCurrentIndex + "_" + dprHelper.devicePixelRatio : ""
+                             asynchronous: true
+                         }
+                     }
+                 }
+ 
++                Connections {
++                    target: subPixelCombo.popup
++                    function onAboutToShow() {
++                        subPixelCombo.previewsWanted = true;
++                    }
++                }
++
+                 KCM.SettingStateBinding {
+                     configObject: kcm.fontsAASettings
+                     settingName: "subPixel"
+@@ -355,8 +403,14 @@ KCM.SimpleKCM {
+ 
+         RowLayout {
+             Kirigami.FormData.label: i18nc("Used as a noun, and precedes a combobox full of options", "Hinting:")
++            Kirigami.FormData.buddyFor: hintingCombo
+             QtControls.ComboBox {
+                 id: hintingCombo
++                // ksr: kcm_fonts/hinting
++
++                // See subPixelCombo: previews are only requested once the list is first opened.
++                property bool previewsWanted: false
++
+                 Layout.preferredWidth: formLayout.maxImplicitWidth
+                 currentIndex: kcm.hintingCurrentIndex
+                 onActivated: (index) => {
+@@ -379,11 +433,19 @@ KCM.SimpleKCM {
+                             id: hintingComboImage
+                             Layout.preferredWidth: implicitWidth / dprHelper.devicePixelRatio
+                             Layout.preferredHeight: implicitHeight / dprHelper.devicePixelRatio
+-                            source: kcm.imageProviderReady ? "image://preview/" + kcm.subPixelCurrentIndex + "_" + model.index + "_" + dprHelper.devicePixelRatio : ""
++                            source: hintingCombo.previewsWanted && kcm.imageProviderReady ? "image://preview/" + kcm.subPixelCurrentIndex + "_" + model.index + "_" + dprHelper.devicePixelRatio : ""
+                             asynchronous: true
+                         }
+                     }
+                 }
++
++                Connections {
++                    target: hintingCombo.popup
++                    function onAboutToShow() {
++                        hintingCombo.previewsWanted = true;
++                    }
++                }
++
+                 KCM.SettingStateBinding {
+                     configObject: kcm.fontsAASettings
+                     settingName: "hinting"

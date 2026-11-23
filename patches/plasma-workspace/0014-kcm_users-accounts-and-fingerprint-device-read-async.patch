@@ -1,0 +1,610 @@
+From 9b0448905f6923bb9201ff3ac2f946fc90db9d68 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 14:25:08 +0500
+Subject: [PATCH 14/24] kcm_users: accounts and fingerprint device read
+ asynchronously, avatar scan on first use
+
+Page type: List with a per-user Form page (docs/page-design.md section 1, Device-like). The existing two-pane layout
+(users list in the sidebar, selected user's Form page next to it via kcm.push) already has this shape and is kept; no control
+moved or was renamed. All AccountsService / fprintd calls, polkit use (nothing new on open), apply jobs and the wallet code are
+unchanged. NOT BUILT YET (owner stopped heavy work); checked statically only.
+
+Structure: unchanged. Added: busy indicator only after 150 ms; the user page is pushed when the accounts are loaded.
+Relabel table: inventory/relabel/kcm_users.tsv (outer repo). Full inventory check: LOST 0 (the per-KCM --strict run reports
+the same plugin/dialog rows as before this commit, 22 -> 21, since wording is unchanged and only two markers were added).
+HIG ids: HIG-001, HIG-006; page-design sections 4, 7.
+
+Speed (cause found in code, not measured). Everything below ran in the KCM constructor or the first user setPath, blocking:
+- UserModel: ListCachedUsers() + reply.waitForFinished() (system bus; wakes accounts-daemon if idle), then per user
+  User::setPath(): systemAccount() plus loadData() = about 13 blocking property reads (uid, userName, iconFile, realName,
+  email, accountType, each read twice in the compare-then-assign code), plus a KDisplayManager::localSessions() call.
+  Now: ListCachedUsers via QDBusPendingCallWatcher; each User::setPathAsync() does ONE asynchronous
+  org.freedesktop.DBus.Properties.GetAll("org.freedesktop.Accounts.User") (the Properties proxy already generated for
+  fprintd) and applies the values with the same compare-and-emit code (Properties struct / applyProperties); the model fills in
+  one reset when the last user is ready (new property UserModel.loaded). UserAdded users that arrive meanwhile are kept.
+  loadData() (on the Changed signal) now makes one read per property instead of two. System-account users are still skipped
+  like before (empty data).
+- FingerprintModel: GetDefaultDevice() + waitForFinished() in the constructor (can activate fprintd). Now asynchronous;
+  deviceFound() turns true when the reply arrives (devicesFoundChanged, which the button's `visible` already follows);
+  scanType is now NOTIFY scanTypeChanged instead of CONSTANT because the device appears later.
+- KCMUser constructor: recursive QDirIterator over every plasma/avatars dir; now done on first read of kcm.avatarFiles (only
+  PicturesSheet.qml, which is itself created on demand).
+- main.qml pushes UserDetailsPage when userModel.loaded, not in Component.onCompleted.
+- After numbers: pending, manager will measure.
+
+Not built yet; uncertain: connect(..., Qt::SingleShotConnection) with the 5-argument functor overload (Qt 6.0+, should be ok);
+`QDBusPendingReply<QList<QDBusObjectPath>>` for ListCachedUsers (the generated proxy's type, unverified); KDisplayManager
+::localSessions() is still one blocking call per user (not changed); QML users of getCurrentUser() before the model is
+loaded get nullptr (only main.qml did, now gated); UserDetailsPage was not read in full.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/users/src/fingerprintmodel.cpp |  35 +++++----
+ kcms/users/src/fingerprintmodel.h   |   3 +-
+ kcms/users/src/kcm.cpp              |  21 ++++--
+ kcms/users/src/kcm.h                |   8 +-
+ kcms/users/src/ui/main.qml          |  35 ++++++++-
+ kcms/users/src/user.cpp             |  80 +++++++++++++++++---
+ kcms/users/src/user.h               |  15 ++++
+ kcms/users/src/usermodel.cpp        | 112 +++++++++++++++++++---------
+ kcms/users/src/usermodel.h          |  12 +++
+ 9 files changed, 251 insertions(+), 70 deletions(-)
+
+diff --git a/kcms/users/src/fingerprintmodel.cpp b/kcms/users/src/fingerprintmodel.cpp
+index 12fb741..b7d771a 100644
+--- a/kcms/users/src/fingerprintmodel.cpp
++++ b/kcms/users/src/fingerprintmodel.cpp
+@@ -6,6 +6,8 @@
+ 
+ #include "fingerprintmodel.h"
+ 
++#include <QDBusPendingCallWatcher>
++
+ FingerprintModel::FingerprintModel(QObject *parent)
+     : QObject(parent)
+     , m_managerDbusInterface(new NetReactivatedFprintManagerInterface(QStringLiteral("net.reactivated.Fprint"),
+@@ -13,22 +15,29 @@ FingerprintModel::FingerprintModel(QObject *parent)
+                                                                       QDBusConnection::systemBus(),
+                                                                       this))
+ {
+-    auto reply = m_managerDbusInterface->GetDefaultDevice();
+-    reply.waitForFinished();
++    // ksr: GetDefaultDevice() was waited for here (waitForFinished), in the KCM constructor. The call can wake up (activate)
++    // fprintd on the system bus, which can take seconds. Now asynchronous: deviceFound() is false until the reply arrives and
++    // devicesFoundChanged() then shows the "Configure Fingerprint Authentication…" button.
++    auto *watcher = new QDBusPendingCallWatcher(m_managerDbusInterface->GetDefaultDevice(), this);
++    connect(watcher, &QDBusPendingCallWatcher::finished, this, [this](QDBusPendingCallWatcher *self) {
++        self->deleteLater();
++        QDBusPendingReply<QDBusObjectPath> reply = *self;
++        if (reply.isError()) {
++            qDebug() << reply.error().message();
++            setCurrentError(reply.error().message());
++            return;
++        }
+ 
+-    if (reply.isError()) {
+-        qDebug() << reply.error().message();
+-        setCurrentError(reply.error().message());
+-        return;
+-    }
++        m_device = new FprintDevice(reply.value(), this);
+ 
+-    QDBusObjectPath path = reply.value();
+-    m_device = new FprintDevice(path, this);
++        connect(m_device, &FprintDevice::enrollCompleted, this, &FingerprintModel::handleEnrollCompleted);
++        connect(m_device, &FprintDevice::enrollStagePassed, this, &FingerprintModel::handleEnrollStagePassed);
++        connect(m_device, &FprintDevice::enrollRetryStage, this, &FingerprintModel::handleEnrollRetryStage);
++        connect(m_device, &FprintDevice::enrollFailed, this, &FingerprintModel::handleEnrollFailed);
+ 
+-    connect(m_device, &FprintDevice::enrollCompleted, this, &FingerprintModel::handleEnrollCompleted);
+-    connect(m_device, &FprintDevice::enrollStagePassed, this, &FingerprintModel::handleEnrollStagePassed);
+-    connect(m_device, &FprintDevice::enrollRetryStage, this, &FingerprintModel::handleEnrollRetryStage);
+-    connect(m_device, &FprintDevice::enrollFailed, this, &FingerprintModel::handleEnrollFailed);
++        Q_EMIT devicesFoundChanged();
++        Q_EMIT scanTypeChanged();
++    });
+ }
+ 
+ FingerprintModel::~FingerprintModel()
+diff --git a/kcms/users/src/fingerprintmodel.h b/kcms/users/src/fingerprintmodel.h
+index b6f8861..11eea11 100644
+--- a/kcms/users/src/fingerprintmodel.h
++++ b/kcms/users/src/fingerprintmodel.h
+@@ -33,7 +33,7 @@ private:
+ class FingerprintModel : public QObject
+ {
+     Q_OBJECT
+-    Q_PROPERTY(FprintDevice::ScanType scanType READ scanType CONSTANT)
++    Q_PROPERTY(FprintDevice::ScanType scanType READ scanType NOTIFY scanTypeChanged)
+     Q_PROPERTY(QString currentError READ currentError WRITE setCurrentError NOTIFY currentErrorChanged) // error for ui to display
+     Q_PROPERTY(QString enrollFeedback READ enrollFeedback WRITE setEnrollFeedback NOTIFY enrollFeedbackChanged)
+     Q_PROPERTY(QVariantList enrolledFingerprints READ enrolledFingerprints NOTIFY enrolledFingerprintsChanged)
+@@ -102,6 +102,7 @@ Q_SIGNALS:
+     void enrollFeedbackChanged();
+     void enrolledFingerprintsChanged();
+     void devicesFoundChanged();
++    void scanTypeChanged();
+     void currentlyEnrollingChanged();
+     void enrollProgressChanged();
+     void dialogStateChanged();
+diff --git a/kcms/users/src/kcm.cpp b/kcms/users/src/kcm.cpp
+index dce1d9e..2a831a3 100644
+--- a/kcms/users/src/kcm.cpp
++++ b/kcms/users/src/kcm.cpp
+@@ -57,15 +57,24 @@ KCMUser::KCMUser(QObject *parent, const KPluginMetaData &data)
+     auto font = QApplication::font("QLabel");
+     auto fm = QFontMetrics(font);
+     setColumnWidth(fm.capHeight() * 30);
++}
+ 
+-    const auto dirs = QStandardPaths::locateAll(QStandardPaths::GenericDataLocation, QStringLiteral("plasma/avatars"), QStandardPaths::LocateDirectory);
+-    for (const auto &dir : dirs) {
+-        QDirIterator it(dir, QStringList{QStringLiteral("*.jpg"), QStringLiteral("*.png")}, QDir::Files, QDirIterator::Subdirectories);
+-
+-        while (it.hasNext()) {
+-            m_avatarFiles << it.next();
++QStringList KCMUser::avatarFiles() const
++{
++    // ksr: this recursive scan of every plasma/avatars directory ran in the constructor; the list is only used by the
++    // avatar picture sheet.
++    if (!m_avatarFilesScanned) {
++        m_avatarFilesScanned = true;
++        const auto dirs = QStandardPaths::locateAll(QStandardPaths::GenericDataLocation, QStringLiteral("plasma/avatars"), QStandardPaths::LocateDirectory);
++        for (const auto &dir : dirs) {
++            QDirIterator it(dir, QStringList{QStringLiteral("*.jpg"), QStringLiteral("*.png")}, QDir::Files, QDirIterator::Subdirectories);
++
++            while (it.hasNext()) {
++                m_avatarFiles << it.next();
++            }
+         }
+     }
++    return m_avatarFiles;
+ }
+ 
+ bool KCMUser::createUser(const QString &name, const QString &realName, const QString &password, bool isAdmin)
+diff --git a/kcms/users/src/kcm.h b/kcms/users/src/kcm.h
+index 2b7a172..100f3a7 100644
+--- a/kcms/users/src/kcm.h
++++ b/kcms/users/src/kcm.h
+@@ -16,19 +16,23 @@ class KCMUser : public KQuickConfigModule
+ {
+     Q_OBJECT
+     Q_PROPERTY(UserModel *userModel MEMBER m_model CONSTANT)
+-    Q_PROPERTY(QStringList avatarFiles MEMBER m_avatarFiles CONSTANT)
++    Q_PROPERTY(QStringList avatarFiles READ avatarFiles CONSTANT)
+     Q_PROPERTY(FingerprintModel *fingerprintModel MEMBER m_fingerprintModel CONSTANT)
+ 
+ private:
+     OrgFreedesktopAccountsInterface *const m_dbusInterface;
+     UserModel *const m_model;
+-    QStringList m_avatarFiles;
++    mutable QStringList m_avatarFiles;
++    mutable bool m_avatarFilesScanned = false;
+     FingerprintModel *const m_fingerprintModel;
+ 
+ public:
+     KCMUser(QObject *parent, const KPluginMetaData &data);
+     ~KCMUser() override;
+ 
++    // Scanned on first use (the picture chooser), not when the page opens
++    QStringList avatarFiles() const;
++
+     Q_SCRIPTABLE bool createUser(const QString &name, const QString &realName, const QString &password, bool admin);
+     Q_SCRIPTABLE bool deleteUser(qint64 index, bool deleteHome);
+     Q_SCRIPTABLE QUrl recolorSVG(const QUrl &url, const QColor &color);
+diff --git a/kcms/users/src/ui/main.qml b/kcms/users/src/ui/main.qml
+index 0d42aad..4e8d04f 100644
+--- a/kcms/users/src/ui/main.qml
++++ b/kcms/users/src/ui/main.qml
+@@ -25,6 +25,7 @@ KCM.ScrollViewKCM {
+     property alias createUserEnabled: createUserButton.enabled
+ 
+     actions: Kirigami.Action {
++            // ksr: kcm_users/AddNew
+             id: createUserButton
+             icon.name: "list-add-symbolic"
+             text: i18nc("@action:button As in, 'add new user'", "Add New…")
+@@ -70,14 +71,41 @@ KCM.ScrollViewKCM {
+         }
+     }
+ 
++    // The accounts are listed asynchronously (kcm.userModel.loaded); the list and the user page appear when they are read.
++    property bool detailsPushed: false
++    function pushFirstDetailsPage() {
++        if (!Kirigami.Settings.isMobile && !detailsPushed && kcm.userModel.loaded) {
++            detailsPushed = true;
++            // Push users page on desktop for two pane layout
++            kcm.push("UserDetailsPage.qml", { user: kcm.userModel.getCurrentUser() })
++        }
++    }
++
++    Connections {
++        target: kcm.userModel
++        function onLoadedChanged() { root.pushFirstDetailsPage() }
++    }
++
+     Component.onCompleted: {
+         if (!Kirigami.Settings.isMobile) {
+             // Set two column mode
+             kcm.columnWidth = Kirigami.Units.gridUnit * 15
+-
+-            // Push users page on desktop for two pane layout
+-            kcm.push("UserDetailsPage.qml", { user: kcm.userModel.getCurrentUser() })
+         }
++        pushFirstDetailsPage()
++    }
++
++    // Busy only when reading takes longer than 150 ms (docs/page-design.md section 3)
++    Timer {
++        id: busyDelay
++        interval: 150
++        running: !kcm.userModel.loaded
++    }
++    QQC2.BusyIndicator {
++        parent: root
++        anchors.centerIn: parent
++        z: 1
++        running: visible
++        visible: !kcm.userModel.loaded && !busyDelay.running
+     }
+ 
+     function switchBackToUser() {
+@@ -128,6 +156,7 @@ KCM.ScrollViewKCM {
+ 
+             width: ListView.view.width
+ 
++            // ksr: kcm_users/model-displayPrimaryName
+             text: model.displayPrimaryName
+             subtitle: model.displaySecondaryName
+ 
+diff --git a/kcms/users/src/user.cpp b/kcms/users/src/user.cpp
+index 63efdd8..f1fe7cb 100644
+--- a/kcms/users/src/user.cpp
++++ b/kcms/users/src/user.cpp
+@@ -8,7 +8,9 @@
+ 
+ #include "user.h"
+ #include "kcmusers_debug.h"
++#include "properties_interface.h"
+ #include "user_interface.h"
++#include <QDBusPendingCallWatcher>
+ #include <KConfigGroup>
+ #include <KLocalizedString>
+ #include <KSharedConfig>
+@@ -182,22 +184,80 @@ void User::setPath(const QDBusObjectPath &path)
+     loadData();
+ }
+ 
++void User::setPathAsync(const QDBusObjectPath &path)
++{
++    if (!m_dbusIface.isNull()) {
++        delete m_dbusIface;
++    }
++    m_dbusIface = new OrgFreedesktopAccountsUserInterface(QStringLiteral("org.freedesktop.Accounts"), path.path(), QDBusConnection::systemBus(), this);
++    m_dbusIface->setInteractiveAuthorizationAllowed(true);
++
++    // ksr: setPath() read about a dozen properties one blocking call at a time (systemAccount, then each of uid, userName,
++    // iconFile, realName, email, accountType twice, in loadData()), per user, before the page existed. One asynchronous GetAll instead.
++    auto *properties = new OrgFreedesktopDBusPropertiesInterface(QStringLiteral("org.freedesktop.Accounts"), path.path(), QDBusConnection::systemBus(), this);
++    auto *watcher = new QDBusPendingCallWatcher(properties->GetAll(QStringLiteral("org.freedesktop.Accounts.User")), this);
++    connect(watcher, &QDBusPendingCallWatcher::finished, this, [this, path, properties](QDBusPendingCallWatcher *self) {
++        self->deleteLater();
++        properties->deleteLater();
++        QDBusPendingReply<QVariantMap> reply = *self;
++        if (!reply.isError()) {
++            const QVariantMap map = reply.value();
++            if (map.value(QStringLiteral("SystemAccount")).toBool()) {
++                mSystemAccount = true;
++            } else {
++                mPath = path;
++                connect(m_dbusIface, &OrgFreedesktopAccountsUserInterface::Changed, this, [this]() {
++                    loadData();
++                });
++                Properties p;
++                p.uid = map.value(QStringLiteral("Uid")).toULongLong();
++                p.name = map.value(QStringLiteral("UserName")).toString();
++                p.iconFile = map.value(QStringLiteral("IconFile")).toString();
++                p.realName = map.value(QStringLiteral("RealName")).toString();
++                p.email = map.value(QStringLiteral("Email")).toString();
++                p.accountType = map.value(QStringLiteral("AccountType")).toInt();
++                applyProperties(p);
++            }
++        } else {
++            qCWarning(KCMUSERS) << reply.error().message();
++        }
++        Q_EMIT ready();
++    });
++}
++
++bool User::isSystemAccount() const
++{
++    return mSystemAccount;
++}
++
+ void User::loadData()
++{
++    Properties p;
++    p.uid = m_dbusIface->uid();
++    p.name = m_dbusIface->userName();
++    p.iconFile = m_dbusIface->iconFile();
++    p.realName = m_dbusIface->realName();
++    p.email = m_dbusIface->email();
++    p.accountType = m_dbusIface->accountType();
++    applyProperties(p);
++}
++
++void User::applyProperties(const Properties &p)
+ {
+     bool userDataChanged = false;
+-    if (mUid != m_dbusIface->uid()) {
+-        mUid = m_dbusIface->uid();
++    if (mUid != p.uid) {
++        mUid = p.uid;
+         mOriginalUid = mUid;
+         userDataChanged = true;
+         Q_EMIT uidChanged();
+     }
+-    if (mName != m_dbusIface->userName()) {
+-        mName = m_dbusIface->userName();
++    if (mName != p.name) {
++        mName = p.name;
+         mOriginalName = mName;
+         userDataChanged = true;
+         Q_EMIT nameChanged();
+     }
+-    const auto localIconFile = QUrl::fromLocalFile(m_dbusIface->iconFile());
++    const auto localIconFile = QUrl::fromLocalFile(p.iconFile);
+     if (mFace != localIconFile) {
+         mFace = localIconFile;
+         mOriginalFace = mFace;
+@@ -207,19 +267,19 @@ void User::loadData()
+         Q_EMIT faceChanged();
+         Q_EMIT faceValidChanged();
+     }
+-    if (mRealName != m_dbusIface->realName()) {
+-        mRealName = m_dbusIface->realName();
++    if (mRealName != p.realName) {
++        mRealName = p.realName;
+         mOriginalRealName = mRealName;
+         userDataChanged = true;
+         Q_EMIT realNameChanged();
+     }
+-    if (mEmail != m_dbusIface->email()) {
+-        mEmail = m_dbusIface->email();
++    if (mEmail != p.email) {
++        mEmail = p.email;
+         mOriginalEmail = mEmail;
+         userDataChanged = true;
+         Q_EMIT emailChanged();
+     }
+-    const auto administrator = (m_dbusIface->accountType() == 1);
++    const auto administrator = (p.accountType == 1);
+     if (mAdministrator != administrator) {
+         mAdministrator = administrator;
+         mOriginalAdministrator = mAdministrator;
+diff --git a/kcms/users/src/user.h b/kcms/users/src/user.h
+index e7f330c..ad5beed 100644
+--- a/kcms/users/src/user.h
++++ b/kcms/users/src/user.h
+@@ -111,11 +111,24 @@ public:
+     void setFace(const QUrl &value);
+     void setAdministrator(bool value);
+     void setPath(const QDBusObjectPath &path);
++    // Same as setPath() but reads all properties with one asynchronous GetAll; ready() is emitted when done
++    void setPathAsync(const QDBusObjectPath &path);
++    bool isSystemAccount() const;
+     void setFaceCrop(const QRect &rect);
+     void setLastFileDialogLocation(QUrl &url);
+ 
+     void loadData();
+ 
++    struct Properties {
++        qulonglong uid = 0;
++        QString name;
++        QString iconFile;
++        QString realName;
++        QString email;
++        int accountType = 0;
++    };
++    void applyProperties(const Properties &properties);
++
+ public Q_SLOTS:
+     Q_SCRIPTABLE void apply();
+     Q_SCRIPTABLE bool usesDefaultWallet();
+@@ -124,6 +137,7 @@ public Q_SLOTS:
+ 
+ Q_SIGNALS:
+     void dataChanged();
++    void ready();
+     void uidChanged();
+     void nameChanged();
+     void realNameChanged();
+@@ -158,6 +172,7 @@ private:
+     bool mLoggedIn = false;
+     bool mOriginalLoggedIn = false;
+     QDBusObjectPath mPath;
++    bool mSystemAccount = false;
+     QPointer<OrgFreedesktopAccountsUserInterface> m_dbusIface;
+     std::optional<QString> mError;
+     QUrl m_lastFileDialogLocation;
+diff --git a/kcms/users/src/usermodel.cpp b/kcms/users/src/usermodel.cpp
+index bea6d51..1882fd6 100644
+--- a/kcms/users/src/usermodel.cpp
++++ b/kcms/users/src/usermodel.cpp
+@@ -8,7 +8,9 @@
+ #include "usermodel.h"
+ 
+ #include <KLocalizedString>
++#include <QDBusPendingCallWatcher>
+ #include <QDBusPendingReply>
++#include <memory>
+ #include <algorithm>
+ 
+ #include "accounts_interface.h"
+@@ -44,52 +46,92 @@ UserModel::UserModel(QObject *parent)
+         }
+     });
+ 
+-    auto reply = m_dbusInterface->ListCachedUsers();
+-    reply.waitForFinished();
++    connect(this, &QAbstractItemModel::rowsInserted, this, &UserModel::moreThanOneAdminUserChanged);
++    connect(this, &QAbstractItemModel::rowsRemoved, this, &UserModel::moreThanOneAdminUserChanged);
++    connect(this, &QAbstractItemModel::dataChanged, this, &UserModel::moreThanOneAdminUserChanged);
++    connect(this, &QAbstractItemModel::modelReset, this, &UserModel::moreThanOneAdminUserChanged);
+ 
+-    if (reply.isError()) {
+-        qCWarning(KCMUSERS) << reply.error().message();
+-        return;
+-    }
++    // ksr: ListCachedUsers() was waited for here and then every user was read with blocking property calls, in the KCM
++    // constructor. Now the list is asynchronous, each user reads its properties with one asynchronous GetAll, and the model is
++    // filled in one reset when the last user is ready (loaded becomes true). Users added in the meantime (UserAdded) stay.
++    auto *watcher = new QDBusPendingCallWatcher(m_dbusInterface->ListCachedUsers(), this);
++    connect(watcher, &QDBusPendingCallWatcher::finished, this, [this](QDBusPendingCallWatcher *self) {
++        self->deleteLater();
++        QDBusPendingReply<QList<QDBusObjectPath>> reply = *self;
++        if (reply.isError()) {
++            qCWarning(KCMUSERS) << reply.error().message();
++            finishLoading({});
++            return;
++        }
+ 
+-    const QList<QDBusObjectPath> users = reply.value();
+-    for (const QDBusObjectPath &path : users) {
+-        User *user = new User(this);
+-        user->setPath(path);
++        const QList<QDBusObjectPath> paths = reply.value();
++        if (paths.isEmpty()) {
++            finishLoading({});
++            return;
++        }
+ 
+-        struct SignalEnumMapping {
+-            void (User::*signalFnc)();
+-            int role;
+-        };
+-        static constexpr const std::array<SignalEnumMapping, 8> set{{
+-            {&User::uidChanged, UidRole},
+-            {&User::nameChanged, NameRole},
+-            {&User::displayNamesChanged, DisplayPrimaryNameRole},
+-            {&User::displayNamesChanged, DisplaySecondaryNameRole},
+-            {&User::faceValidChanged, FaceValidRole},
+-            {&User::realNameChanged, RealNameRole},
+-            {&User::emailChanged, EmailRole},
+-            {&User::administratorChanged, AdministratorRole},
+-        }};
+-
+-        for (const SignalEnumMapping &entry : set) {
+-            connect(user, entry.signalFnc, this, [this, user, entry] {
+-                auto idx = index(m_userList.lastIndexOf(user));
+-                Q_EMIT dataChanged(idx, idx, {entry.role});
+-            });
++        auto users = std::make_shared<QList<User *>>();
++        auto pending = std::make_shared<int>(paths.size());
++        for (const QDBusObjectPath &path : paths) {
++            User *user = new User(this);
++            users->append(user);
++            connect(user, &User::ready, this, [this, users, pending] {
++                if (--*pending == 0) {
++                    finishLoading(*users);
++                }
++            }, Qt::SingleShotConnection);
++            user->setPathAsync(path);
+         }
++    });
++}
+ 
+-        m_userList.append(user);
++void UserModel::connectUser(User *user)
++{
++    struct SignalEnumMapping {
++        void (User::*signalFnc)();
++        int role;
++    };
++    static constexpr const std::array<SignalEnumMapping, 8> set{{
++        {&User::uidChanged, UidRole},
++        {&User::nameChanged, NameRole},
++        {&User::displayNamesChanged, DisplayPrimaryNameRole},
++        {&User::displayNamesChanged, DisplaySecondaryNameRole},
++        {&User::faceValidChanged, FaceValidRole},
++        {&User::realNameChanged, RealNameRole},
++        {&User::emailChanged, EmailRole},
++        {&User::administratorChanged, AdministratorRole},
++    }};
++
++    for (const SignalEnumMapping &entry : set) {
++        connect(user, entry.signalFnc, this, [this, user, entry] {
++            auto idx = index(m_userList.lastIndexOf(user));
++            Q_EMIT dataChanged(idx, idx, {entry.role});
++        });
++    }
++}
++
++void UserModel::finishLoading(const QList<User *> &users)
++{
++    beginResetModel();
++    // users added by UserAdded while the cached list was being read come after the cached ones
++    const QList<User *> added = m_userList;
++    m_userList = users;
++    for (User *user : std::as_const(m_userList)) {
++        connectUser(user);
++    }
++    for (User *user : added) {
++        if (!m_userList.contains(user)) {
++            m_userList.append(user);
++        }
+     }
+ 
+     std::ranges::stable_partition(m_userList, [](User *u) {
+         return u->isCurrentUser();
+     });
++    endResetModel();
+ 
+-    connect(this, &QAbstractItemModel::rowsInserted, this, &UserModel::moreThanOneAdminUserChanged);
+-    connect(this, &QAbstractItemModel::rowsRemoved, this, &UserModel::moreThanOneAdminUserChanged);
+-    connect(this, &QAbstractItemModel::dataChanged, this, &UserModel::moreThanOneAdminUserChanged);
+-    connect(this, &QAbstractItemModel::modelReset, this, &UserModel::moreThanOneAdminUserChanged);
++    m_loaded = true;
++    Q_EMIT loadedChanged();
+ }
+ 
+ QHash<int, QByteArray> UserModel::roleNames() const
+diff --git a/kcms/users/src/usermodel.h b/kcms/users/src/usermodel.h
+index 167107a..9d704e6 100644
+--- a/kcms/users/src/usermodel.h
++++ b/kcms/users/src/usermodel.h
+@@ -36,6 +36,8 @@ public:
+     Q_ENUM(Roles)
+ 
+     Q_PROPERTY(bool moreThanOneAdminUser READ hasMoreThanOneAdminUser NOTIFY moreThanOneAdminUserChanged FINAL)
++    // false until the cached users have been listed and read (asynchronously, after the first frame)
++    Q_PROPERTY(bool loaded READ loaded NOTIFY loadedChanged FINAL)
+ 
+     explicit UserModel(QObject *parent = nullptr);
+     ~UserModel() override;
+@@ -45,14 +47,24 @@ public:
+ 
+     Q_INVOKABLE User *getCurrentUser() const;
+ 
++    bool loaded() const
++    {
++        return m_loaded;
++    }
++
+     QHash<int, QByteArray> roleNames() const override;
+ 
+ Q_SIGNALS:
+     void moreThanOneAdminUserChanged();
++    void loadedChanged();
+ 
+ private:
+     OrgFreedesktopAccountsInterface *const m_dbusInterface;
+     QList<User *> m_userList;
++    bool m_loaded = false;
++
++    void connectUser(User *user);
++    void finishLoading(const QList<User *> &users);
+ 
+     bool hasMoreThanOneAdminUser() const;
+ };

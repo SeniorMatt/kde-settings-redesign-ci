@@ -1,0 +1,384 @@
+From 62c92a1b7c719ceb59dfe1947637dfa3ecefab8c Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 02:23:39 +0500
+Subject: [PATCH 1/2] kcm_kup: probe bup/rsync asynchronously, restore button
+ in the top row, 'Advanced' page renamed
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Page type: List (QtWidgets, docs/page-design.md 8: kept in QtWidgets, the plan editor is a 2500-line widget set with config managers, not a small port).
+kuprc keys, plan numbering, save/reload logic and the daemon call are unchanged.
+
+Speed cause (code): the KcmKup constructor ran three processes synchronously, 'bup version', 'bup fsck --par2-ok' and 'rsync --version'
+(kupkcm.cpp:39,44,52 before this commit), so the first frame waited on process start-ups (and on bup's python start). They now run with QProcess
+and signals; the page shows 'Looking for backup programs…' and finishSetup() builds the real page (or the 'Backup programs are missing' page)
+when both probes have answered, then calls load(). load()/save() return early until then. Still synchronous and left as is: BackupPlanWidget
+(five KPageWidget pages, folder tree, Solid drive list in driveselection.cpp:55) is built for every plan inside load(); a lazy build on Configure would
+be the next step, not done because the config manager of each plan needs its widget. After-numbers: pending, manager will measure.
+
+Moved / renamed:
+- Front page top row: 'Backups enabled', then 'Restore From Backup…' (was the button 'Open and restore from existing backups' at the bottom
+  of the plan list, so it was below any number of plans; old text is the tooltip) and 'Add New Plan…'. Rows kcm_kup/OpenRestore, AddPlan.
+- Plan card: 'Configure' -> 'Configure…' (opens the plan page). Plan page: 'Back to overview' -> 'Back to Plans', 'Description:' -> 'Plan name:'.
+- Plan page list entry 'Advanced' ('Extra options for advanced users', icon preferences-other) -> 'Exclusions and Checks' ('Choose what to leave out and
+  how backups are checked', icon view-filter) (HIG-057). The options on it are unchanged.
+- Markers added on the changed and weak rows; relabel: inventory/relabel/kcm_kup.tsv. Inventory --strict: 0 lost.
+HIG ids: HIG-001/005/006, HIG-019, HIG-057, HIG-058.
+Not built yet. Unconfirmed without a build: late KCModule::addConfig() after construction (done in finishSetup) registers the KConfigDialogManager
+and change tracking like the early call did; QProcess::errorOccurred(FailedToStart) may fire inside start(), so mProbesPending starts at 2 and is
+not reset; QProcess::finished(int, ExitStatus) signal (Qt 6).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcm/backupplanwidget.cpp |  15 ++--
+ kcm/kupkcm.cpp           | 155 ++++++++++++++++++++++++++++-----------
+ kcm/kupkcm.h             |  13 +++-
+ kcm/planstatuswidget.cpp |   6 +-
+ 4 files changed, 138 insertions(+), 51 deletions(-)
+
+diff --git a/kcm/backupplanwidget.cpp b/kcm/backupplanwidget.cpp
+index 95d3d2c..b77ab19 100644
+--- a/kcm/backupplanwidget.cpp
++++ b/kcm/backupplanwidget.cpp
+@@ -454,6 +454,7 @@ DirDialog::DirDialog(const QUrl &pRootDir, const QString &pStartSubDir, QWidget
+     auto lButtonBox = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+     connect(lButtonBox, SIGNAL(accepted()), this, SLOT(accept()));
+     connect(lButtonBox, SIGNAL(rejected()), this, SLOT(reject()));
++    // ksr: kcm_kup/NewFolder
+     auto lNewFolderButton = new QPushButton(xi18nc("@action:button", "New Folder…"));
+     connect(lNewFolderButton, SIGNAL(clicked()), mDirSelector, SLOT(createNewFolder()));
+     lButtonBox->addButton(lNewFolderButton, QDialogButtonBox::ActionRole);
+@@ -480,9 +481,11 @@ BackupPlanWidget::BackupPlanWidget(BackupPlan *pBackupPlan, const QString &pBupV
+     mDescriptionEdit = new KLineEdit;
+     mDescriptionEdit->setObjectName(QStringLiteral("kcfg_Description"));
+     mDescriptionEdit->setClearButtonEnabled(true);
+-    auto lDescriptionLabel = new QLabel(xi18nc("@label", "Description:"));
++    // ksr: kcm_kup/Description
++    auto lDescriptionLabel = new QLabel(xi18nc("@label", "Plan name:"));
+     lDescriptionLabel->setBuddy(mDescriptionEdit);
+-    mConfigureButton = new QPushButton(QIcon::fromTheme(QStringLiteral("go-previous-view")), xi18nc("@action:button", "Back to overview"));
++    // ksr: kcm_kup/BackToOverview
++    mConfigureButton = new QPushButton(QIcon::fromTheme(QStringLiteral("go-previous-view")), xi18nc("@action:button", "Back to Plans"));
+     connect(mConfigureButton, SIGNAL(clicked()), this, SIGNAL(requestOverviewReturn()));
+ 
+     mConfigPages = new KPageWidget;
+@@ -1064,9 +1067,11 @@ KPageWidgetItem *BackupPlanWidget::createAdvancedPage(bool pPar2Available)
+     lAdvancedLayout->setSpacing(lIndentation);
+     lAdvancedWidget->setLayout(lAdvancedLayout);
+     auto lPage = new KPageWidgetItem(lAdvancedWidget);
+-    lPage->setName(xi18nc("@title", "Advanced"));
+-    lPage->setHeader(xi18nc("@label", "Extra options for advanced users"));
+-    lPage->setIcon(QIcon::fromTheme(QStringLiteral("preferences-other")));
++    // Was "Advanced" / "Extra options for advanced users" (HIG-057): named after what is on it. Rows kcm_kup/ShowHidden,
++    // Verify, Recovery, ExcludePatterns, ExcludePatternsFile and the Exclude* options live here.
++    lPage->setName(xi18nc("@title", "Exclusions and Checks"));
++    lPage->setHeader(xi18nc("@label", "Choose what to leave out and how backups are checked"));
++    lPage->setIcon(QIcon::fromTheme(QStringLiteral("view-filter")));
+     return lPage;
+ }
+ 
+diff --git a/kcm/kupkcm.cpp b/kcm/kupkcm.cpp
+index ad5eed3..0e91844 100644
+--- a/kcm/kupkcm.cpp
++++ b/kcm/kupkcm.cpp
+@@ -12,6 +12,7 @@
+ #include <QCheckBox>
+ #include <QDBusInterface>
+ #include <QLabel>
++#include <QProcess>
+ #include <QPushButton>
+ #include <QScrollArea>
+ #include <QStackedLayout>
+@@ -33,29 +34,95 @@ KupKcm::KupKcm(QObject *pParent, const KPluginMetaData &pPluginMetaData, const Q
+     setObjectName(QStringLiteral("kcm_kup")); // needed for the kconfigdialogmanager magic
+     setButtons((Apply | buttons()) & ~Default);
+ 
+-    KProcess lBupProcess;
+-    lBupProcess << QStringLiteral("bup") << QStringLiteral("version");
+-    lBupProcess.setOutputChannelMode(KProcess::MergedChannels);
+-    int lExitCode = lBupProcess.execute();
+-    if (lExitCode >= 0) {
+-        mBupVersion = QString::fromUtf8(lBupProcess.readAllStandardOutput());
+-        KProcess lPar2Process;
+-        lPar2Process << QStringLiteral("bup") << QStringLiteral("fsck") << QStringLiteral("--par2-ok");
+-        mPar2Available = lPar2Process.execute() == 0;
+-    } else {
+-        mPar2Available = false;
++    // Page type: List (docs/page-design.md 8, QtWidgets). The first frame must not wait on bup/rsync: they used to be run
++    // synchronously right here (bup version, bup fsck --par2-ok, rsync --version). Show a short note instead and probe
++    // them asynchronously; finishSetup() builds the real page when both answers are in.
++    QListIterator<QVariant> lIter(pArgs);
++    while (lIter.hasNext()) {
++        QVariant lVariant = lIter.next();
++        if (lVariant.userType() == QMetaType::QString) {
++            QString lArgument = lVariant.toString();
++            if (lArgument == QStringLiteral("show_sources") && lIter.hasNext()) {
++                mSourcePageToShow = lIter.next().toString().toInt();
++            }
++        }
+     }
+ 
+-    KProcess lRsyncProcess;
+-    lRsyncProcess << QStringLiteral("rsync") << QStringLiteral("--version");
+-    lRsyncProcess.setOutputChannelMode(KProcess::MergedChannels);
+-    lExitCode = lRsyncProcess.execute();
+-    if (lExitCode >= 0) {
+-        QString lOutput = QString::fromLocal8Bit(lRsyncProcess.readLine());
+-        mRsyncVersion = lOutput.split(QLatin1Char(' '), Qt::SkipEmptyParts).at(2);
++    mStackedLayout = new QStackedLayout;
++    mCheckingPage = new QLabel(xi18nc("@info:status", "Looking for backup programs…"));
++    mCheckingPage->setAlignment(Qt::AlignCenter);
++    mStackedLayout->addWidget(mCheckingPage);
++    widget()->setLayout(mStackedLayout);
++
++    probeBackupPrograms();
++}
++
++void KupKcm::probeBackupPrograms()
++{
++    // bup: version first, then (only if bup runs at all) whether par2 recovery is available.
++    auto *lBupProcess = new QProcess(this);
++    lBupProcess->setProcessChannelMode(QProcess::MergedChannels);
++    connect(lBupProcess, &QProcess::errorOccurred, this, [this, lBupProcess](QProcess::ProcessError pError) {
++        if (pError == QProcess::FailedToStart) {
++            lBupProcess->deleteLater();
++            probeFinished();
++        }
++    });
++    connect(lBupProcess, &QProcess::finished, this, [this, lBupProcess](int, QProcess::ExitStatus pStatus) {
++        lBupProcess->deleteLater();
++        if (pStatus != QProcess::NormalExit) {
++            probeFinished();
++            return;
++        }
++        mBupVersion = QString::fromUtf8(lBupProcess->readAllStandardOutput());
++        auto *lPar2Process = new QProcess(this);
++        connect(lPar2Process, &QProcess::errorOccurred, this, [this, lPar2Process](QProcess::ProcessError pError) {
++            if (pError == QProcess::FailedToStart) {
++                lPar2Process->deleteLater();
++                probeFinished();
++            }
++        });
++        connect(lPar2Process, &QProcess::finished, this, [this, lPar2Process](int pExitCode, QProcess::ExitStatus pParStatus) {
++            lPar2Process->deleteLater();
++            mPar2Available = pParStatus == QProcess::NormalExit && pExitCode == 0;
++            probeFinished();
++        });
++        lPar2Process->start(QStringLiteral("bup"), {QStringLiteral("fsck"), QStringLiteral("--par2-ok")});
++    });
++    lBupProcess->start(QStringLiteral("bup"), {QStringLiteral("version")});
++
++    auto *lRsyncProcess = new QProcess(this);
++    lRsyncProcess->setProcessChannelMode(QProcess::MergedChannels);
++    connect(lRsyncProcess, &QProcess::errorOccurred, this, [this, lRsyncProcess](QProcess::ProcessError pError) {
++        if (pError == QProcess::FailedToStart) {
++            lRsyncProcess->deleteLater();
++            probeFinished();
++        }
++    });
++    connect(lRsyncProcess, &QProcess::finished, this, [this, lRsyncProcess](int, QProcess::ExitStatus pStatus) {
++        lRsyncProcess->deleteLater();
++        if (pStatus == QProcess::NormalExit) {
++            const QString lOutput = QString::fromLocal8Bit(lRsyncProcess->readLine());
++            mRsyncVersion = lOutput.split(QLatin1Char(' '), Qt::SkipEmptyParts).value(2);
++        }
++        probeFinished();
++    });
++    lRsyncProcess->start(QStringLiteral("rsync"), {QStringLiteral("--version")});
++    // mProbesPending starts at 2 (the bup chain and rsync); a failed start can report before start() returns.
++}
++
++void KupKcm::probeFinished()
++{
++    if (--mProbesPending == 0) {
++        finishSetup();
+     }
++}
+ 
++void KupKcm::finishSetup()
++{
++    QWidget *lPage;
+     if (mBupVersion.isEmpty() && mRsyncVersion.isEmpty()) {
++        lPage = new QWidget;
+         auto lSorryIcon = new QLabel;
+         lSorryIcon->setPixmap(QIcon::fromTheme(QStringLiteral("dialog-error")).pixmap(64, 64));
+         QString lInstallMessage = i18n(
+@@ -69,7 +136,7 @@ KupKcm::KupKcm(QObject *pParent, const KPluginMetaData &pPluginMetaData, const Q
+         auto lHLayout = new QHBoxLayout;
+         lHLayout->addWidget(lSorryIcon);
+         lHLayout->addWidget(lSorryText, 1);
+-        widget()->setLayout(lHLayout);
++        lPage->setLayout(lHLayout);
+     } else {
+         mConfig = KSharedConfig::openConfig(QStringLiteral("kuprc"));
+         mSettings = new KupSettings(mConfig, this);
+@@ -81,27 +148,22 @@ KupKcm::KupKcm(QObject *pParent, const KPluginMetaData &pPluginMetaData, const Q
+         }
+         createSettingsFrontPage();
+         addConfig(mSettings, mFrontPage);
+-
+-        mStackedLayout = new QStackedLayout;
+-        mStackedLayout->addWidget(mFrontPage);
+-        widget()->setLayout(mStackedLayout);
+-
+-        QListIterator<QVariant> lIter(pArgs);
+-        while (lIter.hasNext()) {
+-            QVariant lVariant = lIter.next();
+-            if (lVariant.userType() == QMetaType::QString) {
+-                QString lArgument = lVariant.toString();
+-                if (lArgument == QStringLiteral("show_sources") && lIter.hasNext()) {
+-                    mSourcePageToShow = lIter.next().toString().toInt();
+-                }
+-            }
+-        }
++        lPage = mFrontPage;
++        mSetupDone = true;
++    }
++    mStackedLayout->removeWidget(mCheckingPage);
++    delete mCheckingPage;
++    mCheckingPage = nullptr;
++    mStackedLayout->insertWidget(0, lPage);
++    mStackedLayout->setCurrentIndex(0);
++    if (mSetupDone) {
++        load(); // the host's own load() call came before the probes had answered and did nothing
+     }
+ }
+ 
+ void KupKcm::load()
+ {
+-    if (mBupVersion.isEmpty() && mRsyncVersion.isEmpty()) {
++    if (!mSetupDone) {
+         return;
+     }
+     // status will be set correctly after construction, set to checked here to
+@@ -129,6 +191,9 @@ void KupKcm::load()
+ 
+ void KupKcm::save()
+ {
++    if (!mSetupDone) {
++        return;
++    }
+     int lPlansRemoved = 0;
+     for (int i = 0; i < mPlans.count(); ++i) {
+         auto *lPlan = mPlans.at(i);
+@@ -229,6 +294,7 @@ void KupKcm::createSettingsFrontPage()
+     lScrollArea->setWidgetResizable(true);
+     lScrollArea->setFrameStyle(QFrame::NoFrame);
+ 
++    // ksr: kcm_kup/AddPlan
+     auto lAddPlanButton = new QPushButton(QIcon::fromTheme(QStringLiteral("list-add")), xi18nc("@action:button", "Add New Plan…"));
+     connect(lAddPlanButton, &QPushButton::clicked, this, [this] {
+         mPlans.append(new BackupPlan(mPlans.count() + 1, mConfig, this));
+@@ -242,22 +308,27 @@ void KupKcm::createSettingsFrontPage()
+         emit mStatusWidgets.at(mPlans.count() - 1)->configureMe();
+     });
+ 
++    // ksr: kcm_kup/BackupsEnabled
+     mEnableCheckBox = new QCheckBox(xi18nc("@option:check", "Backups enabled"));
+     mEnableCheckBox->setObjectName(QStringLiteral("kcfg_Backups enabled"));
+     connect(mEnableCheckBox, &QCheckBox::toggled, lAddPlanButton, &QPushButton::setEnabled);
+ 
++    // ksr: kcm_kup/OpenRestore
++    auto lFilediggerButton = new QPushButton(QIcon::fromTheme(QStringLiteral("document-open")), xi18nc("@action:button", "Restore From Backup…"));
++    lFilediggerButton->setToolTip(xi18nc("@info:tooltip", "Open and restore from existing backups"));
++    connect(lFilediggerButton, &QPushButton::clicked, [] {
++        KProcess::startDetached(QStringLiteral("kup-filedigger"));
++    });
++
++    // Top row: the switch, then the two things people come here to do (restore, add a plan).
+     lHLayout->addWidget(mEnableCheckBox);
+     lHLayout->addStretch();
++    lHLayout->addWidget(lFilediggerButton);
+     lHLayout->addWidget(lAddPlanButton);
+     lVLayout->addLayout(lHLayout);
+     lVLayout->addWidget(lScrollArea);
+     mFrontPage->setLayout(lVLayout);
+ 
+-    auto lFilediggerButton = new QPushButton(xi18nc("@action:button", "Open and restore from existing backups"));
+-    connect(lFilediggerButton, &QPushButton::clicked, [] {
+-        KProcess::startDetached(QStringLiteral("kup-filedigger"));
+-    });
+-    mVerticalLayout->addWidget(lFilediggerButton);
+     mVerticalLayout->addStretch(1);
+     lCentralWidget->setLayout(mVerticalLayout);
+ }
+@@ -303,8 +374,8 @@ void KupKcm::createPlanWidgets(int pIndex)
+     mPlanWidgets[pIndex] = lPlanWidget;
+     mStackedLayout->insertWidget(pIndex + 1, lPlanWidget);
+     mStatusWidgets[pIndex] = lStatusWidget;
+-    // always insert at end, before the file digger button and strech space at the bottom.
+-    mVerticalLayout->insertWidget(mVerticalLayout->count() - 2, lStatusWidget);
++    // always insert at end, before the stretch space at the bottom.
++    mVerticalLayout->insertWidget(mVerticalLayout->count() - 1, lStatusWidget);
+ }
+ 
+ void KupKcm::completelyRemovePlan(int pIndex)
+diff --git a/kcm/kupkcm.h b/kcm/kupkcm.h
+index a5f892e..2ff61bd 100644
+--- a/kcm/kupkcm.h
++++ b/kcm/kupkcm.h
+@@ -19,6 +19,7 @@ class KPageWidgetItem;
+ class QPushButton;
+ 
+ class QCheckBox;
++class QLabel;
+ class QStackedLayout;
+ class QVBoxLayout;
+ 
+@@ -36,24 +37,30 @@ public slots:
+     void showFrontPage();
+ 
+ private:
++    void probeBackupPrograms();
++    void probeFinished();
++    void finishSetup();
+     void createSettingsFrontPage();
+     void createPlanWidgets(int pIndex);
+     void completelyRemovePlan(int pIndex);
+     void partiallyRemovePlan(int pIndex);
+ 
+     KSharedConfigPtr mConfig;
+-    KupSettings *mSettings;
++    KupSettings *mSettings{};
+     QWidget *mFrontPage{};
+     QList<BackupPlan *> mPlans;
+     QList<BackupPlanWidget *> mPlanWidgets;
+     QList<PlanStatusWidget *> mStatusWidgets;
+     QList<KConfigDialogManager *> mConfigManagers;
+-    QStackedLayout *mStackedLayout;
++    QStackedLayout *mStackedLayout{};
++    QLabel *mCheckingPage{};
+     QVBoxLayout *mVerticalLayout{};
+     QCheckBox *mEnableCheckBox{};
+     QString mBupVersion;
+     QString mRsyncVersion;
+-    bool mPar2Available;
++    bool mPar2Available{false};
++    bool mSetupDone{false};
++    int mProbesPending{2};
+     int mSourcePageToShow;
+ };
+ 
+diff --git a/kcm/planstatuswidget.cpp b/kcm/planstatuswidget.cpp
+index e1baa72..d555f1c 100644
+--- a/kcm/planstatuswidget.cpp
++++ b/kcm/planstatuswidget.cpp
+@@ -27,11 +27,15 @@ PlanStatusWidget::PlanStatusWidget(BackupPlan *pPlan, QWidget *pParent)
+     mDescriptionLabel->setFont(lDescriptionFont);
+     mStatusIconLabel = new QLabel();
+     // TODO: add dbus interface to be notified from daemon when this is updated.
++    // ksr: kcm_kup/PlanStatus
+     mStatusTextLabel = new QLabel(mPlan->statusText());
+-    auto lConfigureButton = new QPushButton(QIcon::fromTheme(QStringLiteral("configure")), xi18nc("@action:button", "Configure"));
++    // ksr: kcm_kup/PlanConfigure
++    auto lConfigureButton = new QPushButton(QIcon::fromTheme(QStringLiteral("configure")), xi18nc("@action:button", "Configure…"));
+     connect(lConfigureButton, SIGNAL(clicked()), this, SIGNAL(configureMe()));
++    // ksr: kcm_kup/PlanRemove
+     auto lRemoveButton = new QPushButton(QIcon::fromTheme(QStringLiteral("list-remove")), xi18nc("@action:button", "Remove"));
+     connect(lRemoveButton, SIGNAL(clicked()), this, SIGNAL(removeMe()));
++    // ksr: kcm_kup/PlanDuplicate
+     auto lCopyButton = new QPushButton(QIcon::fromTheme(QStringLiteral("edit-duplicate")), xi18nc("@action:button", "Duplicate"));
+     connect(lCopyButton, &QPushButton::clicked, this, &PlanStatusWidget::duplicateMe);
+ 

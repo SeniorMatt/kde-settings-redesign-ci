@@ -1,0 +1,29 @@
+From 46c09931977417cad69d7f20838e6de1a551dc4b Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 02:14:25 +0500
+Subject: [PATCH 2/2] kcm_bluetooth: no 'No devices paired' while the manager
+ is still starting
+
+The empty-list placeholder had no operational check (the other two have), so it was drawn together with the busy indicator
+that shows during start-up. Now one or the other.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ src/kcm/ui/main.qml | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/src/kcm/ui/main.qml b/src/kcm/ui/main.qml
+index a80ac56..63fd404 100644
+--- a/src/kcm/ui/main.qml
++++ b/src/kcm/ui/main.qml
+@@ -152,7 +152,8 @@ KCMUtils.ScrollViewKCM {
+         }
+ 
+         Kirigami.PlaceholderMessage {
+-            visible: !noBluetoothMessage.visible && !bluetoothDisabledMessage.visible && list.count === 0
++            // not while the manager is still starting: the busy indicator is shown then, never both
++            visible: BluezQt.Manager.operational && !noBluetoothMessage.visible && !bluetoothDisabledMessage.visible && list.count === 0
+             icon.name: "network-bluetooth-activated"
+             text: i18n("No devices paired")
+             // ksr: kcm_bluetooth/NoDevices

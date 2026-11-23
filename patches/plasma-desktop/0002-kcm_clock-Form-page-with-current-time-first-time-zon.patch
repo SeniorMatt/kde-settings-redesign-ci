@@ -1,0 +1,406 @@
+From 56493a2aa5fa528723f0f0db201299392fd50a58 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 10:42:26 +0500
+Subject: [PATCH 02/31] kcm_clock: Form page with current time first, time zone
+ map on a sub-page
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Page type: Form (docs/page-design.md). Behaviour, timedated calls, polkit/KAuth and config are unchanged.
+
+Moved / renamed:
+- Top of the page now answers "what time is it": current date and time (heading) and current time zone,
+  then the one common choice, "Set date and time automatically" (kcm_clock/Set-date-and-time-automatically).
+- "Set Time" / "Set Date" -> "Set Time…" / "Set Date…" with icons, in a "Set manually:" row. They are disabled,
+  not hidden, while automatic is on (kcm_clock/Set-Time, kcm_clock/Set-Date).
+- The time zone map and region/zone lists moved from the main page to a sub-page (kcm.push TimeZonePage.qml),
+  opened by a "Change Time Zone…" button under a "Time zone" section (kcm_clock/TimeZone). The selector is
+  created asynchronously (Loader) with a busy indicator only after 150 ms.
+- Page now uses Kirigami.FormLayout instead of Kirigami.Form/FormGroup.
+- Relabel table: inventory/relabel/kcm_clock.tsv (outer repo). All 4 inventory rows kept, 0 lost.
+
+Speed:
+- The map (GeoJSON of all zones, QtLocation map, one polygon item per zone) is no longer built when the page opens.
+- timedated properties (CanNTP, NTP) are now read with an async GetAll call instead of two blocking property
+  getters in load()/refresh(); the checkbox enables when the reply arrives.
+- Numbers: before (fast, no CPU limit) frame 954-1099 ms, ready 1156-1328 ms; slow (0.5 CPU) frame 4601 ms,
+  ready 5402 ms (build/bench/clean/before-*.tsv). After: pending, see the outer repo.
+
+HIG: HIG-001, HIG-005, HIG-006, HIG-013 (design doc: disabled instead of hidden), HIG-017, HIG-019, HIG-020,
+HIG-023, HIG-047, HIG-058, HIG-062.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/dateandtime/dateandtime.cpp             |  45 ++++--
+ kcms/dateandtime/dateandtime.h               |   1 +
+ kcms/dateandtime/ui/TimeZonePage.qml         |  57 +++++++
+ kcms/dateandtime/ui/TimeZoneSelectorItem.qml |  33 ++++
+ kcms/dateandtime/ui/main.qml                 | 149 +++++++++----------
+ 5 files changed, 191 insertions(+), 94 deletions(-)
+ create mode 100644 kcms/dateandtime/ui/TimeZonePage.qml
+ create mode 100644 kcms/dateandtime/ui/TimeZoneSelectorItem.qml
+
+diff --git a/kcms/dateandtime/dateandtime.cpp b/kcms/dateandtime/dateandtime.cpp
+index 0324f47..d837c9c 100644
+--- a/kcms/dateandtime/dateandtime.cpp
++++ b/kcms/dateandtime/dateandtime.cpp
+@@ -8,6 +8,8 @@
+ 
+ #include <QDBusConnection>
+ #include <QDBusMessage>
++#include <QDBusPendingCallWatcher>
++#include <QDBusPendingReply>
+ #include <QTimeZone>
+ #include <qqml.h>
+ 
+@@ -186,7 +188,6 @@ void DateAndTime::load()
+ {
+     m_systemTimeZone = {};
+     m_timeZone = {};
+-    m_systemNtpEnabled = false;
+     m_systemNtpEnabledSet = false;
+     m_ntpEnabled = false;
+     m_ntpEnabledSet = false;
+@@ -199,19 +200,35 @@ void DateAndTime::load()
+ 
+ void DateAndTime::refresh()
+ {
+-    if (!m_systemNtpEnabledSet || !m_ntpAvailable) {
+-        OrgFreedesktopTimedate1Interface timeDatedIface("org.freedesktop.timedate1"_L1, "/org/freedesktop/timedate1"_L1, QDBusConnection::systemBus());
+-        const auto oldNtpAvailable = std::exchange(m_ntpAvailable, timeDatedIface.canNTP());
+-        if (m_ntpAvailable) {
+-            m_messages.remove(NtpUnavailableKey);
+-        } else {
+-            addMessage(Message::error(i18n("Unable to change NTP settings")), false, NtpUnavailableKey);
+-        }
+-        const auto oldSystemNtpEnabled = std::exchange(m_systemNtpEnabled, timeDatedIface.nTP());
+-        m_systemNtpEnabledSet = true;
+-        if (oldNtpAvailable != m_ntpAvailable || oldSystemNtpEnabled != m_systemNtpEnabled) {
+-            Q_EMIT ntpChanged();
+-        }
++    // ksr: timedated is queried asynchronously, the first frame must not wait for the system bus
++    if ((!m_systemNtpEnabledSet || !m_ntpAvailable) && !m_ntpQueryPending) {
++        m_ntpQueryPending = true;
++        auto call = QDBusMessage::createMethodCall("org.freedesktop.timedate1"_L1,
++                                                   "/org/freedesktop/timedate1"_L1,
++                                                   "org.freedesktop.DBus.Properties"_L1,
++                                                   "GetAll"_L1);
++        call << "org.freedesktop.timedate1"_L1;
++        auto *watcher = new QDBusPendingCallWatcher(QDBusConnection::systemBus().asyncCall(call), this);
++        connect(watcher, &QDBusPendingCallWatcher::finished, this, [this](QDBusPendingCallWatcher *w) {
++            w->deleteLater();
++            m_ntpQueryPending = false;
++            const QDBusPendingReply<QVariantMap> reply = *w;
++            // a failed call reads as "no NTP support", as the synchronous property getters did
++            const auto props = reply.isError() ? QVariantMap() : reply.value();
++            const auto oldNtpAvailable = std::exchange(m_ntpAvailable, props.value("CanNTP"_L1).toBool());
++            if (m_ntpAvailable) {
++                m_messages.remove(NtpUnavailableKey);
++                Q_EMIT messagesChanged();
++            } else {
++                addMessage(Message::error(i18n("Unable to change NTP settings")), false, NtpUnavailableKey);
++            }
++            const auto oldSystemNtpEnabled = std::exchange(m_systemNtpEnabled, props.value("NTP"_L1).toBool());
++            m_systemNtpEnabledSet = true;
++            if (oldNtpAvailable != m_ntpAvailable || oldSystemNtpEnabled != m_systemNtpEnabled) {
++                Q_EMIT ntpChanged();
++            }
++            checkNeedsSave();
++        });
+     }
+ 
+     // Timezone
+diff --git a/kcms/dateandtime/dateandtime.h b/kcms/dateandtime/dateandtime.h
+index bec79e9..85cf516 100644
+--- a/kcms/dateandtime/dateandtime.h
++++ b/kcms/dateandtime/dateandtime.h
+@@ -68,6 +68,7 @@ private:
+     QTimeZone m_timeZone = {};
+     QTimeZone timeZoneToUse() const;
+     bool m_ntpAvailable = false;
++    bool m_ntpQueryPending = false;
+     bool m_systemNtpEnabled = false;
+     bool m_systemNtpEnabledSet = false;
+     bool m_ntpEnabled = false;
+diff --git a/kcms/dateandtime/ui/TimeZonePage.qml b/kcms/dateandtime/ui/TimeZonePage.qml
+new file mode 100644
+index 0000000..be7edc4
+--- /dev/null
++++ b/kcms/dateandtime/ui/TimeZonePage.qml
+@@ -0,0 +1,57 @@
++/*
++    SPDX-FileCopyrightText: 2024 Niccolò Venerandi <niccolo@venerandi.com>
++    SPDX-FileCopyrightText: 2026 James Graham <james.h.graham@protonmail.com>
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++import QtQuick
++import QtQuick.Controls as QQC2
++import QtQuick.Layouts
++
++import org.kde.kirigami as Kirigami
++import org.kde.kcmutils as KCMUtils
++
++pragma ComponentBehavior: Bound
++
++// Sub-page of the Date & Time page: the map and the region/zone lists.
++// The selector (GeoJSON parse, map plugin, ~400 polygons) is created asynchronously after the page is shown.
++KCMUtils.SimpleKCM {
++    id: root
++
++    title: i18ndc("kcm_clock", "@title", "Time Zone")
++
++    ColumnLayout {
++        spacing: Kirigami.Units.largeSpacing
++
++        QQC2.Label {
++            // ksr: kcm_clock/TimeZone
++            Layout.fillWidth: true
++            text: root.KCMUtils.ConfigModule.timeZoneString
++            wrapMode: Text.Wrap
++        }
++
++        Loader {
++            id: selectorLoader
++            Layout.fillWidth: true
++            Layout.preferredHeight: item ? item.implicitHeight : Kirigami.Units.gridUnit * 20
++            Layout.minimumWidth: Kirigami.Units.gridUnit * 20
++            asynchronous: true
++            Component.onCompleted: setSource("TimeZoneSelectorItem.qml", {configModule: root.KCMUtils.ConfigModule})
++
++            // Only show a busy indicator when loading takes noticeable time
++            QQC2.BusyIndicator {
++                anchors.centerIn: parent
++                running: visible
++                visible: selectorLoader.status === Loader.Loading && showBusy.elapsed
++                Timer {
++                    id: showBusy
++                    property bool elapsed: false
++                    interval: 150
++                    running: selectorLoader.status === Loader.Loading
++                    onTriggered: elapsed = true
++                }
++            }
++        }
++    }
++}
+diff --git a/kcms/dateandtime/ui/TimeZoneSelectorItem.qml b/kcms/dateandtime/ui/TimeZoneSelectorItem.qml
+new file mode 100644
+index 0000000..87682af
+--- /dev/null
++++ b/kcms/dateandtime/ui/TimeZoneSelectorItem.qml
+@@ -0,0 +1,33 @@
++/*
++    SPDX-FileCopyrightText: 2024 Niccolò Venerandi <niccolo@venerandi.com>
++    SPDX-FileCopyrightText: 2026 James Graham <james.h.graham@protonmail.com>
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++import QtQuick
++
++import org.kde.kirigami as Kirigami
++
++import org.kde.plasma.workspace.timezoneselector as TimeZone
++
++TimeZone.TimezoneSelector {
++    id: timeZoneSelector
++
++    required property var configModule
++    implicitWidth: Kirigami.Units.gridUnit * 50
++    implicitHeight: Math.round(width * 3 / 4)
++
++    selectedTimeZone: configModule.timeZone
++
++    onSelectedTimeZoneChanged: {
++        configModule.timeZone = selectedTimeZone
++    }
++
++    Connections {
++        target: configModule
++        function onTimeZoneChanged(): void {
++            timeZoneSelector.selectedTimeZone = configModule.timeZone
++        }
++    }
++}
+diff --git a/kcms/dateandtime/ui/main.qml b/kcms/dateandtime/ui/main.qml
+index 0561b71..5392404 100644
+--- a/kcms/dateandtime/ui/main.qml
++++ b/kcms/dateandtime/ui/main.qml
+@@ -12,12 +12,11 @@ import QtQuick.Layouts
+ import org.kde.kirigami as Kirigami
+ import org.kde.kirigamiaddons.dateandtime as DateAndTime
+ import org.kde.kcmutils as KCMUtils
+-import org.kde.plasma.workspace.timezoneselector as TimeZone
+-
+-import org.kde.plasma.private.kcm_clock as DateTime
+ 
+ pragma ComponentBehavior: Bound
+ 
++// Form page. First thing: the current date, time and zone; then the one common choice (automatic or manual);
++// the world map lives on its own sub-page (TimeZonePage.qml) so it is only built when asked for.
+ KCMUtils.SimpleKCM {
+     id: root
+ 
+@@ -25,91 +24,81 @@ KCMUtils.SimpleKCM {
+         messages: root.KCMUtils.ConfigModule.messages
+     }
+ 
+-    Kirigami.Form {
+-        Kirigami.FormGroup {
+-            Kirigami.FormEntry {
+-                contentItem: QQC2.Label {
+-                    Layout.fillWidth: true
+-                    text: root.KCMUtils.ConfigModule.dateTimeString
+-                    wrapMode: Text.Wrap
+-                }
+-            }
+-            Kirigami.FormEntry {
+-                contentItem: QQC2.CheckBox {
+-                    text: i18ndc("kcm_clock", "@option", "Set date and time automatically")
+-                    enabled: root.KCMUtils.ConfigModule.ntpAvailable
+-                    checked: root.KCMUtils.ConfigModule.ntpEnabled
++    Kirigami.FormLayout {
++        Kirigami.Heading {
++            Kirigami.FormData.label: i18ndc("kcm_clock", "@label", "Current time:")
++            level: 2
++            text: root.KCMUtils.ConfigModule.dateTimeString
++            wrapMode: Text.Wrap
++            Layout.fillWidth: true
++        }
+ 
+-                    onToggled: root.KCMUtils.ConfigModule.ntpEnabled = !root.KCMUtils.ConfigModule.ntpEnabled
+-                }
+-            }
+-            Kirigami.FormEntry {
+-                visible: !root.KCMUtils.ConfigModule.ntpEnabled
+-                contentItem: RowLayout {
+-                    spacing: Kirigami.Units.smallSpacing
++        RowLayout {
++            Kirigami.FormData.label: i18ndc("kcm_clock", "@label", "Time zone:")
++            spacing: Kirigami.Units.largeSpacing
+ 
+-                    QQC2.Button {
+-                        id: timeButton
+-                        Layout.fillWidth: true
+-                        text: i18ndc("kcm_clock", "@action:button as in set the current time on the machine", "Set Time")
+-                        onClicked: {
+-                            let dialog = Qt.createComponent("org.kde.kirigamiaddons.dateandtime", "TimePopup").createObject(QQC2.Overlay.overlay, {
+-                                value: root.KCMUtils.ConfigModule.dateTime
+-                            }) as DateAndTime.TimePopup;
+-                            dialog.onAccepted.connect(() => {
+-                                root.KCMUtils.ConfigModule.setTime(dialog.value);
+-                            });
+-                            dialog.open();
+-                        }
+-                    }
+-                    QQC2.Button {
+-                        id: dateButton
+-                        Layout.fillWidth: true
+-                        text: i18ndc("kcm_clock", "@action:button as in set the current date on the machine", "Set Date")
+-                        onClicked: {
+-                            let dialog = Qt.createComponent("org.kde.kirigamiaddons.dateandtime", "DatePopup").createObject(QQC2.Overlay.overlay, {
+-                                width: Kirigami.Units.gridUnit * 18,
+-                                height: Kirigami.Units.gridUnit * 18,
+-                                value: root.KCMUtils.ConfigModule.dateTime
+-                            }) as DateAndTime.DatePopup;
+-                            dialog.onAccepted.connect(() => {
+-                                root.KCMUtils.ConfigModule.setDate(dialog.value);
+-                            });
+-                            dialog.open();
+-                        }
+-                    }
+-                }
++            QQC2.Label {
++                text: root.KCMUtils.ConfigModule.timeZoneString
++                wrapMode: Text.Wrap
++                Layout.fillWidth: true
++            }
++            QQC2.Button {
++                // ksr: kcm_clock/TimeZone
++                icon.name: "globe"
++                text: i18ndc("kcm_clock", "@action:button opens the map and list of time zones", "Change…")
++                Accessible.name: i18ndc("kcm_clock", "@action:button", "Change time zone")
++                onClicked: root.KCMUtils.ConfigModule.push("TimeZonePage.qml")
+             }
+         }
+-        Kirigami.FormGroup {
+-            title: i18ndc("kcm_clock", "@title", "Time Zone")
+ 
+-            Kirigami.FormEntry {
+-                contentItem: QQC2.Label {
+-                    Layout.fillWidth: true
+-                    text: root.KCMUtils.ConfigModule.timeZoneString
+-                    wrapMode: Text.Wrap
+-                }
+-            }
+-            Kirigami.FormEntry {
+-                contentItem: TimeZone.TimezoneSelector {
+-                    id: timeZoneSelector
+-                    Layout.fillWidth: true
+-                    implicitWidth: Kirigami.Units.gridUnit * 50
+-                    implicitHeight: Math.round(width * 3 / 4)
++        Item {
++            Kirigami.FormData.isSection: true
++        }
+ 
+-                    selectedTimeZone: root.KCMUtils.ConfigModule.timeZone
++        QQC2.CheckBox {
++            // ksr: kcm_clock/Set-date-and-time-automatically
++            text: i18ndc("kcm_clock", "@option:check", "Set date and time automatically")
++            enabled: root.KCMUtils.ConfigModule.ntpAvailable
++            checked: root.KCMUtils.ConfigModule.ntpEnabled
++            Accessible.name: text
+ 
+-                    onSelectedTimeZoneChanged: {
+-                        root.KCMUtils.ConfigModule.timeZone = selectedTimeZone
+-                    }
++            onToggled: root.KCMUtils.ConfigModule.ntpEnabled = !root.KCMUtils.ConfigModule.ntpEnabled
++        }
+ 
+-                    Connections {
+-                        target: root.KCMUtils.ConfigModule
+-                        function onTimeZoneChanged(): void {
+-                            timeZoneSelector.selectedTimeZone = root.KCMUtils.ConfigModule.timeZone
+-                        }
+-                    }
++        RowLayout {
++            Kirigami.FormData.label: i18ndc("kcm_clock", "@label", "Set manually:")
++            // Disabled, not hidden, while the automatic setting is on
++            enabled: !root.KCMUtils.ConfigModule.ntpEnabled
++            spacing: Kirigami.Units.smallSpacing
++
++            QQC2.Button {
++                // ksr: kcm_clock/Set-Time
++                icon.name: "clock"
++                text: i18ndc("kcm_clock", "@action:button as in set the current time on the machine", "Set Time…")
++                onClicked: {
++                    let dialog = Qt.createComponent("org.kde.kirigamiaddons.dateandtime", "TimePopup").createObject(QQC2.Overlay.overlay, {
++                        value: root.KCMUtils.ConfigModule.dateTime
++                    }) as DateAndTime.TimePopup;
++                    dialog.onAccepted.connect(() => {
++                        root.KCMUtils.ConfigModule.setTime(dialog.value);
++                    });
++                    dialog.open();
++                }
++            }
++            QQC2.Button {
++                // ksr: kcm_clock/Set-Date
++                icon.name: "view-calendar"
++                text: i18ndc("kcm_clock", "@action:button as in set the current date on the machine", "Set Date…")
++                onClicked: {
++                    let dialog = Qt.createComponent("org.kde.kirigamiaddons.dateandtime", "DatePopup").createObject(QQC2.Overlay.overlay, {
++                        width: Kirigami.Units.gridUnit * 18,
++                        height: Kirigami.Units.gridUnit * 18,
++                        value: root.KCMUtils.ConfigModule.dateTime
++                    }) as DateAndTime.DatePopup;
++                    dialog.onAccepted.connect(() => {
++                        root.KCMUtils.ConfigModule.setDate(dialog.value);
++                    });
++                    dialog.open();
+                 }
+             }
+         }

@@ -1,0 +1,256 @@
+From 1080552082dff49780852fdc178a6bfd77ae771e Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 02:20:27 +0500
+Subject: [PATCH] kcm_plasmakeyboard: sections Feedback/Typing/Alternate
+ characters, link to the KWin virtual keyboard page
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Page type: Form (docs/page-design.md 1). Config keys (plasmakeyboardrc General/*), kcfg and the layouts sub-pages are unchanged.
+
+Moved / renamed:
+- Top section (no title): 'Keyboard layouts:' button is now 'Choose Layouts…'; new row 'Show on screen:' with a 'Virtual Keyboard…' button
+  that opens kcm_virtualkeyboard (KCMLauncher.openSystemSettings), so this page and the KWin page (e75933e) point at each other
+  instead of the user guessing which one picks the keyboard and when it appears.
+- Checkbox groups get noun section titles instead of 'Key press feedback:'/'General:' form labels: Feedback, Typing, Alternate characters.
+  Texts say what happens: 'Play a sound on key press', 'Vibrate on key press', 'Show a popup with the pressed character',
+  'Navigate the keyboard with arrow keys', 'Capitalize the first letter of a sentence' (were Sound, Vibration, Character popup,
+  Keyboard navigation, Auto-capitalization). Rows kcm_plasmakeyboard/*, relabel: inventory/relabel/kcm_plasmakeyboard.tsv.
+- Every control has Accessible.name and KCM.SettingStateBinding (changed-settings highlight; hold delay disabled while the popup is off).
+  Handlers use onToggled/onValueModified so loading values never writes them back.
+- Markers added on the Add Layout sub-page controls (no wording change) so --strict can prove them.
+HIG ids: HIG-001/005/006, HIG-019, HIG-057, HIG-058.
+
+Speed cause (code): none on the main page (plain bindings, no D-Bus or models); the Add Layout page builds the grouped layout models
+only when pushed (keyboardlayoutmodel.cpp). Nothing changed there. After-numbers: pending, manager will measure.
+Not built yet. Unconfirmed without a build: SettingStateBinding settingName equals the kcfg entry key (soundEnabled etc.; entries have no name=,
+so key is the name); handset/mediacenter variants left as they are (Kirigami Addons FormCard, different form factors).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcm/ui/KeyboardLayoutSelectorListView.qml |   3 +
+ kcm/ui/KeyboardLayoutsPage.qml            |   1 +
+ kcm/ui/main.qml                           | 111 +++++++++++++++++-----
+ 3 files changed, 93 insertions(+), 22 deletions(-)
+
+diff --git a/kcm/ui/KeyboardLayoutSelectorListView.qml b/kcm/ui/KeyboardLayoutSelectorListView.qml
+index 4b23440..e08c0f0 100644
+--- a/kcm/ui/KeyboardLayoutSelectorListView.qml
++++ b/kcm/ui/KeyboardLayoutSelectorListView.qml
+@@ -34,6 +34,7 @@ ListView {
+ 
+             Kirigami.SearchField {
+                 id: searchField
++                // ksr: kcm_plasmakeyboard/availableKeyboardLayoutGroups-filterText
+                 placeholderText: i18n("Filter languages…")
+                 Accessible.name: i18n("Filter languages")
+ 
+@@ -48,6 +49,7 @@ ListView {
+             QQC2.CheckBox {
+                 Layout.topMargin: Kirigami.Units.smallSpacing
+ 
++                // ksr: kcm_plasmakeyboard/hasHiddenKeyboardLayouts
+                 text: i18nc("@option:check", "Show all layouts")
+                 visible: kcm.hasHiddenKeyboardLayouts
+                 checked: !kcm.keyboardLayoutFormFactorFilterEnabled
+@@ -104,6 +106,7 @@ ListView {
+                     }
+ 
+                     QQC2.Label {
++                        // ksr: kcm_plasmakeyboard/availableKeyboardLayoutGroups-toggleExpanded
+                         Layout.fillWidth: true
+                         text: {
+                             const selectionText = selectedCount === 0
+diff --git a/kcm/ui/KeyboardLayoutsPage.qml b/kcm/ui/KeyboardLayoutsPage.qml
+index fa32ae5..f05ed94 100644
+--- a/kcm/ui/KeyboardLayoutsPage.qml
++++ b/kcm/ui/KeyboardLayoutsPage.qml
+@@ -18,6 +18,7 @@ Kirigami.ScrollablePage {
+     actions: [
+         Kirigami.Action {
+             id: addLayoutAction
++            // ksr: kcm_plasmakeyboard/AddLayout
+             text: i18n("Add Layout…")
+             icon.name: "list-add-symbolic"
+             onTriggered: kcm.push("AddKeyboardLayoutPage.qml")
+diff --git a/kcm/ui/main.qml b/kcm/ui/main.qml
+index 4995636..a160560 100644
+--- a/kcm/ui/main.qml
++++ b/kcm/ui/main.qml
+@@ -15,77 +15,144 @@ import org.kde.kcmutils as KCM
+ KCM.SimpleKCM {
+     id: root
+ 
++    // Page type: Form (docs/page-design.md 1). Same look as the KWin "Virtual Keyboard" page next to it.
+     Kirigami.FormLayout {
+         id: formLayout
+ 
+         width: flickable.width
+ 
++        // First section has no title: the two things people open this page for.
+         QQC2.Button {
++            // ksr: kcm_plasmakeyboard/Configure
+             Kirigami.FormData.label: i18n("Keyboard layouts:")
+-            text: i18n("Configure…")
++            text: i18n("Choose Layouts…")
+             icon.name: "languages"
+             onClicked: kcm.push("KeyboardLayoutsPage.qml")
+         }
+ 
++        QQC2.Button {
++            // Which keyboard to use and when it appears is set on the KWin page, not here.
++            Kirigami.FormData.label: i18n("Show on screen:")
++            text: i18n("Virtual Keyboard…")
++            icon.name: "input-keyboard-virtual"
++            onClicked: KCM.KCMLauncher.openSystemSettings("kcm_virtualkeyboard")
++        }
++
++        Kirigami.Separator {
++            Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18n("Feedback")
++        }
++
+         QQC2.CheckBox {
+-            id: soundsEnabled
+-            Kirigami.FormData.label: i18n("Key press feedback:")
+-            text: i18n("Sound")
++            // ksr: kcm_plasmakeyboard/plasmaKeyboardSettings-soundEnabled
++            text: i18n("Play a sound on key press")
++            Accessible.name: text
++
++            KCM.SettingStateBinding {
++                configObject: kcm.plasmaKeyboardSettings
++                settingName: "soundEnabled"
++            }
+ 
+             checked: kcm.plasmaKeyboardSettings.soundEnabled
+-            onCheckedChanged: kcm.plasmaKeyboardSettings.soundEnabled = checked
++            onToggled: kcm.plasmaKeyboardSettings.soundEnabled = checked
+         }
+ 
+         QQC2.CheckBox {
+-            id: vibrationEnabled
+-            text: i18n("Vibration")
++            // ksr: kcm_plasmakeyboard/plasmaKeyboardSettings-vibrationEnabled
++            text: i18n("Vibrate on key press")
++            Accessible.name: text
++
++            KCM.SettingStateBinding {
++                configObject: kcm.plasmaKeyboardSettings
++                settingName: "vibrationEnabled"
++            }
+ 
+             checked: kcm.plasmaKeyboardSettings.vibrationEnabled
+-            onCheckedChanged: kcm.plasmaKeyboardSettings.vibrationEnabled = checked
++            onToggled: kcm.plasmaKeyboardSettings.vibrationEnabled = checked
+         }
+ 
+         QQC2.CheckBox {
+-            id: characterPopupEnabled
+-            text: i18n("Character popup")
++            // ksr: kcm_plasmakeyboard/plasmaKeyboardSettings-characterPopupEnabled
++            text: i18n("Show a popup with the pressed character")
++            Accessible.name: text
++
++            KCM.SettingStateBinding {
++                configObject: kcm.plasmaKeyboardSettings
++                settingName: "characterPopupEnabled"
++            }
+ 
+             checked: kcm.plasmaKeyboardSettings.characterPopupEnabled
+-            onCheckedChanged: kcm.plasmaKeyboardSettings.characterPopupEnabled = checked
++            onToggled: kcm.plasmaKeyboardSettings.characterPopupEnabled = checked
++        }
++
++        Kirigami.Separator {
++            Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18n("Typing")
+         }
+ 
+         QQC2.CheckBox {
+-            id: keyboardNavigationEnabled
+-            Kirigami.FormData.label: i18n("General:")
+-            text: i18n("Keyboard navigation")
++            // ksr: kcm_plasmakeyboard/plasmaKeyboardSettings-keyboardNavigationEnabled
++            text: i18n("Navigate the keyboard with arrow keys")
++            Accessible.name: text
++
++            KCM.SettingStateBinding {
++                configObject: kcm.plasmaKeyboardSettings
++                settingName: "keyboardNavigationEnabled"
++            }
+ 
+             checked: kcm.plasmaKeyboardSettings.keyboardNavigationEnabled
+-            onCheckedChanged: kcm.plasmaKeyboardSettings.keyboardNavigationEnabled = checked
++            onToggled: kcm.plasmaKeyboardSettings.keyboardNavigationEnabled = checked
+         }
+ 
+         QQC2.CheckBox {
+-            id: autoCapitalizationEnabled
+-            text: i18n("Auto-capitalization")
++            // ksr: kcm_plasmakeyboard/plasmaKeyboardSettings-autoCapitalizationEnabled
++            text: i18n("Capitalize the first letter of a sentence")
++            Accessible.name: text
++
++            KCM.SettingStateBinding {
++                configObject: kcm.plasmaKeyboardSettings
++                settingName: "autoCapitalizationEnabled"
++            }
+ 
+             checked: kcm.plasmaKeyboardSettings.autoCapitalizationEnabled
+-            onCheckedChanged: kcm.plasmaKeyboardSettings.autoCapitalizationEnabled = checked
++            onToggled: kcm.plasmaKeyboardSettings.autoCapitalizationEnabled = checked
++        }
++
++        Kirigami.Separator {
++            Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18n("Alternate characters")
+         }
+ 
+         QQC2.CheckBox {
+             id: diacriticsCheckbox
+-            Kirigami.FormData.label: i18n("Alternate characters:")
++            // ksr: kcm_plasmakeyboard/plasmaKeyboardSettings-diacriticsPopupEnabled
+             text: i18n("Show popup when holding a key")
++            Accessible.name: text
++
++            KCM.SettingStateBinding {
++                configObject: kcm.plasmaKeyboardSettings
++                settingName: "diacriticsPopupEnabled"
++            }
+ 
+             checked: kcm.plasmaKeyboardSettings.diacriticsPopupEnabled
+-            onCheckedChanged: kcm.plasmaKeyboardSettings.diacriticsPopupEnabled = checked
++            onToggled: kcm.plasmaKeyboardSettings.diacriticsPopupEnabled = checked
+         }
+ 
+         QQC2.SpinBox {
+             id: diacriticsDelaySpinBox
++            // ksr: kcm_plasmakeyboard/plasmaKeyboardSettings-diacriticsHoldThresholdMs
+             Kirigami.FormData.label: i18n("Hold delay:")
++            Accessible.name: Kirigami.FormData.label
+             from: 100
+             to: 1500
+             stepSize: 50
+ 
+-            enabled: diacriticsCheckbox.checked
++            KCM.SettingStateBinding {
++                configObject: kcm.plasmaKeyboardSettings
++                settingName: "diacriticsHoldThresholdMs"
++                extraEnabledConditions: diacriticsCheckbox.checked
++            }
++
+             value: kcm.plasmaKeyboardSettings.diacriticsHoldThresholdMs
+ 
+             // Include the `milliseconds` suffix in the spinbox instead of the label
+@@ -102,7 +169,7 @@ KCM.SimpleKCM {
+                 return number;
+             }
+ 
+-            onValueChanged: kcm.plasmaKeyboardSettings.diacriticsHoldThresholdMs = value
++            onValueModified: kcm.plasmaKeyboardSettings.diacriticsHoldThresholdMs = value
+         }
+     }
+ }

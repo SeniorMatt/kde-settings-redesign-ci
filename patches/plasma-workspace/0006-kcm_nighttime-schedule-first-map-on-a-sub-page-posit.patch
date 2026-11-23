@@ -1,0 +1,596 @@
+From e93e7abc1a9c262ccf6d8ee895ad06f525be52f5 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 14:07:38 +0500
+Subject: [PATCH 06/24] kcm_nighttime: schedule first, map on a sub-page,
+ position service created after the first frame
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Page type: Form (docs/page-design.md). Config keys (nighttimesettings.kcfg), the schedule preview, validator and the
+KNightTime code are unchanged. NOT BUILT YET (owner stopped heavy work); checked statically only.
+
+Moved / renamed:
+- State first: the sun path chart (sunrise/sunset times) stays on top, with one small line "Night Light and dynamic
+  wallpapers follow this schedule." (was a centred paragraph above everything). (HIG-001/005)
+- Page is now KCM.SimpleKCM + Kirigami.FormLayout (was the newer Kirigami.Form/FormGroup/FormEntry). "Determine
+  sunrise and sunset times" combo box is a radio pair "Sunrise and sunset: Based on device's location / Custom times"
+  (two short exclusive options, page-design section 3). Same setting "source".
+- Section "Location" (noun): "Use automatic location" -> "Detect automatically", with the service note under it
+  (shown once the service is known); "Use manual location:" -> "Enter coordinates" with an indented Latitude/Longitude row
+  (disabled, not hidden, while Detect is chosen); the world map is a sub-page: button "Choose on Map…"
+  -> kcm.push("MapPage.qml") (titled "Choose Location"). Section "Times" (custom times): Sunrise, Sunset, Transition
+  duration, unchanged wording. Only the section of the chosen source is shown (alternatives, not dependent options).
+- Lat/long fields got Accessible.name. Nothing removed; ia/duplicates.md: nothing to link (Night Light links here from
+  its own page).
+- Relabel table: inventory/relabel/kcm_nighttime.tsv (outer repo). Inventory --strict: 11 rows ok, 0 lost.
+- HIG ids: HIG-001, HIG-005, HIG-006, HIG-057 (noun sections), page-design sections 2, 3, 7.
+
+Speed (cause found in code, not measured):
+- main.qml created the WorldMap (ShadowedRectangle, Flickable, a 148 KB worldmap.png decoded by a synchronous Image,
+  zoom buttons, attribution TextEdit) and a PositionSource up front, even for the "custom times" source (the map was
+  only `visible: false`). Creating a PositionSource loads the Qt Positioning backend plugin (GeoClue2) on the GUI thread
+  in componentComplete.
+- Now: the map exists only on the sub-page and its Image is asynchronous; the PositionSource sits in a Loader that is
+  active only for "location + automatic", and only one event-loop turn after the first frame (positionAllowed Timer).
+- After numbers: pending, manager will measure.
+
+Not built yet; uncertain: kcm.push(url, {positionSource: <object>}) passing a QObject from a Loader item; the schedule
+preview gets an invalid QGeoCoordinate (as before for an inactive source) until the position arrives; Layout.maximumWidth
+hint label inside FormLayout (16 gridUnits) as in kcm_clock 56095d1.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/nighttime/ui/MapPage.qml  |  45 ++++
+ kcms/nighttime/ui/WorldMap.qml |   3 +
+ kcms/nighttime/ui/main.qml     | 406 +++++++++++++++++----------------
+ 3 files changed, 257 insertions(+), 197 deletions(-)
+ create mode 100644 kcms/nighttime/ui/MapPage.qml
+
+diff --git a/kcms/nighttime/ui/MapPage.qml b/kcms/nighttime/ui/MapPage.qml
+new file mode 100644
+index 0000000..198be26
+--- /dev/null
++++ b/kcms/nighttime/ui/MapPage.qml
+@@ -0,0 +1,45 @@
++/*
++    SPDX-FileCopyrightText: 2025 Vlad Zahorodnii <vlad.zahorodnii@kde.org>
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++
++import QtQuick
++import QtQuick.Layouts
++
++import org.kde.kirigami as Kirigami
++import org.kde.kcmutils as KCM
++
++// Sub-page of the Day-Night Cycle page: pick the location on a world map. Built only when "Choose on Map…" is pressed.
++KCM.SimpleKCM {
++    id: page
++
++    // The position service of the main page (may be null while it is not running).
++    property var positionSource: null
++
++    title: i18nc("@title", "Choose Location")
++
++    WorldMap {
++        id: map
++        width: parent.width
++        latitude: {
++            if (kcm.settings.automaticLocation) {
++                return page.positionSource ? page.positionSource.position.coordinate.latitude : 0;
++            } else {
++                return kcm.settings.manualLatitude;
++            }
++        }
++        longitude: {
++            if (kcm.settings.automaticLocation) {
++                return page.positionSource ? page.positionSource.position.coordinate.longitude : 0;
++            } else {
++                return kcm.settings.manualLongitude;
++            }
++        }
++        onAccepted: (latitude, longitude) => {
++            kcm.settings.manualLatitude = latitude;
++            kcm.settings.manualLongitude = longitude;
++            kcm.settings.automaticLocation = false;
++        }
++    }
++}
+diff --git a/kcms/nighttime/ui/WorldMap.qml b/kcms/nighttime/ui/WorldMap.qml
+index bcb0e18..66d8fa9 100644
+--- a/kcms/nighttime/ui/WorldMap.qml
++++ b/kcms/nighttime/ui/WorldMap.qml
+@@ -79,6 +79,8 @@ ColumnLayout {
+         font: Kirigami.Theme.smallFont
+     }
+ 
++    // ksr: kcm_nighttime/Zoom-in
++    // ksr: kcm_nighttime/Zoom-out
+     Kirigami.ShadowedRectangle {
+         id: mapRect
+         Layout.fillWidth: true
+@@ -113,6 +115,7 @@ ColumnLayout {
+             Image {
+                 id: mapImage
+                 source: Qt.resolvedUrl("./worldmap.png") // loaded using QRC
++                asynchronous: true
+                 transform: Scale {
+                     id: mapZoom
+                     xScale: mapRect.currentScale
+diff --git a/kcms/nighttime/ui/main.qml b/kcms/nighttime/ui/main.qml
+index af90421..cc696f5 100644
+--- a/kcms/nighttime/ui/main.qml
++++ b/kcms/nighttime/ui/main.qml
+@@ -13,254 +13,267 @@ import org.kde.kirigami as Kirigami
+ import org.kde.kcmutils as KCM
+ import org.kde.private.kcms.nighttime as Private
+ 
++// Form page (docs/page-design.md): the sunrise/sunset preview (the state) first, then where the times come from.
++// The world map is a sub-page (MapPage.qml), and the position service is only created when it is needed.
+ KCM.SimpleKCM {
+     id: root
+ 
+-    ColumnLayout {
+-    QQC2.Label {
+-        Layout.fillWidth: true
+-        Layout.margins: Kirigami.Units.gridUnit
+-        Layout.maximumWidth: form.implicitWidth
+-        Layout.alignment: Qt.AlignCenter
+-
+-        text: i18nc("@info", "Time-based features such as Night Light and dynamic wallpapers can be synchronized with the day-night cycle. Choose your preferred cycle here.")
+-        textFormat: Text.PlainText
+-        wrapMode: Text.WordWrap
+-        horizontalAlignment: Text.AlignHCenter
++    readonly property bool useLocation: kcm.settings.source === Private.NightTimeSettings.Location
++
++    // One event-loop turn after the first frame: Qt Positioning loads its backend plugin when a PositionSource is created.
++    property bool positionAllowed: false
++    Timer {
++        interval: 0
++        running: true
++        onTriggered: root.positionAllowed = true
+     }
+ 
+-    Kirigami.Form {
+-        id: form
+-        Layout.fillWidth: true
+-        Kirigami.FormGroup {
+-
+-            Kirigami.FormEntry {
+-                fullWidth: true
+-                contentItem: RowLayout {
+-                    Layout.fillWidth: true
+-                    Item {
+-                        Layout.fillWidth: true
+-                    }
+-                    SunPath {
+-                        Layout.fillWidth: true
+-                        Layout.preferredWidth: Kirigami.Units.gridUnit * 30
+-                        Layout.maximumWidth: Kirigami.Units.gridUnit * 30
+-                        Layout.alignment: Qt.AlignHCenter
+-                        schedule: schedulePreview
+-                    }
+-                    Item {
+-                        Layout.fillWidth: true
+-                    }
++    Loader {
++        id: positionLoader
++        active: root.positionAllowed && root.useLocation && kcm.settings.automaticLocation
++        sourceComponent: PositionSource {
++            active: true
++        }
++    }
++    readonly property var positionSource: positionLoader.item
++    readonly property var detectedCoordinate: positionSource ? positionSource.position.coordinate : QtPositioning.coordinate()
++
++    ColumnLayout {
++        spacing: Kirigami.Units.largeSpacing
++
++        // ksr: kcm_nighttime/sun-path
++        SunPath {
++            Layout.fillWidth: true
++            Layout.preferredWidth: Kirigami.Units.gridUnit * 30
++            Layout.maximumWidth: Kirigami.Units.gridUnit * 30
++            Layout.alignment: Qt.AlignHCenter
++            schedule: schedulePreview
++        }
++
++        QQC2.Label {
++            Layout.fillWidth: true
++            Layout.maximumWidth: Kirigami.Units.gridUnit * 30
++            Layout.alignment: Qt.AlignHCenter
++            text: i18nc("@info", "Night Light and dynamic wallpapers follow this schedule.")
++            textFormat: Text.PlainText
++            wrapMode: Text.WordWrap
++            horizontalAlignment: Text.AlignHCenter
++            font: Kirigami.Theme.smallFont
++        }
++
++        Kirigami.FormLayout {
++            id: form
++            Layout.fillWidth: true
++
++            // ksr: kcm_nighttime/source
++            QQC2.RadioButton {
++                id: locationSourceButton
++                Kirigami.FormData.label: i18nc("@label", "Sunrise and sunset:")
++                QQC2.ButtonGroup.group: sourceGroup
++                text: i18nc("@option:radio", "Based on device's location")
++                checked: root.useLocation
++                onToggled: kcm.settings.source = Private.NightTimeSettings.Location
++
++                KCM.SettingStateBinding {
++                    configObject: kcm.settings
++                    settingName: "source"
+                 }
+             }
+ 
+-            Kirigami.FormSeparator {}
+-
+-            Kirigami.FormEntry {
+-                contentItem: QQC2.ComboBox {
+-                    id: sourceComboBox
+-                    Layout.minimumWidth: Kirigami.Units.gridUnit * 17
+-                    Kirigami.FormData.label: i18nc("@label:listbox part of a sentence: 'Determine sunrise and sunset times [based on]'", "Determine sunrise and sunset times:")
+-                    currentIndex: kcm.settings.source
+-                    textRole: "text"
+-                    valueRole: "value"
+-                    model: [
+-                        { value: Private.NightTimeSettings.Location, text: i18nc("@item:inlistbox part of a sentence: 'Determine sunrise and sunset times'", "Based on device's location") },
+-                        { value: Private.NightTimeSettings.Times, text: i18nc("@item:inlistbox part of a sentence: 'Determine sunrise and sunset times'", "Using custom times") }
+-                    ]
+-                    onActivated: kcm.settings.source = currentValue;
++            QQC2.RadioButton {
++                id: timesSourceButton
++                QQC2.ButtonGroup.group: sourceGroup
++                text: i18nc("@option:radio", "Custom times")
++                checked: kcm.settings.source === Private.NightTimeSettings.Times
++                onToggled: kcm.settings.source = Private.NightTimeSettings.Times
+ 
+-                    KCM.SettingStateBinding {
+-                        configObject: kcm.settings
+-                        settingName: "source"
+-                    }
++                KCM.SettingStateBinding {
++                    configObject: kcm.settings
++                    settingName: "source"
+                 }
+             }
+ 
+-            Kirigami.FormEntry {
+-                visible: kcm.settings.source === Private.NightTimeSettings.Times
+-                contentItem: TimeField {
+-                    id: sunriseStartTimeField
+-                    Kirigami.FormData.label: i18nc("@label", "Sunrise:")
+-                    value: kcm.settings.sunriseStart
+-                    onActivated: (value) => {
+-                        kcm.settings.sunriseStart = Private.DarkLightScheduleValidator.validate(value, kcm.settings.sunsetStart, kcm.settings.transitionDuration);
+-                    }
++            QQC2.ButtonGroup { id: sourceGroup }
+ 
+-                    KCM.SettingStateBinding {
+-                        configObject: kcm.settings
+-                        settingName: "sunriseStart"
+-                    }
++            // Location
++            Kirigami.Separator {
++                Kirigami.FormData.isSection: true
++                Kirigami.FormData.label: i18nc("@title:group", "Location")
++                visible: root.useLocation
++            }
++
++            QQC2.RadioButton {
++                id: automaticLocationButton
++                visible: root.useLocation
++                QQC2.ButtonGroup.group: locationGroup
++                // ksr: kcm_nighttime/automaticLocation
++                text: i18nc("@option:radio", "Detect automatically")
++                checked: kcm.settings.automaticLocation
++                onToggled: kcm.settings.automaticLocation = true
++
++                KCM.SettingStateBinding {
++                    configObject: kcm.settings
++                    settingName: "automaticLocation"
+                 }
+             }
+ 
+-            Kirigami.FormEntry {
+-                visible: kcm.settings.source === Private.NightTimeSettings.Times
+-                contentItem: TimeField {
+-                    id: sunsetStartTimeField
+-                    Kirigami.FormData.label: i18nc("@label", "Sunset:")
+-                    value: kcm.settings.sunsetStart
+-                    onActivated: (value) => {
+-                        kcm.settings.sunsetStart = Private.DarkLightScheduleValidator.validate(value, kcm.settings.sunriseStart, kcm.settings.transitionDuration);
+-                    }
++            QQC2.Label {
++                visible: root.useLocation && root.positionSource !== null && root.positionSource !== undefined
++                Layout.fillWidth: true
++                Layout.maximumWidth: Kirigami.Units.gridUnit * 16
++                wrapMode: Text.WordWrap
++                font: Kirigami.Theme.smallFont
++                textFormat: Text.StyledText
++                onLinkActivated: (url) => Qt.openUrlExternally(url)
++                text: !root.positionSource ? "" : root.positionSource.name === "geoclue2"
++                    ? xi18nc("@info", "The <application>GeoClue2</application> service will be used to periodically update the device's location using GPS or cell tower triangulation if available, or else by sending its IP address to <link url='https://geoip.com/privacy/'>GeoIP</link>.")
++                    : xi18nc("@info", "The <application>%1</application> service will be used to periodically update the device's location. Please open a bug report at <link url='https://bugs.kde.org'>https://bugs.kde.org</link> asking KDE developers to write a detailed description of what this service will do.", root.positionSource.name)
++            }
++
++            RowLayout {
++                visible: root.useLocation
++                spacing: Kirigami.Units.smallSpacing
++                Kirigami.FormData.buddyFor: manualLocationButton
++
++                QQC2.RadioButton {
++                    id: manualLocationButton
++                    QQC2.ButtonGroup.group: locationGroup
++                    // ksr: kcm_nighttime/automaticLocation
++                    text: i18nc("@option:radio", "Enter coordinates")
++                    checked: !kcm.settings.automaticLocation
++                    onToggled: kcm.settings.automaticLocation = false
+ 
+                     KCM.SettingStateBinding {
+                         configObject: kcm.settings
+-                        settingName: "sunsetStart"
++                        settingName: "automaticLocation"
+                     }
+                 }
+             }
+ 
+-            Kirigami.FormEntry {
+-                visible: kcm.settings.source === Private.NightTimeSettings.Times
+-                contentItem: QQC2.SpinBox {
+-                    Kirigami.FormData.label: i18nc("@label:spinbox", "Transition duration:")
+-                    from: 60
+-                    to: 36000
+-                    stepSize: 300
+-                    value: kcm.settings.transitionDuration
+-                    textFromValue: (value, locale) => i18ncp("@item:valuesuffix transition duration", "%1 minute", "%1 minutes", Math.round(value / 60))
+-                    valueFromText: (text, locale) => parseInt(text) * 60
+-                    onValueModified: {
+-                        kcm.settings.sunsetStart = Private.DarkLightScheduleValidator.validate(kcm.settings.sunsetStart, kcm.settings.sunriseStart, value);
+-                        kcm.settings.transitionDuration = value;
+-                    }
++            RowLayout {
++                visible: root.useLocation
++                Layout.leftMargin: Kirigami.Units.gridUnit
++                spacing: Kirigami.Units.smallSpacing
++
++                QQC2.Label {
++                    enabled: manualLocationButton.checked
++                    text: i18nc("@label", "Latitude:")
++                    textFormat: Text.PlainText
++                }
++
++                NumberField {
++                    implicitWidth: 4 * Kirigami.Units.gridUnit
++                    from: -90
++                    to: 90
++                    value: kcm.settings.manualLatitude
++                    onValueEdited: (value) => kcm.settings.manualLatitude = value
++                    Accessible.name: i18nc("@label", "Latitude")
+ 
+                     KCM.SettingStateBinding {
+                         configObject: kcm.settings
+-                        settingName: "transitionDuration"
++                        settingName: "manualLatitude"
++                        extraEnabledConditions: manualLocationButton.checked
+                     }
+                 }
+-            }
+ 
+-            Kirigami.FormEntry {
+-                fullWidth: true
+-                visible: kcm.settings.source === Private.NightTimeSettings.Location
+-                subtitle: automaticLocationProvider.name === "geoclue2"
+-                        ? xi18nc("@info", "The <application>GeoClue2</application> service will be used to periodically update the device's location using GPS or cell tower triangulation if available, or else by sending its IP address to <link url='https://geoip.com/privacy/'>GeoIP</link>.")
+-                        : xi18nc("@info", "The <application>%1</application> service will be used to periodically update the device's location. Please open a bug report at <link url='https://bugs.kde.org'>https://bugs.kde.org</link> asking KDE developers to write a detailed description of what this service will do.", automaticLocationProvider.name)
+-                contentItem: QQC2.RadioButton {
+-                    QQC2.ButtonGroup.group: locationGroup
+-                    text: i18nc("@option:radio", "Automatically detect location")
+-                    checked: kcm.settings.automaticLocation
+-                    onToggled: kcm.settings.automaticLocation = true;
++                QQC2.Label {
++                    enabled: manualLocationButton.checked
++                    text: i18nc("@label", "Longitude:")
++                    textFormat: Text.PlainText
++                }
++
++                NumberField {
++                    implicitWidth: 4 * Kirigami.Units.gridUnit
++                    from: -180
++                    to: 180
++                    value: kcm.settings.manualLongitude
++                    onValueEdited: (value) => kcm.settings.manualLongitude = value
++                    Accessible.name: i18nc("@label", "Longitude")
+ 
+                     KCM.SettingStateBinding {
+                         configObject: kcm.settings
+-                        settingName: "automaticLocation"
++                        settingName: "manualLongitude"
++                        extraEnabledConditions: manualLocationButton.checked
+                     }
+-                    QQC2.ButtonGroup { id: locationGroup }
+                 }
+             }
+ 
+-            Kirigami.FormEntry {
+-                fullWidth: true
+-                visible: kcm.settings.source === Private.NightTimeSettings.Location
+-                contentItem: RowLayout {
+-                    Layout.fillWidth: true
+-                    Kirigami.FormData.buddyFor: manualLocationButton
+-                    spacing: Kirigami.Units.smallSpacing
+-
+-                    QQC2.RadioButton {
+-                        id: manualLocationButton
+-                        QQC2.ButtonGroup.group: locationGroup
+-                        text: i18nc("@option:radio", "Use manual location:")
+-                        checked: !kcm.settings.automaticLocation
+-                        onToggled: kcm.settings.automaticLocation = false;
+-
+-                        KCM.SettingStateBinding {
+-                            configObject: kcm.settings
+-                            settingName: "automaticLocation"
+-                        }
+-                    }
++            // The map is built only when the sub-page is opened. ksr: kcm_nighttime/world-map-pick
++            QQC2.Button {
++                visible: root.useLocation
++                Layout.leftMargin: Kirigami.Units.gridUnit
++                icon.name: "mark-location"
++                text: i18nc("@action:button opens a world map", "Choose on Map…")
++                onClicked: kcm.push("MapPage.qml", { positionSource: root.positionSource })
++            }
+ 
+-                    QQC2.Label {
+-                        enabled: manualLocationButton.checked
+-                        text: i18nc("@label", "Latitude:")
+-                        textFormat: Text.PlainText
+-                    }
++            // Custom times
++            Kirigami.Separator {
++                Kirigami.FormData.isSection: true
++                Kirigami.FormData.label: i18nc("@title:group", "Times")
++                visible: !root.useLocation
++            }
+ 
+-                    NumberField {
+-                        implicitWidth: 4 * Kirigami.Units.gridUnit
+-                        from: -90
+-                        to: 90
+-                        value: kcm.settings.manualLatitude
+-                        onValueEdited: (value) => kcm.settings.manualLatitude = value;
+-
+-                        KCM.SettingStateBinding {
+-                            configObject: kcm.settings
+-                            settingName: "manualLatitude"
+-                            extraEnabledConditions: manualLocationButton.checked
+-                        }
+-                    }
++            TimeField {
++                id: sunriseStartTimeField
++                visible: !root.useLocation
++                Kirigami.FormData.label: i18nc("@label", "Sunrise:")
++                value: kcm.settings.sunriseStart
++                onActivated: (value) => {
++                    kcm.settings.sunriseStart = Private.DarkLightScheduleValidator.validate(value, kcm.settings.sunsetStart, kcm.settings.transitionDuration);
++                }
+ 
+-                    QQC2.Label {
+-                        enabled: manualLocationButton.checked
+-                        text: i18nc("@label", "Longitude:")
+-                        textFormat: Text.PlainText
+-                    }
++                KCM.SettingStateBinding {
++                    configObject: kcm.settings
++                    settingName: "sunriseStart"
++                }
++            }
+ 
+-                    NumberField {
+-                        implicitWidth: 4 * Kirigami.Units.gridUnit
+-                        from: -180
+-                        to: 180
+-                        value: kcm.settings.manualLongitude
+-                        onValueEdited: (value) => kcm.settings.manualLongitude = value;
+-
+-                        KCM.SettingStateBinding {
+-                            configObject: kcm.settings
+-                            settingName: "manualLongitude"
+-                            extraEnabledConditions: manualLocationButton.checked
+-                        }
+-                    }
++            TimeField {
++                id: sunsetStartTimeField
++                visible: !root.useLocation
++                Kirigami.FormData.label: i18nc("@label", "Sunset:")
++                value: kcm.settings.sunsetStart
++                onActivated: (value) => {
++                    kcm.settings.sunsetStart = Private.DarkLightScheduleValidator.validate(value, kcm.settings.sunriseStart, kcm.settings.transitionDuration);
++                }
++
++                KCM.SettingStateBinding {
++                    configObject: kcm.settings
++                    settingName: "sunsetStart"
+                 }
+             }
+ 
+-            Kirigami.FormEntry {
+-                fullWidth: true
+-                visible: kcm.settings.source === Private.NightTimeSettings.Location
+-                contentItem: RowLayout {
+-                    Layout.fillWidth: true
+-                    Item {
+-                        Layout.fillWidth: true
+-                    }
+-                    WorldMap {
+-                        Layout.alignment: Qt.AlignHCenter
+-                        latitude: if (kcm.settings.automaticLocation) {
+-                            return automaticLocationProvider.position.coordinate.latitude;
+-                        } else {
+-                            return kcm.settings.manualLatitude;
+-                        }
+-                        longitude: if (kcm.settings.automaticLocation) {
+-                            return automaticLocationProvider.position.coordinate.longitude;
+-                        } else {
+-                            return kcm.settings.manualLongitude;
+-                        }
+-                        onAccepted: (latitude, longitude) => {
+-                            kcm.settings.manualLatitude = latitude;
+-                            kcm.settings.manualLongitude = longitude;
+-                            kcm.settings.automaticLocation = false;
+-                        }
+-                    }
+-                    Item {
+-                        Layout.fillWidth: true
+-                    }
++            QQC2.SpinBox {
++                visible: !root.useLocation
++                Kirigami.FormData.label: i18nc("@label:spinbox", "Transition duration:")
++                from: 60
++                to: 36000
++                stepSize: 300
++                value: kcm.settings.transitionDuration
++                textFromValue: (value, locale) => i18ncp("@item:valuesuffix transition duration", "%1 minute", "%1 minutes", Math.round(value / 60))
++                valueFromText: (text, locale) => parseInt(text) * 60
++                onValueModified: {
++                    kcm.settings.sunsetStart = Private.DarkLightScheduleValidator.validate(kcm.settings.sunsetStart, kcm.settings.sunriseStart, value);
++                    kcm.settings.transitionDuration = value;
++                }
++
++                KCM.SettingStateBinding {
++                    configObject: kcm.settings
++                    settingName: "transitionDuration"
+                 }
+             }
+-        }
+-    }
+ 
+-    PositionSource {
+-        id: automaticLocationProvider
+-        active: kcm.settings.source === Private.NightTimeSettings.Location && kcm.settings.automaticLocation
++            QQC2.ButtonGroup { id: locationGroup }
++        }
+     }
+ 
+     Private.DarkLightSchedulePreview {
+         id: schedulePreview
+         coordinate: {
+-            if (kcm.settings.source === Private.NightTimeSettings.Location) {
++            if (root.useLocation) {
+                 if (kcm.settings.automaticLocation) {
+-                    return automaticLocationProvider.position.coordinate;
++                    return root.detectedCoordinate;
+                 } else {
+                     return QtPositioning.coordinate(kcm.settings.manualLatitude, kcm.settings.manualLongitude);
+                 }
+@@ -272,5 +285,4 @@ KCM.SimpleKCM {
+         sunriseStart: kcm.settings.sunriseStart
+         transitionDuration: kcm.settings.transitionDuration
+     }
+-    }
+ }

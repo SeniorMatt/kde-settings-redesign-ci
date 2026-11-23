@@ -1,0 +1,677 @@
+From 60298a709429377c3e0ac16f5d68a66f8f922856 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 14:01:00 +0500
+Subject: [PATCH 03/12] kcm_kwinoptions: one Form page, mouse actions on two
+ sub-pages, no eager tabs
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Note: on master this page is already QML (Kirigami.Form), not QtWidgets; the rework stays in QML.
+
+Moved / renamed (config keys, kcfg and KWin reload signal unchanged):
+- The tab bar Focus | Titlebar Actions | Window Actions | Movement & Placement is gone: the tabs were not peers.
+  Main page now = focus and raising (first, untitled group), Placement, Snapping (was "Movement"), Overlay Positioning.
+  Window Behavior.qml is Focus.qml + the groups of MovementAndPlacement.qml.
+- Toolbar buttons "Titlebar Actions…" and "Window Actions…" push TitlebarActionsPage.qml / WindowActionsPage.qml.
+- Group titles on those pages: "Titlebar Actions" -> "Titlebar" (it repeated the page title), "Maximize Button Actions" ->
+  "Maximize Button", "Unfocused Inner Window Actions" -> "Unfocused Windows", "Inner Window, Titlebar, and Frame
+  Actions" -> "Modifier Key". No "Advanced" anywhere.
+HIG ids: HIG-001/005/006, HIG-013/015 (long rare forms on named sub-pages), HIG-023, HIG-057. Page-design.md 1, 2, 6, 7.
+
+Speed cause (code evidence): ui/main.qml put Focus, TitlebarActions, WindowActions and MovementAndPlacement in one
+StackLayout, which instantiates every child up front: about 100 controls (ComboBoxes with JS model arrays,
+SettingStateBindings, the OSD position selector) were built before the first frame although one tab is visible. Now
+the first frame builds only the main form (about a third of them); the two action forms are created when opened
+(kcm.push loads the page lazily). The C++ side has no blocking work (kwinoptions.cpp constructor only registers
+settings).
+After-numbers: pending, manager will measure. Not built yet. Unconfirmed without a build: Kirigami.Form as a child
+of ColumnLayout with Layout.fillWidth (same shape as before, where the StackLayout sat in a ColumnLayout).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ src/kcms/options/ui/MovementAndPlacement.qml  | 216 ------------------
+ src/kcms/options/ui/TitlebarActions.qml       |   6 +-
+ src/kcms/options/ui/TitlebarActionsPage.qml   |  22 ++
+ src/kcms/options/ui/WindowActions.qml         |   6 +-
+ src/kcms/options/ui/WindowActionsPage.qml     |  22 ++
+ .../ui/{Focus.qml => WindowBehavior.qml}      | 206 +++++++++++++++++
+ src/kcms/options/ui/main.qml                  |  65 ++----
+ 7 files changed, 277 insertions(+), 266 deletions(-)
+ delete mode 100644 src/kcms/options/ui/MovementAndPlacement.qml
+ create mode 100644 src/kcms/options/ui/TitlebarActionsPage.qml
+ create mode 100644 src/kcms/options/ui/WindowActionsPage.qml
+ rename src/kcms/options/ui/{Focus.qml => WindowBehavior.qml} (58%)
+
+diff --git a/src/kcms/options/ui/MovementAndPlacement.qml b/src/kcms/options/ui/MovementAndPlacement.qml
+deleted file mode 100644
+index fd15ec5..0000000
+--- a/src/kcms/options/ui/MovementAndPlacement.qml
++++ /dev/null
+@@ -1,216 +0,0 @@
+-/*
+-    SPDX-FileCopyrightText: 2026 Tobias Ozór <tobiasozor@outlook.com>
+-
+-    SPDX-License-Identifier: GPL-2.0-or-later
+-*/
+-
+-import QtQuick
+-import QtQuick.Controls as QQC2
+-
+-import org.kde.kcmutils as KCM
+-import org.kde.kirigami as Kirigami
+-
+-import org.kde.plasma.kcm.kwinoptions
+-
+-Kirigami.Form {
+-    Kirigami.FormGroup {
+-        title: i18ndc("kcmkwm", "@title:group", "Movement")
+-        Kirigami.FormEntry {
+-            contentItem: QQC2.SpinBox {
+-                id: borderSnapZoneSpinBox
+-
+-                readonly property string label: i18nd("kcmkwm", "Screen &edge snap zone:")
+-                Kirigami.FormData.label: label
+-                Accessible.name: label
+-
+-                from: 0
+-                to: 100
+-
+-                textFromValue: (value, locale) => {
+-                    return value === 0 ? i18nd("kcmkwm", "None") : i18ndc("kcmkwm", "short for pixel(s)", "%1 px", value)
+-                }
+-
+-                valueFromText: (text, locale) => {
+-                    return Number.fromLocaleString(locale, text.replace(i18ndc("kcmkwm", "short for pixel(s)", "px"), ""))
+-                }
+-
+-                value: kcm.kwinSettings.borderSnapZone
+-                onValueModified: kcm.kwinSettings.borderSnapZone = value
+-
+-                KCM.SettingStateBinding {
+-                    configObject: kcm.kwinSettings
+-                    settingName: "BorderSnapZone"
+-                }
+-            }
+-        }
+-
+-        Kirigami.FormEntry {
+-            contentItem: QQC2.SpinBox {
+-                id: windowSnapZoneSpinBox
+-                readonly property string label: i18nd("kcmkwm", "&Window snap zone:")
+-                Kirigami.FormData.label: label
+-                Accessible.name: label
+-
+-                from: 0
+-                to: 100
+-
+-                textFromValue: (value, locale) => {
+-                    return value === 0 ? i18nd("kcmkwm", "None") : i18ndc("kcmkwm", "short for pixel(s)", "%1 px", value)
+-                }
+-
+-                valueFromText: (text, locale) => {
+-                    return Number.fromLocaleString(locale, text.replace(i18ndc("kcmkwm", "short for pixel(s)", "px"), ""))
+-                }
+-
+-                value: kcm.kwinSettings.windowSnapZone
+-                onValueModified: kcm.kwinSettings.windowSnapZone = value
+-
+-                KCM.SettingStateBinding {
+-                    configObject: kcm.kwinSettings
+-                    settingName: "WindowSnapZone"
+-                }
+-            }
+-        }
+-
+-        Kirigami.FormEntry {
+-            contentItem: QQC2.SpinBox {
+-                id: centerSnapZoneSpinBox
+-
+-                readonly property string label: i18nd("kcmkwm", "&Center snap zone:")
+-                Kirigami.FormData.label: label
+-                Accessible.name: label
+-
+-                from: 0
+-                to: 100
+-
+-                textFromValue: (value, locale) => {
+-                    return value === 0 ? i18nd("kcmkwm", "None") : i18ndc("kcmkwm", "short for pixel(s)", "%1 px", value)
+-                }
+-
+-                valueFromText: (text, locale) => {
+-                    return Number.fromLocaleString(locale, text.replace(i18ndc("kcmkwm", "short for pixel(s)", "px"), ""))
+-                }
+-
+-                value: kcm.kwinSettings.centerSnapZone
+-                onValueModified: kcm.kwinSettings.centerSnapZone = value
+-
+-                KCM.SettingStateBinding {
+-                    configObject: kcm.kwinSettings
+-                    settingName: "CenterSnapZone"
+-                }
+-            }
+-        }
+-
+-        Kirigami.FormEntry {
+-            contentItem: QQC2.CheckBox {
+-                Kirigami.FormData.label: i18nd("kcmkwm", "&Snap windows:")
+-                text: i18nd("kcmkwm", "Only when overlapping")
+-
+-                checked: kcm.kwinSettings.snapOnlyWhenOverlapping
+-                onCheckedChanged: kcm.kwinSettings.snapOnlyWhenOverlapping = checked
+-
+-                KCM.SettingStateBinding {
+-                    configObject: kcm.kwinSettings
+-                    settingName: "SnapOnlyWhenOverlapping"
+-                }
+-            }
+-        }
+-    }
+-
+-
+-    Kirigami.FormGroup {
+-        title: i18ndc("kcmkwm", "@title:group", "Placement")
+-        Kirigami.FormEntry {
+-            contentItem: QQC2.ComboBox {
+-                Kirigami.FormData.label: i18nd("kcmkwm", "Window &placement:")
+-                textRole: "text"
+-                valueRole: "value"
+-                model: [
+-                    { text: i18nd("kcmkwm", "Minimal Overlapping"), value: KWinOptionsSettings.Smart },
+-                    { text: i18nd("kcmkwm", "Maximized"), value: KWinOptionsSettings.Maximizing },
+-                    { text: i18nd("kcmkwm", "Random"), value: KWinOptionsSettings.Random },
+-                    { text: i18nd("kcmkwm", "Centered"), value: KWinOptionsSettings.Centered },
+-                    { text: i18nd("kcmkwm", "In Top-Left Corner"), value: KWinOptionsSettings.ZeroCornered },
+-                    { text: i18nd("kcmkwm", "Under mouse"), value: KWinOptionsSettings.UnderMouse },
+-                ]
+-                currentValue: kcm.kwinSettings.placement
+-                onActivated: kcm.kwinSettings.placement = currentValue
+-
+-                KCM.SettingStateBinding {
+-                    configObject: kcm.kwinSettings
+-                    settingName: "Placement"
+-                }
+-            }
+-        }
+-    }
+-
+-
+-    Kirigami.FormGroup {
+-        title: i18ndc("kcmkwm", "@title:group", "Overlay Positioning")
+-        Kirigami.FormEntry {
+-            id: osdPositionEntry
+-            title: i18ndc("kcmkwm", "@label:chooser", "OSD popups:")
+-            contentItem: OnScreenDisplayPositionSelector {
+-                Accessible.name: osdPositionEntry.title
+-
+-                selectedPosition: kcm.kwinSettings.onScreenDisplayPosition
+-                onPositionPicked: position => kcm.kwinSettings.onScreenDisplayPosition = position
+-
+-                KCM.SettingStateBinding {
+-                    configObject: kcm.kwinSettings
+-                    settingName: "OnScreenDisplayPosition"
+-                }
+-            }
+-        }
+-        Kirigami.FormEntry {
+-            visible: kcm.isPiPEnabled
+-            title: i18ndc("kcmkwm", "@label:chooser", "Picture-in-picture:")
+-            contentItem: QQC2.ComboBox {
+-                textRole: "text"
+-                valueRole: "value"
+-                model: [
+-                    { text: i18nd("kcmkwm", "Top-left"), value: Qt.Corner.TopLeftCorner },
+-                    { text: i18nd("kcmkwm", "Top-right"), value: Qt.Corner.TopRightCorner },
+-                    { text: i18nd("kcmkwm", "Bottom-left"), value: Qt.Corner.BottomLeftCorner },
+-                    { text: i18nd("kcmkwm", "Bottom-right"), value: Qt.Corner.BottomRightCorner },
+-                ]
+-                currentValue: kcm.kwinSettings.pictureInPictureHomeCorner
+-                onActivated: kcm.kwinSettings.pictureInPictureHomeCorner = currentValue
+-
+-                KCM.SettingStateBinding {
+-                    configObject: kcm.kwinSettings
+-                    settingName: "PictureInPictureHomeCorner"
+-                }
+-            }
+-        }
+-        Kirigami.FormEntry {
+-            id: marginSpinboxLabel
+-            visible: kcm.isPiPEnabled
+-            title: i18nd("kcmkwm", "Margin:")
+-            contentItem: QQC2.SpinBox {
+-                id: marginSpinbox
+-
+-                Accessible.name: marginSpinboxLabel.title
+-                from: 0
+-                to: 99
+-                stepSize: 1
+-
+-                textFromValue: (value, locale) => {
+-                    return i18ndc("kcmkwm", "short for pixel(s)", "%1 px", value)
+-                }
+-
+-                valueFromText: (text, locale) => {
+-                    return Number.fromLocaleString(locale, text.replace(i18ndc("kcmkwm", "short for pixel(s)", "px"), ""))
+-                }
+-
+-                value: kcm.kwinSettings.pictureInPictureMargin
+-                onValueModified: kcm.kwinSettings.pictureInPictureMargin = value
+-
+-                KCM.SettingStateBinding {
+-                    configObject: kcm.kwinSettings
+-                    settingName: "PictureInPictureMargin"
+-                }
+-            }
+-        }
+-    }
+-}
+diff --git a/src/kcms/options/ui/TitlebarActions.qml b/src/kcms/options/ui/TitlebarActions.qml
+index 3511a5e..2d873e1 100644
+--- a/src/kcms/options/ui/TitlebarActions.qml
++++ b/src/kcms/options/ui/TitlebarActions.qml
+@@ -46,7 +46,8 @@ Kirigami.Form {
+     ]
+ 
+     Kirigami.FormGroup {
+-        title: i18nd("kcmkwm", "Titlebar Actions")
++        // ksr: kcm_kwinoptions/TitlebarDoubleClickCommand (group was "Titlebar Actions", same name as the page)
++        title: i18nd("kcmkwm", "Titlebar")
+ 
+         Kirigami.FormEntry {
+             title: i18nd("kcmkwm", "&Double-click:")
+@@ -245,7 +246,8 @@ Kirigami.Form {
+ 
+ 
+     Kirigami.FormGroup {
+-        title: i18nd("kcmkwm", "Maximize Button Actions")
++        // ksr: kcm_kwinoptions/MaximizeButtonLeftClickCommand (group was "Maximize Button Actions")
++        title: i18nd("kcmkwm", "Maximize Button")
+ 
+         Kirigami.FormEntry {
+             title: i18nd("kcmkwm", "L&eft click:")
+diff --git a/src/kcms/options/ui/TitlebarActionsPage.qml b/src/kcms/options/ui/TitlebarActionsPage.qml
+new file mode 100644
+index 0000000..8eb9b77
+--- /dev/null
++++ b/src/kcms/options/ui/TitlebarActionsPage.qml
+@@ -0,0 +1,22 @@
++/*
++    SPDX-FileCopyrightText: 2026 Tobias Ozór <tobiasozor@outlook.com>
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++
++import QtQuick
++import QtQuick.Layouts
++
++import org.kde.kcmutils as KCM
++
++// Sub-page of Window Behavior (kcm.push): what clicks and the wheel do on titlebars, frames and the maximize button.
++// These were the "Titlebar Actions" tab.
++KCM.SimpleKCM {
++    title: i18nd("kcmkwm", "Titlebar Actions")
++
++    ColumnLayout {
++        TitlebarActions {
++            Layout.fillWidth: true
++        }
++    }
++}
+diff --git a/src/kcms/options/ui/WindowActions.qml b/src/kcms/options/ui/WindowActions.qml
+index 1d079a1..046841e 100644
+--- a/src/kcms/options/ui/WindowActions.qml
++++ b/src/kcms/options/ui/WindowActions.qml
+@@ -39,7 +39,8 @@ Kirigami.Form {
+     ]
+ 
+     Kirigami.FormGroup {
+-        title: i18ndc("kcmkwm", "@title:group", "Unfocused Inner Window Actions")
++        // ksr: kcm_kwinoptions/CommandWindow1 (group was "Unfocused Inner Window Actions")
++        title: i18ndc("kcmkwm", "@title:group", "Unfocused Windows")
+ 
+         Kirigami.FormEntry {
+             contentItem: QQC2.ComboBox {
+@@ -117,7 +118,8 @@ Kirigami.Form {
+     }
+ 
+     Kirigami.FormGroup {
+-        title: i18nd("kcmkwm", "Inner Window, Titlebar, and Frame Actions")
++        // ksr: kcm_kwinoptions/CommandAllKey (group was "Inner Window, Titlebar, and Frame Actions")
++        title: i18nd("kcmkwm", "Modifier Key")
+ 
+         Kirigami.FormEntry {
+             title: i18nd("kcmkwm", "Mo&difier key:")
+diff --git a/src/kcms/options/ui/WindowActionsPage.qml b/src/kcms/options/ui/WindowActionsPage.qml
+new file mode 100644
+index 0000000..a1e6b52
+--- /dev/null
++++ b/src/kcms/options/ui/WindowActionsPage.qml
+@@ -0,0 +1,22 @@
++/*
++    SPDX-FileCopyrightText: 2026 Tobias Ozór <tobiasozor@outlook.com>
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++
++import QtQuick
++import QtQuick.Layouts
++
++import org.kde.kcmutils as KCM
++
++// Sub-page of Window Behavior (kcm.push): what clicks do on unfocused windows, and the modifier-key actions.
++// These were the "Window Actions" tab.
++KCM.SimpleKCM {
++    title: i18nd("kcmkwm", "Window Actions")
++
++    ColumnLayout {
++        WindowActions {
++            Layout.fillWidth: true
++        }
++    }
++}
+diff --git a/src/kcms/options/ui/Focus.qml b/src/kcms/options/ui/WindowBehavior.qml
+similarity index 58%
+rename from src/kcms/options/ui/Focus.qml
+rename to src/kcms/options/ui/WindowBehavior.qml
+index 9315b5a..924dc99 100644
+--- a/src/kcms/options/ui/Focus.qml
++++ b/src/kcms/options/ui/WindowBehavior.qml
+@@ -14,6 +14,10 @@ import org.kde.kirigami as Kirigami
+ import org.kde.plasma.kcm.kwinoptions
+ 
+ Kirigami.Form {
++    id: root
++
++    // ksr: the page opens on focus and raising (kcm_kwinoptions/FocusPolicy ...); placement and snapping follow, the
++    // titlebar and window mouse actions are sub-pages (TitlebarActionsPage.qml, WindowActionsPage.qml)
+     Kirigami.FormGroup {
+         Kirigami.FormEntry {
+             contentItem: QQC2.ComboBox {
+@@ -282,4 +286,206 @@ Kirigami.Form {
+             }
+         }
+     }
++
++    Kirigami.FormGroup {
++        // ksr: kcm_kwinoptions/Placement (unchanged, now on the main page)
++        title: i18ndc("kcmkwm", "@title:group", "Placement")
++        Kirigami.FormEntry {
++            contentItem: QQC2.ComboBox {
++                Kirigami.FormData.label: i18nd("kcmkwm", "Window &placement:")
++                textRole: "text"
++                valueRole: "value"
++                model: [
++                    { text: i18nd("kcmkwm", "Minimal Overlapping"), value: KWinOptionsSettings.Smart },
++                    { text: i18nd("kcmkwm", "Maximized"), value: KWinOptionsSettings.Maximizing },
++                    { text: i18nd("kcmkwm", "Random"), value: KWinOptionsSettings.Random },
++                    { text: i18nd("kcmkwm", "Centered"), value: KWinOptionsSettings.Centered },
++                    { text: i18nd("kcmkwm", "In Top-Left Corner"), value: KWinOptionsSettings.ZeroCornered },
++                    { text: i18nd("kcmkwm", "Under mouse"), value: KWinOptionsSettings.UnderMouse },
++                ]
++                currentValue: kcm.kwinSettings.placement
++                onActivated: kcm.kwinSettings.placement = currentValue
++
++                KCM.SettingStateBinding {
++                    configObject: kcm.kwinSettings
++                    settingName: "Placement"
++                }
++            }
++        }
++    }
++
++    Kirigami.FormGroup {
++        // ksr: kcm_kwinoptions/BorderSnapZone (group was "Movement")
++        title: i18ndc("kcmkwm", "@title:group", "Snapping")
++        Kirigami.FormEntry {
++            contentItem: QQC2.SpinBox {
++                id: borderSnapZoneSpinBox
++
++                readonly property string label: i18nd("kcmkwm", "Screen &edge snap zone:")
++                Kirigami.FormData.label: label
++                Accessible.name: label
++
++                from: 0
++                to: 100
++
++                textFromValue: (value, locale) => {
++                    return value === 0 ? i18nd("kcmkwm", "None") : i18ndc("kcmkwm", "short for pixel(s)", "%1 px", value)
++                }
++
++                valueFromText: (text, locale) => {
++                    return Number.fromLocaleString(locale, text.replace(i18ndc("kcmkwm", "short for pixel(s)", "px"), ""))
++                }
++
++                value: kcm.kwinSettings.borderSnapZone
++                onValueModified: kcm.kwinSettings.borderSnapZone = value
++
++                KCM.SettingStateBinding {
++                    configObject: kcm.kwinSettings
++                    settingName: "BorderSnapZone"
++                }
++            }
++        }
++
++        Kirigami.FormEntry {
++            contentItem: QQC2.SpinBox {
++                id: windowSnapZoneSpinBox
++                readonly property string label: i18nd("kcmkwm", "&Window snap zone:")
++                Kirigami.FormData.label: label
++                Accessible.name: label
++
++                from: 0
++                to: 100
++
++                textFromValue: (value, locale) => {
++                    return value === 0 ? i18nd("kcmkwm", "None") : i18ndc("kcmkwm", "short for pixel(s)", "%1 px", value)
++                }
++
++                valueFromText: (text, locale) => {
++                    return Number.fromLocaleString(locale, text.replace(i18ndc("kcmkwm", "short for pixel(s)", "px"), ""))
++                }
++
++                value: kcm.kwinSettings.windowSnapZone
++                onValueModified: kcm.kwinSettings.windowSnapZone = value
++
++                KCM.SettingStateBinding {
++                    configObject: kcm.kwinSettings
++                    settingName: "WindowSnapZone"
++                }
++            }
++        }
++
++        Kirigami.FormEntry {
++            contentItem: QQC2.SpinBox {
++                id: centerSnapZoneSpinBox
++
++                readonly property string label: i18nd("kcmkwm", "&Center snap zone:")
++                Kirigami.FormData.label: label
++                Accessible.name: label
++
++                from: 0
++                to: 100
++
++                textFromValue: (value, locale) => {
++                    return value === 0 ? i18nd("kcmkwm", "None") : i18ndc("kcmkwm", "short for pixel(s)", "%1 px", value)
++                }
++
++                valueFromText: (text, locale) => {
++                    return Number.fromLocaleString(locale, text.replace(i18ndc("kcmkwm", "short for pixel(s)", "px"), ""))
++                }
++
++                value: kcm.kwinSettings.centerSnapZone
++                onValueModified: kcm.kwinSettings.centerSnapZone = value
++
++                KCM.SettingStateBinding {
++                    configObject: kcm.kwinSettings
++                    settingName: "CenterSnapZone"
++                }
++            }
++        }
++
++        Kirigami.FormEntry {
++            contentItem: QQC2.CheckBox {
++                Kirigami.FormData.label: i18nd("kcmkwm", "&Snap windows:")
++                text: i18nd("kcmkwm", "Only when overlapping")
++
++                checked: kcm.kwinSettings.snapOnlyWhenOverlapping
++                onCheckedChanged: kcm.kwinSettings.snapOnlyWhenOverlapping = checked
++
++                KCM.SettingStateBinding {
++                    configObject: kcm.kwinSettings
++                    settingName: "SnapOnlyWhenOverlapping"
++                }
++            }
++        }
++    }
++
++    Kirigami.FormGroup {
++        // ksr: kcm_kwinoptions/OnScreenDisplayPosition (unchanged, now on the main page)
++        title: i18ndc("kcmkwm", "@title:group", "Overlay Positioning")
++        Kirigami.FormEntry {
++            id: osdPositionEntry
++            title: i18ndc("kcmkwm", "@label:chooser", "OSD popups:")
++            contentItem: OnScreenDisplayPositionSelector {
++                Accessible.name: osdPositionEntry.title
++
++                selectedPosition: kcm.kwinSettings.onScreenDisplayPosition
++                onPositionPicked: position => kcm.kwinSettings.onScreenDisplayPosition = position
++
++                KCM.SettingStateBinding {
++                    configObject: kcm.kwinSettings
++                    settingName: "OnScreenDisplayPosition"
++                }
++            }
++        }
++        Kirigami.FormEntry {
++            visible: kcm.isPiPEnabled
++            title: i18ndc("kcmkwm", "@label:chooser", "Picture-in-picture:")
++            contentItem: QQC2.ComboBox {
++                textRole: "text"
++                valueRole: "value"
++                model: [
++                    { text: i18nd("kcmkwm", "Top-left"), value: Qt.Corner.TopLeftCorner },
++                    { text: i18nd("kcmkwm", "Top-right"), value: Qt.Corner.TopRightCorner },
++                    { text: i18nd("kcmkwm", "Bottom-left"), value: Qt.Corner.BottomLeftCorner },
++                    { text: i18nd("kcmkwm", "Bottom-right"), value: Qt.Corner.BottomRightCorner },
++                ]
++                currentValue: kcm.kwinSettings.pictureInPictureHomeCorner
++                onActivated: kcm.kwinSettings.pictureInPictureHomeCorner = currentValue
++
++                KCM.SettingStateBinding {
++                    configObject: kcm.kwinSettings
++                    settingName: "PictureInPictureHomeCorner"
++                }
++            }
++        }
++        Kirigami.FormEntry {
++            id: marginSpinboxLabel
++            visible: kcm.isPiPEnabled
++            title: i18nd("kcmkwm", "Margin:")
++            contentItem: QQC2.SpinBox {
++                id: marginSpinbox
++
++                Accessible.name: marginSpinboxLabel.title
++                from: 0
++                to: 99
++                stepSize: 1
++
++                textFromValue: (value, locale) => {
++                    return i18ndc("kcmkwm", "short for pixel(s)", "%1 px", value)
++                }
++
++                valueFromText: (text, locale) => {
++                    return Number.fromLocaleString(locale, text.replace(i18ndc("kcmkwm", "short for pixel(s)", "px"), ""))
++                }
++
++                value: kcm.kwinSettings.pictureInPictureMargin
++                onValueModified: kcm.kwinSettings.pictureInPictureMargin = value
++
++                KCM.SettingStateBinding {
++                    configObject: kcm.kwinSettings
++                    settingName: "PictureInPictureMargin"
++                }
++            }
++        }
++    }
+ }
+diff --git a/src/kcms/options/ui/main.qml b/src/kcms/options/ui/main.qml
+index c402605..707c140 100644
+--- a/src/kcms/options/ui/main.qml
++++ b/src/kcms/options/ui/main.qml
+@@ -12,56 +12,29 @@ import org.kde.kirigami as Kirigami
+ 
+ import org.kde.plasma.kcm.kwinoptions
+ 
++// ksr: kcm_kwinoptions/FocusPolicy (and every row of the former tab bar)
++// The four tabs (Focus | Titlebar Actions | Window Actions | Movement & Placement) were not peers of one kind, and a
++// StackLayout creates all of them before the first frame. Now: one Form page with focus, raising, placement,
++// snapping and popups; the two long mouse-action forms are sub-pages that are created only when opened.
+ KCM.SimpleKCM {
+-    topPadding: 0
+-    leftPadding: 0
+-    rightPadding: 0
+-    bottomPadding: 0
++    actions: [
++        Kirigami.Action {
++            icon.name: "system-run-symbolic"
++            text: i18nd("kcmkwm", "Titlebar A&ctions…")
++            displayHint: Kirigami.DisplayHint.KeepVisible
++            onTriggered: kcm.push("TitlebarActionsPage.qml")
++        },
++        Kirigami.Action {
++            icon.name: "window-focus"
++            text: i18nd("kcmkwm", "W&indow Actions…")
++            displayHint: Kirigami.DisplayHint.KeepVisible
++            onTriggered: kcm.push("WindowActionsPage.qml")
++        }
++    ]
+ 
+     ColumnLayout {
+-        spacing: 0
+-
+-        Kirigami.NavigationTabBar {
+-            Kirigami.Theme.colorSet: Kirigami.Theme.Window
++        WindowBehavior {
+             Layout.fillWidth: true
+-
+-            actions: [
+-                Kirigami.Action {
+-                    icon.name: "window-focus"
+-                    text: i18nd("kcmkwm", "&Focus")
+-                    checked: stackLayout.currentIndex === 0
+-                    onTriggered: stackLayout.currentIndex = 0
+-                },
+-                Kirigami.Action {
+-                    icon.name: "system-run-symbolic"
+-                    text: i18nd("kcmkwm", "Titlebar A&ctions")
+-                    checked: stackLayout.currentIndex === 1
+-                    onTriggered: stackLayout.currentIndex = 1
+-                },
+-                Kirigami.Action {
+-                    icon.name: "system-run-symbolic"
+-                    text: i18nd("kcmkwm", "W&indow Actions")
+-                    checked: stackLayout.currentIndex === 2
+-                    onTriggered: stackLayout.currentIndex = 2
+-                },
+-                Kirigami.Action {
+-                    icon.name: "preferences-system-windows-move-symbolic"
+-                    text: i18nd("kcmkwm", "Mo&vement & Placement")
+-                    checked: stackLayout.currentIndex === 3
+-                    onTriggered: stackLayout.currentIndex = 3
+-                },
+-            ]
+-        }
+-
+-        StackLayout {
+-            id: stackLayout
+-
+-            Layout.preferredHeight: children[currentIndex].implicitHeight
+-
+-            Focus {}
+-            TitlebarActions {}
+-            WindowActions {}
+-            MovementAndPlacement {}
+         }
+     }
+ }

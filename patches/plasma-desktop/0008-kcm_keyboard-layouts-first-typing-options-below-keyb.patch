@@ -1,0 +1,588 @@
+From 30316a8cbba351fa9be5f4d46d5ab94c05f937d9 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 14:07:20 +0500
+Subject: [PATCH 08/31] kcm_keyboard: layouts first, typing options below,
+ keyboard model on its own sub-page
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Page type: List (layouts) with the footer form. The three tabs of unlike things were already sub-pages; the main page
+now answers the most common task first (docs/page-design.md sections 1, 2). Config keys, kcfg, XKB, KGlobalAccel and
+tastenbrett calls are unchanged.
+
+Moved / renamed (inventory/relabel/kcm_keyboard.tsv):
+- Layouts list first (was below Model / NumLock / Key repeat / Test area); "Add…" is the page action.
+- Footer form now has sections: Switching (Change layout shortcut, Configure Switching…, Spare layouts), Typing
+  (NumLock on startup, Key repeat with Delay and Rate, Test area), Keyboard (buttons).
+- "Model:" moved to the sub-page "Keyboard Model…" and is now "Keyboard model:" (kcm_keyboard/keyboardModel);
+  "Key Bindings" is a "Key Bindings…" button in the Keyboard section (was a toolbar action) (kcm_keyboard/KeyBindings).
+- "ksr:" markers added on every control whose label or place changed or is text-only.
+
+Speed (cause from code, not measured):
+- KeyboardModel (all keyboard models from the XKB rules, sorted through a KSortFilterProxyModel) was built in the
+  first frame for the Model combo; it is now created only when "Keyboard Model…" is opened.
+- The empty-state text bound kcm.defaultLayout even while the list had layouts; defaultLayout can do a blocking
+  system-bus call to org.freedesktop.locale1 (kcm_keyboard.cpp:199, FollowLocale1) plus Rules lookups. It is now only
+  evaluated when the list is empty.
+- Not changed (needs a build to do safely): Rules::self() still parses the whole XKB ruleset on first use, which the
+  layout list and the XKB options model also need (xkb_rules.cpp:120-134). Next idea: parse lazily/threaded.
+- Numbers: before ~1.85 s under load (ranking only). After: pending, manager will measure.
+
+HIG: HIG-001, HIG-005, HIG-006, HIG-019, HIG-047, HIG-057.
+
+Not built yet (freeze). Unconfirmed: ScrollViewKCM without a header and a FormLayout footer with section Separators.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/keyboard/ui/Hardware.qml     |  59 +++++
+ kcms/keyboard/ui/LayoutDialog.qml |   1 +
+ kcms/keyboard/ui/main.qml         | 395 +++++++++++++++---------------
+ 3 files changed, 259 insertions(+), 196 deletions(-)
+ create mode 100644 kcms/keyboard/ui/Hardware.qml
+
+diff --git a/kcms/keyboard/ui/Hardware.qml b/kcms/keyboard/ui/Hardware.qml
+new file mode 100644
+index 0000000..514f367
+--- /dev/null
++++ b/kcms/keyboard/ui/Hardware.qml
+@@ -0,0 +1,59 @@
++/*
++    SPDX-FileCopyrightText: 2024 Evgeny Chesnokov <echesnokov@astralinux.ru>
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++
++import QtQuick
++import QtQuick.Layouts
++import QtQuick.Controls as QQC2
++
++import org.kde.kitemmodels as KItemModels
++import org.kde.kirigami as Kirigami
++import org.kde.kcmutils as KCM
++
++import org.kde.plasma.private.kcm_keyboard as KCMKeyboard
++
++// Own page so the keyboard model list is only built when someone asks for it.
++KCM.SimpleKCM {
++    title: i18nc("@title", "Keyboard Model")
++
++    KItemModels.KSortFilterProxyModel {
++        id: keyboardsProxy
++        sourceModel: KCMKeyboard.KeyboardModel {}
++        sortRoleName: "description"
++        sortOrder: Qt.AscendingOrder
++    }
++
++    Kirigami.FormLayout {
++        QQC2.ComboBox {
++            id: keyboardModelComboBox
++            // ksr: kcm_keyboard/keyboardModel
++            Kirigami.FormData.label: i18nc("@label:listbox Keyboard model", "Keyboard model:")
++            model: keyboardsProxy
++            textRole: "description"
++            valueRole: "name"
++            onActivated: kcm.keyboardSettings.keyboardModel = currentValue
++
++            Component.onCompleted: selectCurrent()
++
++            Connections {
++                target: kcm?.keyboardSettings ?? undefined
++
++                function onKeyboardModelChanged(): void {
++                    keyboardModelComboBox.selectCurrent()
++                }
++            }
++
++            function selectCurrent(): void {
++                currentIndex = indexOfValue(kcm.keyboardSettings.keyboardModel);
++            }
++
++            KCM.SettingStateBinding {
++                configObject: kcm.keyboardSettings
++                settingName: "keyboardModel"
++            }
++        }
++
++    }
++}
+diff --git a/kcms/keyboard/ui/LayoutDialog.qml b/kcms/keyboard/ui/LayoutDialog.qml
+index db3f1a5..936d291 100644
+--- a/kcms/keyboard/ui/LayoutDialog.qml
++++ b/kcms/keyboard/ui/LayoutDialog.qml
+@@ -136,6 +136,7 @@ Kirigami.Dialog {
+             }
+ 
+             QQC2.Label {
++                // ksr: kcm_keyboard/layoutDialogShortcut
+                 text: i18nc("@option:textbox", "Shortcut:")
+             }
+ 
+diff --git a/kcms/keyboard/ui/main.qml b/kcms/keyboard/ui/main.qml
+index ec473b7..22f55cc 100644
+--- a/kcms/keyboard/ui/main.qml
++++ b/kcms/keyboard/ui/main.qml
+@@ -21,19 +21,13 @@ KCM.ScrollViewKCM {
+     implicitWidth: Kirigami.Units.gridUnit * 44
+     implicitHeight: Kirigami.Units.gridUnit * 25
+ 
+-    actions: [keyBindingsPageAction]
++    actions: [addLayoutAction]
+ 
+     extraFooterTopPadding: true // re-add separator line
+ 
+-    KItemModels.KSortFilterProxyModel {
+-        id: keyboardsProxy
+-        sourceModel: KCMKeyboard.KeyboardModel {}
+-        sortRoleName: "description"
+-        sortOrder: Qt.AscendingOrder
+-    }
+-
+     readonly property Kirigami.Action switchingPageAction: Kirigami.Action {
+         icon.name: "input-keyboard-symbolic"
++        // ksr: kcm_keyboard/ConfigureSwitching
+         text: i18nc("@action:button", "Configure Switching…")
+         Accessible.name: i18nc("@action:button accessible", "Configure Switching")
+         onTriggered: kcm.push("Switching.qml")
+@@ -41,53 +35,221 @@ KCM.ScrollViewKCM {
+ 
+     readonly property Kirigami.Action keyBindingsPageAction: Kirigami.Action {
+         icon.name: "settings-configure-symbolic"
+-        text: i18nc("@action:button", "Key Bindings")
++        // ksr: kcm_keyboard/KeyBindings
++        text: i18nc("@action:button", "Key Bindings…")
+         Accessible.name: i18nc("@action:button accessible", "Key Bindings")
+         onTriggered: kcm.push("KeyBindings.qml")
+     }
+ 
++    readonly property Kirigami.Action hardwarePageAction: Kirigami.Action {
++        icon.name: "input-keyboard-symbolic"
++        // ksr: kcm_keyboard/keyboardModel
++        text: i18nc("@action:button", "Keyboard Model…")
++        Accessible.name: i18nc("@action:button accessible", "Keyboard model")
++        onTriggered: kcm.push("Hardware.qml")
++    }
++
+     readonly property Kirigami.Action addLayoutAction: Kirigami.Action {
+         icon.name: "list-add-symbolic"
++        // ksr: kcm_keyboard/AddLayout
+         text: i18nc("@action:button Layout", "Add…")
+         Accessible.name: i18nc("@action:button accessible", "Add layout")
+         onTriggered: _cLayoutDialog.incubateObject(root, {}, Qt.Asynchronous)
+     }
+ 
+-    header: Kirigami.FormLayout {
+-        id: headerFormLayout
++    view: ListView {
++        id: list
++        model: kcm.userLayoutModel
+ 
+-        QQC2.ComboBox {
+-            id: keyboardModelComboBox
+-            Kirigami.FormData.label: i18nc("@label:listbox Keyboard model", "Model:")
+-            model: keyboardsProxy
+-            textRole: "description"
+-            valueRole: "name"
+-            onActivated: kcm.keyboardSettings.keyboardModel = currentValue
++        headerPositioning: ListView.OverlayHeader
++        header: Kirigami.InlineViewHeader {
++            width: list.width
++            text: i18nc("@title:view", "Layouts")
++            actions: [ addLayoutAction ]
++        }
+ 
+-            Component.onCompleted: selectCurrent()
++        readonly property int maxKeySequenceItemWidth: Math.max(...contentItem.children.map(item => item?.keySequenceItemWidth || 0))
+ 
+-            Connections {
+-                target: kcm?.keyboardSettings ?? undefined
++        Item {
++            anchors.fill: parent
++            anchors.topMargin: list.headerItem.height
++            Kirigami.PlaceholderMessage {
++                // defaultLayout may call locale1 on the system bus: only evaluate it when the empty state is shown
++                // ksr: kcm_keyboard/SystemLayoutNotice
++                text: list.count === 0 ? i18nc("@info:usagetip %1 is the name of a keyboard layout", "Using system-wide layout “%1”", kcm.defaultLayout) : ""
++                explanation:  xi18nc("@info:usagetip", "To override this or add more layouts for this user account, press the <interface>Add…</interface> button.")
++                anchors.centerIn: parent
++                width: parent.width - (Kirigami.Units.largeSpacing * 4)
++                visible: list.count === 0
++            }
++        }
++
++
++        delegate: LayoutDelegate {
++            id: delegate
++            onMove: (oldIndex, newIndex) => kcm.userLayoutModel.move(oldIndex, newIndex)
+ 
+-                function onKeyboardModelChanged(): void {
+-                    keyboardModelComboBox.selectCurrent()
++            isLoopingLayout: layoutLoopingCheckBox.checked && (index + 1) > layoutLoopCountSpinBox.value
++            actions: [
++                Kirigami.Action {
++                    icon.name: "arrow-up-symbolic"
++                    // ksr: kcm_keyboard/layout-MoveUp
++                    text: i18nc("@action:button", "Move Up")
++                    Accessible.name: i18nc("@action:button accessible", "Move %1 layout up", delegate.layoutName)
++                    onTriggered: kcm.userLayoutModel.move(index, index - 1)
++                    enabled: index > 0
++                },
++                Kirigami.Action {
++                    icon.name: "arrow-down-symbolic"
++                    // ksr: kcm_keyboard/layout-MoveDown
++                    text: i18nc("@action:button", "Move Down")
++                    Accessible.name: i18nc("@action:button accessible", "Move %1 layout Down", delegate.layoutName)
++                    onTriggered: kcm.userLayoutModel.move(index, index + 1)
++                    enabled: index < list.count - 1
++                },
++                Kirigami.Action {
++                    separator: true
++                },
++                Kirigami.Action {
++                    icon.name: "input-keyboard-virtual-symbolic"
++                    text: i18nc("@action:button", "Preview")
++                    Accessible.name: i18nc("@action:button accessible", "Preview")
++                    onTriggered: kcm.requestPreview(kcm.keyboardSettings.keyboardModel, layout, variant, variantName)
++                },
++                Kirigami.Action {
++                    separator: true
++                },
++                Kirigami.Action {
++                    icon.name: "edit-delete-remove-symbolic"
++                    // ksr: kcm_keyboard/layout-Remove
++                    text: i18nc("@action:button", "Remove")
++                    Accessible.name: i18nc("@action:button accessible", "Remove layout %1", delegate.layoutName)
++                    onTriggered: kcm.userLayoutModel.remove(index)
++                }
++            ]
++        }
++    }
++
++    footer: Kirigami.FormLayout {
++        id: footerForm
++
++        Kirigami.Separator {
++            Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18nc("@title:group", "Switching")
++        }
++
++        RowLayout {
++            Kirigami.FormData.label: i18nc("@label:group Shortcut to change the keyboard layout. Keep it short", "Change layout shortcut:")
++            spacing: Kirigami.Units.smallSpacing
++
++            KQuickControls.KeySequenceItem {
++                id: alternativeShortcut
++                patterns: KQuickControls.ShortcutPattern.Modifier | KQuickControls.ShortcutPattern.ModifierAndKey
++
++                keySequence: kcm.shortcutHelper.alternativeShortcut
++                onKeySequenceModified: kcm.shortcutHelper.alternativeShortcut = keySequence
++
++                Binding {
++                    target: alternativeShortcut
++                    property: "keySequence"
++                    value: kcm.shortcutHelper.alternativeShortcut
++                }
++
++                KCM.SettingHighlighter {
++                    target: alternativeShortcut
++                    highlight: alternativeShortcut.keySequence !== kcm.shortcutHelper.defaultAlternativeShortcut()
+                 }
+             }
+ 
+-            function selectCurrent(): void {
+-                currentIndex = indexOfValue(kcm.keyboardSettings.keyboardModel);
++            QQC2.Label {
++                text: i18nc("@label Change layout shortcut or \"Configure Switching\"", "or")
+             }
+ 
+-            KCM.SettingStateBinding {
+-                configObject: kcm.keyboardSettings
+-                settingName: "keyboardModel"
++            QQC2.Button {
++                action: switchingPageAction
+             }
+         }
+ 
++        RowLayout {
++            spacing: Kirigami.Units.smallSpacing
++            Kirigami.FormData.label: i18nc("@label:checkbox", "Spare layouts:")
++
++            QQC2.CheckBox {
++                id: layoutLoopingCheckBox
++                onToggled: {
++                    const count = checked ? __internal.minimumAvailableLoops : __internal.noLooping;
++                    kcm.keyboardSettings.layoutLoopCount = count;
++                }
++
++                checked: {
++                    if (__internal.minimumAvailableLoops < __internal.minimumLoopingCount) {
++                        return false;
++                    }
++
++                    // If the number of layouts is not the default value
++                    // or the available number of layouts is greater than the limit from X.org, then enable the option
++                    return kcm.keyboardSettings.layoutLoopCount !== __internal.noLooping
++                        || __internal.minimumAvailableLoops >= kcm.maxGroupCount
++                }
++
++                enabled: {
++                    // If the number of layouts is within the range of acceptable values, then enable the element
++                    return __internal.minimumAvailableLoops >= __internal.minimumLoopingCount
++                        && __internal.minimumAvailableLoops < kcm.maxGroupCount
++                }
++            }
++
++            QQC2.SpinBox {
++                id: layoutLoopCountSpinBox
++                Layout.minimumWidth: Kirigami.Units.gridUnit * 4
++
++                Accessible.name: i18nc("@label:spinbox", "Number of spared main layouts")
++
++                enabled: layoutLoopingCheckBox.checked
++                to: Math.max(from, __internal.minimumAvailableLoops)
++                from: {
++                    if (layoutLoopingCheckBox.checked) {
++                        return __internal.minimumLoopingCount;
++                    }
++
++                    return __internal.noLooping;
++                }
++
++                value: {
++                    if (kcm.keyboardSettings.layoutLoopCount > to){
++                        return to
++                    }
++
++                    return kcm.keyboardSettings.layoutLoopCount;
++                }
++
++                textFromValue: (value, locale) => value < 0 ? "" : Number(value).toLocaleString(locale, "f", 0)
++                onValueModified: kcm.keyboardSettings.layoutLoopCount = value;
++            }
++
++            QQC2.Label {
++                // Force the label to use its own Kirigami.Theme object
++                Kirigami.Theme.inherit: false
++                enabled: layoutLoopCountSpinBox.enabled
++                text: i18nc("@label:textbox completes spinbox, x main layouts", "main layouts")
++            }
++
++            Kirigami.ContextualHelpButton {
++                toolTipText: i18nc("@info", "You can have up to 4 main layouts, all other layouts are spare. Spare layouts are not included when cycling through the layouts, but can be accessed through the keyboard indicator applet or by setting a custom shortcut.")
++            }
++        }
++
++
++        Kirigami.Separator {
++            Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18nc("@title:group", "Typing")
++        }
++
+         QQC2.ComboBox {
+             id: numlockCombobox
++            // ksr: kcm_keyboard/numLock
+             Kirigami.FormData.label: i18nc("@label:listbox", "NumLock on startup:")
+-            Layout.preferredWidth: keyboardModelComboBox.width
++            Layout.preferredWidth: Kirigami.Units.gridUnit * 14
+             textRole: "text"
+             valueRole: "value"
+             onActivated: kcm.miscSettings.numLock = currentValue
+@@ -128,6 +290,7 @@ KCM.ScrollViewKCM {
+         }
+ 
+         RowLayout {
++            // ksr: kcm_keyboard/keyboardRepeat
+             Kirigami.FormData.label: i18nc("@label:checkbox", "Key repeat:")
+             spacing: Kirigami.Units.smallSpacing
+ 
+@@ -225,182 +388,22 @@ KCM.ScrollViewKCM {
+         }
+ 
+         QQC2.TextField {
++            // ksr: kcm_keyboard/x-2
+             Kirigami.FormData.label: i18nc("@label:textbox", "Test area:")
+-            Layout.preferredWidth: keyboardModelComboBox.width
++            Layout.preferredWidth: Kirigami.Units.gridUnit * 14
+             placeholderText: i18nc("@info:placeholder", "Type here to test settings")
+         }
+-    }
+-
+-    view: ListView {
+-        id: list
+-        model: kcm.userLayoutModel
+-
+-        headerPositioning: ListView.OverlayHeader
+-        header: Kirigami.InlineViewHeader {
+-            width: list.width
+-            text: i18nc("@title:view", "Layouts")
+-            actions: [ addLayoutAction ]
+-        }
+-
+-        readonly property int maxKeySequenceItemWidth: Math.max(...contentItem.children.map(item => item?.keySequenceItemWidth || 0))
+-
+-        Item {
+-            anchors.fill: parent
+-            anchors.topMargin: list.headerItem.height
+-            Kirigami.PlaceholderMessage {
+-                text: i18nc("@info:usagetip %1 is the name of a keyboard layout", "Using system-wide layout “%1”", kcm.defaultLayout)
+-                explanation:  xi18nc("@info:usagetip", "To override this or add more layouts for this user account, press the <interface>Add…</interface> button.")
+-                anchors.centerIn: parent
+-                width: parent.width - (Kirigami.Units.largeSpacing * 4)
+-                visible: list.count === 0
+-            }
+-        }
+-
+-
+-        delegate: LayoutDelegate {
+-            id: delegate
+-            onMove: (oldIndex, newIndex) => kcm.userLayoutModel.move(oldIndex, newIndex)
+-
+-            isLoopingLayout: layoutLoopingCheckBox.checked && (index + 1) > layoutLoopCountSpinBox.value
+-            actions: [
+-                Kirigami.Action {
+-                    icon.name: "arrow-up-symbolic"
+-                    text: i18nc("@action:button", "Move Up")
+-                    Accessible.name: i18nc("@action:button accessible", "Move %1 layout up", delegate.layoutName)
+-                    onTriggered: kcm.userLayoutModel.move(index, index - 1)
+-                    enabled: index > 0
+-                },
+-                Kirigami.Action {
+-                    icon.name: "arrow-down-symbolic"
+-                    text: i18nc("@action:button", "Move Down")
+-                    Accessible.name: i18nc("@action:button accessible", "Move %1 layout Down", delegate.layoutName)
+-                    onTriggered: kcm.userLayoutModel.move(index, index + 1)
+-                    enabled: index < list.count - 1
+-                },
+-                Kirigami.Action {
+-                    separator: true
+-                },
+-                Kirigami.Action {
+-                    icon.name: "input-keyboard-virtual-symbolic"
+-                    text: i18nc("@action:button", "Preview")
+-                    Accessible.name: i18nc("@action:button accessible", "Preview")
+-                    onTriggered: kcm.requestPreview(kcm.keyboardSettings.keyboardModel, layout, variant, variantName)
+-                },
+-                Kirigami.Action {
+-                    separator: true
+-                },
+-                Kirigami.Action {
+-                    icon.name: "edit-delete-remove-symbolic"
+-                    text: i18nc("@action:button", "Remove")
+-                    Accessible.name: i18nc("@action:button accessible", "Remove layout %1", delegate.layoutName)
+-                    onTriggered: kcm.userLayoutModel.remove(index)
+-                }
+-            ]
+-        }
+-    }
+-
+-    footer: Kirigami.FormLayout {
+-        twinFormLayouts: headerFormLayout
+-
+-        RowLayout {
+-            spacing: Kirigami.Units.smallSpacing
+-            Kirigami.FormData.label: i18nc("@label:checkbox", "Spare layouts:")
+-
+-            QQC2.CheckBox {
+-                id: layoutLoopingCheckBox
+-                onToggled: {
+-                    const count = checked ? __internal.minimumAvailableLoops : __internal.noLooping;
+-                    kcm.keyboardSettings.layoutLoopCount = count;
+-                }
+-
+-                checked: {
+-                    if (__internal.minimumAvailableLoops < __internal.minimumLoopingCount) {
+-                        return false;
+-                    }
+-
+-                    // If the number of layouts is not the default value
+-                    // or the available number of layouts is greater than the limit from X.org, then enable the option
+-                    return kcm.keyboardSettings.layoutLoopCount !== __internal.noLooping
+-                        || __internal.minimumAvailableLoops >= kcm.maxGroupCount
+-                }
+-
+-                enabled: {
+-                    // If the number of layouts is within the range of acceptable values, then enable the element
+-                    return __internal.minimumAvailableLoops >= __internal.minimumLoopingCount
+-                        && __internal.minimumAvailableLoops < kcm.maxGroupCount
+-                }
+-            }
+-
+-            QQC2.SpinBox {
+-                id: layoutLoopCountSpinBox
+-                Layout.minimumWidth: Kirigami.Units.gridUnit * 4
+-
+-                Accessible.name: i18nc("@label:spinbox", "Number of spared main layouts")
+-
+-                enabled: layoutLoopingCheckBox.checked
+-                to: Math.max(from, __internal.minimumAvailableLoops)
+-                from: {
+-                    if (layoutLoopingCheckBox.checked) {
+-                        return __internal.minimumLoopingCount;
+-                    }
+-
+-                    return __internal.noLooping;
+-                }
+-
+-                value: {
+-                    if (kcm.keyboardSettings.layoutLoopCount > to){
+-                        return to
+-                    }
+-
+-                    return kcm.keyboardSettings.layoutLoopCount;
+-                }
+-
+-                textFromValue: (value, locale) => value < 0 ? "" : Number(value).toLocaleString(locale, "f", 0)
+-                onValueModified: kcm.keyboardSettings.layoutLoopCount = value;
+-            }
+ 
+-            QQC2.Label {
+-                // Force the label to use its own Kirigami.Theme object
+-                Kirigami.Theme.inherit: false
+-                enabled: layoutLoopCountSpinBox.enabled
+-                text: i18nc("@label:textbox completes spinbox, x main layouts", "main layouts")
+-            }
+-
+-            Kirigami.ContextualHelpButton {
+-                toolTipText: i18nc("@info", "You can have up to 4 main layouts, all other layouts are spare. Spare layouts are not included when cycling through the layouts, but can be accessed through the keyboard indicator applet or by setting a custom shortcut.")
+-            }
++        Kirigami.Separator {
++            Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18nc("@title:group", "Keyboard")
+         }
+ 
+         RowLayout {
+-            Kirigami.FormData.label: i18nc("@label:group Shortcut to change the keyboard layout. Keep it short", "Change layout shortcut:")
+             spacing: Kirigami.Units.smallSpacing
+ 
+-            KQuickControls.KeySequenceItem {
+-                id: alternativeShortcut
+-                patterns: KQuickControls.ShortcutPattern.Modifier | KQuickControls.ShortcutPattern.ModifierAndKey
+-
+-                keySequence: kcm.shortcutHelper.alternativeShortcut
+-                onKeySequenceModified: kcm.shortcutHelper.alternativeShortcut = keySequence
+-
+-                Binding {
+-                    target: alternativeShortcut
+-                    property: "keySequence"
+-                    value: kcm.shortcutHelper.alternativeShortcut
+-                }
+-
+-                KCM.SettingHighlighter {
+-                    target: alternativeShortcut
+-                    highlight: alternativeShortcut.keySequence !== kcm.shortcutHelper.defaultAlternativeShortcut()
+-                }
+-            }
+-
+-            QQC2.Label {
+-                text: i18nc("@label Change layout shortcut or \"Configure Switching\"", "or")
+-            }
+-
+-            QQC2.Button {
+-                action: switchingPageAction
+-            }
++            QQC2.Button { action: hardwarePageAction }
++            QQC2.Button { action: keyBindingsPageAction }
+         }
+     }
+ 

@@ -1,0 +1,331 @@
+From 2abb1dd212f7d198ee7035db881811fd21565d86 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 14:08:51 +0500
+Subject: [PATCH 05/12] kcm_kwin_taskswitching: main task switcher on one page,
+ alternative switcher and overview on sub-pages
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Page type: Form (docs/page-design.md section 1). Config keys, kcfg, KGlobalAccel, shortcut dialogs and the save() D-Bus
+calls are unchanged.
+
+Moved / renamed (inventory/relabel/kcm_kwin_taskswitching.tsv):
+- The NavigationTabBar (Task Switcher | Task Switcher (Alternative) | Overview) is gone. The main page is the
+  existing TabBoxSettings form (Appearance, Behavior, Configure Shortcuts…) plus a group "Other switchers" with two
+  buttons: "Alternative Task Switcher…" (AlternativeSwitcher.qml, same TabBoxSettings with isAlternative) and
+  "Overview…" (OverviewPage.qml, the unchanged OverviewSettings form with its Configure Shortcuts / Screen Edges /
+  Touchscreen Gestures buttons). The focus-policy message shows on both switcher pages and the controls stay disabled.
+- The overview stays here (it is also an effect in Desktop Effects, ia/duplicates.md): moving it out needs the
+  manager's call, so only its place in the page changed.
+- ksr: markers on the text-only buttons (shortcuts, preview, screen edges, touchscreen, focus warning).
+
+Speed (cause from code, not measured):
+- TabBoxLayoutsModel's constructor called load() synchronously: a QDir listing of every plasma/look-and-feel
+  directory, a KPackage load and a KConfig read per package, plus KPackage listPackages(KWin/WindowSwitcher) and a
+  sort (tabboxlayoutsmodel.cpp:38-80), all before the first frame. It is now queued one event-loop turn later; the
+  combo shows "None" for that moment and its currentIndex binding re-runs when the rows arrive (it reads count).
+- StackLayout built all three tabs up front (two TabBoxSettings forms with 5 combos each, the overview form with a
+  synchronous KGlobalAccel::globalShortcut lookup, kcm.cpp:77). Only the main form is built now; the alternative form
+  and the overview (and that lookup) are created when their button is used.
+- Numbers: before ~1.6 s under load (ranking only). After: pending, manager will measure.
+
+HIG: HIG-001, HIG-005, HIG-006, HIG-019, HIG-057.
+
+Not built yet (freeze). Unconfirmed: a FormLayout/Form inside ColumnLayout inside SimpleKCM sizing (Kirigami.Form is
+new API; both forms use Layout.fillWidth) and the brief "None" flash in the style combo.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ src/kcms/taskswitching/tabboxlayoutsmodel.cpp |   3 +-
+ .../taskswitching/ui/AlternativeSwitcher.qml  |  49 ++++++++
+ src/kcms/taskswitching/ui/OverviewPage.qml    |  21 ++++
+ .../taskswitching/ui/OverviewSettings.qml     |   3 +
+ src/kcms/taskswitching/ui/TabBoxSettings.qml  |   2 +
+ src/kcms/taskswitching/ui/main.qml            | 106 +++++-------------
+ 6 files changed, 105 insertions(+), 79 deletions(-)
+ create mode 100644 src/kcms/taskswitching/ui/AlternativeSwitcher.qml
+ create mode 100644 src/kcms/taskswitching/ui/OverviewPage.qml
+
+diff --git a/src/kcms/taskswitching/tabboxlayoutsmodel.cpp b/src/kcms/taskswitching/tabboxlayoutsmodel.cpp
+index 7312c66..4ed8d48 100644
+--- a/src/kcms/taskswitching/tabboxlayoutsmodel.cpp
++++ b/src/kcms/taskswitching/tabboxlayoutsmodel.cpp
+@@ -22,7 +22,8 @@ namespace KWin
+ TabBoxLayoutsModel::TabBoxLayoutsModel(QObject *parent)
+     : QAbstractListModel(parent)
+ {
+-    load();
++    // Scanning every look-and-feel package and the KPackage list is slow: do it after the page is shown.
++    QMetaObject::invokeMethod(this, &TabBoxLayoutsModel::load, Qt::QueuedConnection);
+ }
+ 
+ void TabBoxLayoutsModel::load()
+diff --git a/src/kcms/taskswitching/ui/AlternativeSwitcher.qml b/src/kcms/taskswitching/ui/AlternativeSwitcher.qml
+new file mode 100644
+index 0000000..c7be741
+--- /dev/null
++++ b/src/kcms/taskswitching/ui/AlternativeSwitcher.qml
+@@ -0,0 +1,49 @@
++/*
++    SPDX-FileCopyrightText: 2025 Oliver Beard <olib141@outlook.com>
++
++    SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++*/
++
++import QtQuick
++import QtQuick.Layouts
++import QtQuick.Controls as QQC2
++
++import org.kde.kirigami as Kirigami
++import org.kde.kcmutils as KCM
++
++import org.kde.kwin.kcmtaskswitching
++
++KCM.SimpleKCM {
++    title: i18nc("@title", "Alternative Task Switcher")
++
++    ColumnLayout {
++        spacing: Kirigami.Units.largeSpacing
++
++        Kirigami.InlineMessage {
++            Layout.fillWidth: true
++
++            type: Kirigami.MessageType.Information
++            visible: kcm.tabBoxLimitedByFocusPolicy
++            text: i18nc("@info", "Focus policy settings limit the functionality of navigating through windows.")
++        }
++
++        QQC2.Label {
++            Layout.fillWidth: true
++            Layout.maximumWidth: Kirigami.Units.gridUnit * 24
++            Layout.alignment: Qt.AlignHCenter
++
++            horizontalAlignment: Text.AlignHCenter
++            textFormat: Text.PlainText
++            wrapMode: Text.Wrap
++
++            text: i18nc("@info", "The alternative task switcher is a second switcher with its own separate shortcut, appearance, and behavior settings.")
++        }
++
++        TabBoxSettings {
++            Layout.fillWidth: true
++
++            enabled: !kcm.tabBoxLimitedByFocusPolicy
++            isAlternative: true
++        }
++    }
++}
+diff --git a/src/kcms/taskswitching/ui/OverviewPage.qml b/src/kcms/taskswitching/ui/OverviewPage.qml
+new file mode 100644
+index 0000000..b21d608
+--- /dev/null
++++ b/src/kcms/taskswitching/ui/OverviewPage.qml
+@@ -0,0 +1,21 @@
++/*
++    SPDX-FileCopyrightText: 2025 Oliver Beard <olib141@outlook.com>
++
++    SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++*/
++
++import QtQuick
++import QtQuick.Layouts
++import QtQuick.Controls as QQC2
++
++import org.kde.kirigami as Kirigami
++import org.kde.kcmutils as KCM
++
++import org.kde.kwin.kcmtaskswitching
++
++// The overview is a desktop effect; it is built (and its shortcut looked up in KGlobalAccel) only when opened.
++KCM.SimpleKCM {
++    title: i18nc("@title", "Overview")
++
++    OverviewSettings {}
++}
+diff --git a/src/kcms/taskswitching/ui/OverviewSettings.qml b/src/kcms/taskswitching/ui/OverviewSettings.qml
+index d8c5f6d..8d6435f 100644
+--- a/src/kcms/taskswitching/ui/OverviewSettings.qml
++++ b/src/kcms/taskswitching/ui/OverviewSettings.qml
+@@ -91,6 +91,7 @@ Kirigami.Form {
+         Kirigami.FormAction {
+             enabled: action.enabled
+             action: QQC2.Action {
++                // ksr: kcm_kwin_taskswitching/overview-shortcuts
+                 text: i18nc("@action:button", "Configure Shortcuts…")
+                 icon.name: "preferences-desktop-keyboard-shortcut"
+                 enabled: overviewBox.checked
+@@ -103,6 +104,7 @@ Kirigami.Form {
+         Kirigami.FormAction {
+             enabled: action.enabled
+             action: QQC2.Action {
++                // ksr: kcm_kwin_taskswitching/overview-edges
+                 text: i18nc("@action:button", "Configure Screen Edges…")
+                 icon.name: "preferences-desktop-gestures-screenedges"
+                 enabled: overviewBox.checked
+@@ -115,6 +117,7 @@ Kirigami.Form {
+         Kirigami.FormAction {
+             enabled: action.enabled
+             action: QQC2.Action {
++                // ksr: kcm_kwin_taskswitching/overview-touch
+                 text: i18nc("@action:button", "Configure Touchscreen Gestures…")
+                 icon.name: "preferences-desktop-gestures-touch"
+                 enabled: overviewBox.checked
+diff --git a/src/kcms/taskswitching/ui/TabBoxSettings.qml b/src/kcms/taskswitching/ui/TabBoxSettings.qml
+index e2063f4..2f48ca1 100644
+--- a/src/kcms/taskswitching/ui/TabBoxSettings.qml
++++ b/src/kcms/taskswitching/ui/TabBoxSettings.qml
+@@ -64,6 +64,7 @@ Kirigami.Form {
+                     }
+                 }
+                 QQC2.Button {
++                    // ksr: kcm_kwin_taskswitching/show-preview
+                     text: i18nc("@action:button", "Show Preview")
+                     icon.name: "fileview-preview"
+                     display: QQC2.Button.IconOnly
+@@ -311,6 +312,7 @@ Kirigami.Form {
+         Kirigami.FormAction {
+             subtitle: i18nc("@label Hint for task switcher usage", "Use shortcuts to activate the task switcher")
+             action: QQC2.Action {
++                // ksr: kcm_kwin_taskswitching/tabbox-shortcuts
+                 text: i18nc("@action:button", "Configure Shortcuts…")
+                 icon.name: "preferences-desktop-keyboard-shortcut"
+                 onTriggered: kcm.configureTabBoxShortcuts(root.isAlternative, root)
+diff --git a/src/kcms/taskswitching/ui/main.qml b/src/kcms/taskswitching/ui/main.qml
+index f04c5c1..8bd276d 100644
+--- a/src/kcms/taskswitching/ui/main.qml
++++ b/src/kcms/taskswitching/ui/main.qml
+@@ -13,104 +13,54 @@ import org.kde.kcmutils as KCM
+ 
+ import org.kde.kwin.kcmtaskswitching
+ 
+-KCM.AbstractKCM {
++KCM.SimpleKCM {
+     id: root
+ 
+-    topPadding: 0
+-    leftPadding: 0
+-    rightPadding: 0
+-    bottomPadding: 0
+-
++    // One page: the main task switcher. The alternative switcher and the overview effect are separate things with
++    // their own sub-pages, so no tab bar and no hidden-but-built tab contents.
+     ColumnLayout {
+-        anchors.fill: parent
+-
+-        spacing: 0
+-
+-        Kirigami.NavigationTabBar {
+-            Layout.fillWidth: true
+-
+-            actions: [
+-                // TODO: Need custom symbolic icons for each of these, like in
+-                //       Accessibility & Power Managment KCMs
+-                Kirigami.Action {
+-                    text: i18nc("@title:tab", "Task Switcher")
+-                    icon.name: "preferences-system-tabbox-symbolic"
+-                    checked: stackLayout.currentIndex === 0
+-                    onTriggered: stackLayout.currentIndex = 0
+-                },
+-                Kirigami.Action {
+-                    text: i18nc("@title:tab", "Task Switcher (Alternative)")
+-                    icon.name: "preferences-system-tabbox-symbolic"
+-                    checked: stackLayout.currentIndex === 1
+-                    onTriggered: stackLayout.currentIndex = 1
+-                },
+-                Kirigami.Action {
+-                    text: i18nc("@title:tab", "Overview")
+-                    icon.name: "preferences-system-windows-effect-overview-symbolic"
+-                    checked: stackLayout.currentIndex === 2
+-                    onTriggered: stackLayout.currentIndex = 2
+-                }
+-            ]
+-        }
++        spacing: Kirigami.Units.largeSpacing
+ 
+         Kirigami.InlineMessage {
+             Layout.fillWidth: true
+ 
+-            position: Kirigami.InlineMessage.Position.Header
+             type: Kirigami.MessageType.Information
+-            visible: kcm.tabBoxLimitedByFocusPolicy && stackLayout.currentIndex !== 2
++            visible: kcm.tabBoxLimitedByFocusPolicy
++            // ksr: kcm_kwin_taskswitching/tabbox-focus-warning
+             text: i18nc("@info", "Focus policy settings limit the functionality of navigating through windows.")
+         }
+ 
+-        QQC2.ScrollView {
+-            id: scrollView
++        TabBoxSettings {
+             Layout.fillWidth: true
+-            Layout.fillHeight: true
+ 
+-            Item {
+-                width: scrollView.availableWidth
+-                height: Math.max(implicitHeight, scrollView.availableHeight)
+-                implicitHeight: (stackLayout.children[stackLayout.currentIndex]?.implicitHeight ?? 0) + Kirigami.Units.gridUnit * 2
++            enabled: !kcm.tabBoxLimitedByFocusPolicy
++            isAlternative: false
++        }
+ 
+-                StackLayout {
+-                    id: stackLayout
+-                    anchors.fill: parent
+-                    anchors.margins: Kirigami.Units.gridUnit
++        Kirigami.Form {
++            Layout.fillWidth: true
+ 
+-                    currentIndex: 0
++            Kirigami.FormGroup {
++                title: i18nc("@title:group", "Other switchers")
+ 
+-                    // "Task Switcher"
+-                    TabBoxSettings {
+-                        enabled: !kcm.tabBoxLimitedByFocusPolicy
+-                        isAlternative: false
++                Kirigami.FormAction {
++                    subtitle: i18nc("@info", "A second switcher with its own shortcut, appearance and behavior")
++                    action: QQC2.Action {
++                        text: i18nc("@action:button", "Alternative Task Switcher…")
++                        icon.name: "preferences-system-tabbox-symbolic"
++                        onTriggered: kcm.push("AlternativeSwitcher.qml")
+                     }
++                }
+ 
+-                    // "Task Switcher (Alternative)"
+-                    ColumnLayout {
+-                        enabled: !kcm.tabBoxLimitedByFocusPolicy
+-                        spacing: Kirigami.Units.largeSpacing
+-
+-                        QQC2.Label {
+-                            Layout.fillWidth: true
+-                            Layout.maximumWidth: Kirigami.Units.gridUnit * 24
+-                            Layout.alignment: Qt.AlignHCenter
+-
+-                            horizontalAlignment: Text.AlignHCenter
+-                            textFormat: Text.PlainText
+-                            wrapMode: Text.Wrap
+-
+-                            text: i18nc("@info", "The alternative task switcher is a second switcher with its own separate shortcut, appearance, and behavior settings.")
+-                        }
+-
+-                        TabBoxSettings {
+-                            Layout.fillWidth: true
++                Kirigami.FormSeparator {}
+ 
+-                            isAlternative: true
+-                        }
++                Kirigami.FormAction {
++                    subtitle: i18nc("@info", "Show all windows at once; also reached by gestures and screen edges")
++                    action: QQC2.Action {
++                        text: i18nc("@action:button", "Overview…")
++                        icon.name: "preferences-system-windows-effect-overview-symbolic"
++                        onTriggered: kcm.push("OverviewPage.qml")
+                     }
+-
+-                    // "Overview"
+-                    OverviewSettings {}
+                 }
+             }
+         }

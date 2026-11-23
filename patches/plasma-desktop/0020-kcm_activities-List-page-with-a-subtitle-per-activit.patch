@@ -1,0 +1,216 @@
+From 07fdb9e6f14cc7620b3a123456787595df320237 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 02:20:27 +0500
+Subject: [PATCH 20/31] =?UTF-8?q?kcm=5Factivities:=20List=20page=20with=20?=
+ =?UTF-8?q?a=20subtitle=20per=20activity,=20"Add=20Activity=E2=80=A6",=20e?=
+ =?UTF-8?q?ditor=20ordered=20identity,=20shortcut,=20behaviour?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Page type: List with a Form sub-page (ActivityEditor). C++ (ActivitiesModule), ActivityConfig, KAuthorized check, delete prompt and
+all stored values unchanged. Not built yet.
+
+Moved / renamed:
+- List rows show icon, name and a small subtitle ("Current activity" or the activity description); delete is a ToolButton
+  with tooltip and Accessible.name (kcm_activities/configureActivity, isNewActivityAuthorized). Placeholder when empty.
+- "Create New…" became "Add Activity…", kept visible (kcm_activities/CreateNew); old wording in ia/layout.json aliases.
+- Editor: Icon, Name, Description, then "Shortcut for switching:" (used more often than the permissions), then a section
+  "While this activity is active" with three plain checkboxes: "Track files and apps used", "Turn off the screen
+  automatically", "Shut down or sleep automatically" (were "While on this activity, allow:" + Tracking file and app use /
+  Automatically turning off the screen / Automatically shutting down or sleeping; inverted bindings kept) (settings-isPrivate,
+  settings-inhibitScreen, settings-inhibitSleep, settings-shortcut). The empty spacer Item became nothing.
+HIG ids: HIG-001/005/006 (order by use), HIG-057 (no generic section), button labels with ellipsis when they open something.
+
+Speed cause (kcm_activities.cpp): nothing blocking; load() only handles a launch argument via singleShot(0). The activity list
+comes from Activities.ActivityModel in the view, so the page shows before data arrives. KGlobalAccel D-Bus happens on Save only
+(activityconfig.cpp). After numbers: pending, manager will measure.
+
+Unconfirmed: the ActivityModel role names "current" and "description" (model lives in libkactivities, not in src/master); a
+missing role reads as undefined and the subtitle is just hidden. Not compiled.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/activities/ui/ActivityEditor.qml | 33 +++++++++++--------
+ kcms/activities/ui/main.qml           | 46 +++++++++++++++++++++++----
+ 2 files changed, 58 insertions(+), 21 deletions(-)
+
+diff --git a/kcms/activities/ui/ActivityEditor.qml b/kcms/activities/ui/ActivityEditor.qml
+index d822a79..e153aa3 100644
+--- a/kcms/activities/ui/ActivityEditor.qml
++++ b/kcms/activities/ui/ActivityEditor.qml
+@@ -23,6 +23,7 @@ KCM.SimpleKCM {
+                       : i18nc("@title:window", "Create a New Activity")
+ 
+     actions: Kirigami.Action {
++        // ksr: kcm_activities/Save
+         text: i18nc("@action:button as in, 'save changes'", "Save")
+         icon.name: "document-save"
+         enabled: settings.name.length > 0 && settings.isSaveNeeded
+@@ -44,17 +45,15 @@ KCM.SimpleKCM {
+     Kirigami.FormLayout {
+         anchors.fill: parent
+ 
+-        Item {
+-            height: Kirigami.Units.smallSpacing
+-        }
+-
+         QQC2.Button {
++            // ksr: kcm_activities/x
+             implicitHeight:  Kirigami.Units.iconSizes.medium + Kirigami.Units.largeSpacing * 2
+             implicitWidth: height
+             icon.height: Kirigami.Units.iconSizes.medium
+             icon.width: Kirigami.Units.iconSizes.medium
+             icon.name: settings.iconName
+             Kirigami.FormData.label: i18nc("@label:chooser", "Icon:")
++            Accessible.name: i18nc("@action:button", "Choose Icon…")
+             onClicked: iconDialog.open();
+ 
+             KIconThemes.IconDialog {
+@@ -65,44 +64,50 @@ KCM.SimpleKCM {
+         }
+ 
+         QQC2.TextField {
++            // ksr: kcm_activities/settings-name
+             Kirigami.FormData.label: i18nc("@label:textbox", "Name:")
+             text: settings.name
+             onTextEdited: settings.name = text
+         }
+ 
+         QQC2.TextField {
++            // ksr: kcm_activities/settings-description
+             Kirigami.FormData.label: i18nc("@label:textbox", "Description:")
+             text: settings.description
+             onTextEdited: settings.description = text
+         }
+ 
++        KQuickControls.KeySequenceItem {
++            // ksr: kcm_activities/settings-shortcut
++            Kirigami.FormData.label: i18nc("@label prefix for keyboard shortcut input button", "Shortcut for switching:")
++            keySequence: settings.shortcut
++            onCaptureFinished: settings.shortcut = keySequence
++        }
++
+         Kirigami.Separator {
+             Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18nc("@title:group", "While this activity is active")
+         }
+ 
+         QQC2.CheckBox {
+-            Kirigami.FormData.label: i18nc("@title:group for checkbox group", "While on this activity, allow:")
+-            text: i18nc("@option:check While on activity, allow", "Tracking file and app use")
++            // ksr: kcm_activities/settings-isPrivate
++            text: i18nc("@option:check While on activity, allow", "Track files and apps used")
+             checked: !settings.isPrivate
+             onToggled: settings.isPrivate = !checked
+         }
+ 
+         QQC2.CheckBox {
+-            text: i18nc("@option:check While on activity, allow", "Automatically turning off the screen")
++            // ksr: kcm_activities/settings-inhibitScreen
++            text: i18nc("@option:check While on activity, allow", "Turn off the screen automatically")
+             checked: !settings.inhibitScreen
+             onToggled: settings.inhibitScreen = !checked
+         }
+ 
+         QQC2.CheckBox {
+-            text: i18nc("@option:check While on activity, allow", "Automatically shutting down or sleeping")
++            // ksr: kcm_activities/settings-inhibitSleep
++            text: i18nc("@option:check While on activity, allow", "Shut down or sleep automatically")
+             checked: !settings.inhibitSleep
+             onToggled: settings.inhibitSleep = !checked
+         }
+-
+-        KQuickControls.KeySequenceItem {
+-            Kirigami.FormData.label: i18nc("@label prefix for keyboard shortcut input button", "Shortcut for switching:")
+-            keySequence: settings.shortcut
+-            onCaptureFinished: settings.shortcut = keySequence
+-        }
+     }
+ }
+diff --git a/kcms/activities/ui/main.qml b/kcms/activities/ui/main.qml
+index a2a3539..3d10e61 100644
+--- a/kcms/activities/ui/main.qml
++++ b/kcms/activities/ui/main.qml
+@@ -30,6 +30,16 @@ KCM.ScrollViewKCM {
+             id: kactivities
+         }
+ 
++        Kirigami.PlaceholderMessage {
++            anchors.centerIn: parent
++            width: parent.width - (Kirigami.Units.largeSpacing * 4)
++            visible: activitiesList.count === 0
++            icon.name: "activities"
++            text: i18nc("@info:status", "No activities")
++            explanation: i18nc("@info:usagetip", "Activities keep separate sets of apps and files for different tasks.")
++        }
++
++        // ksr: kcm_activities/configureActivity
+         delegate: QQC2.ItemDelegate {
+             width: ListView.view.width
+ 
+@@ -41,25 +51,45 @@ KCM.ScrollViewKCM {
+             contentItem: RowLayout {
+                 id: row
+ 
++                spacing: Kirigami.Units.largeSpacing
++
+                 Kirigami.Icon {
+                     id: icon
+-                    height: Kirigami.Units.iconSizes.medium
+-                    width: height
++                    Layout.preferredHeight: Kirigami.Units.iconSizes.medium
++                    Layout.preferredWidth: Kirigami.Units.iconSizes.medium
+                     source: model.icon
+                 }
+ 
+-                QQC2.Label {
++                ColumnLayout {
+                     Layout.fillWidth: true
+-                    text: model.name
+-                    textFormat: Text.PlainText
++                    spacing: 0
++
++                    QQC2.Label {
++                        Layout.fillWidth: true
++                        text: model.name
++                        textFormat: Text.PlainText
++                        elide: Text.ElideRight
++                    }
++
++                    // Role names "current" and "description" are those of KActivities::ActivitiesModel (not in this tree).
++                    QQC2.Label {
++                        Layout.fillWidth: true
++                        visible: text.length > 0
++                        text: model.current ? i18nc("@info:status", "Current activity") : (model.description ?? "")
++                        textFormat: Text.PlainText
++                        elide: Text.ElideRight
++                        font: Kirigami.Theme.smallFont
++                    }
+                 }
+ 
+-                QQC2.Button {
++                QQC2.ToolButton {
++                    // ksr: kcm_activities/isNewActivityAuthorized
+                     visible: kcm.isNewActivityAuthorized
+                     enabled:  activitiesList.count > 1
+                     icon.name: "edit-delete"
+                     text: i18nc("@info:tooltip", "Delete %1 activity", model.name)
+                     display: QQC2.AbstractButton.IconOnly
++                    Accessible.name: text
+                     QQC2.ToolTip.text: text
+                     QQC2.ToolTip.visible: hovered || visualFocus
+                     onClicked: {
+@@ -73,8 +103,10 @@ KCM.ScrollViewKCM {
+     }
+ 
+     actions: Kirigami.Action {
++        // ksr: kcm_activities/CreateNew
+         visible: kcm.isNewActivityAuthorized
+-        text: i18nc("@action:button Create new Activity", "Create New…")
++        displayHint: Kirigami.DisplayHint.KeepVisible
++        text: i18nc("@action:button Create new Activity", "Add Activity…")
+         icon.name: "list-add"
+         onTriggered: kcm.newActivity();
+     }

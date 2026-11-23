@@ -1,0 +1,167 @@
+From e54ed5e589339774358a7a88d7584976acf657d6 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 15:06:49 +0500
+Subject: [PATCH 30/31] kcm_kded: no blocking D-Bus call before the first
+ frame; module scan after it; empty-search message
+
+Page type: List (search + filter, then Startup / Load-on-Demand sections), unchanged structure and wording, so no relabel rows.
+Speed cause (code): KDEDConfig constructor called QDBusConnectionInterface::isServiceRegistered() (synchronous D-Bus
+round trip) and load() ran ModulesModel::load() (KPluginMetaData::findPlugins("kf6/kded") + kded5rc reads + sort) before
+the first frame. Now NameHasOwner goes through asyncCall + QDBusPendingCallWatcher, and the first model load is queued
+with QTimer::singleShot(0) so the page paints first (later Reset loads stay synchronous).
+- New property kdedStateKnown so the "kded6 is not running" error is not flashed while the async check is pending.
+- ModulesModel: dataChanged is skipped while the model is still empty (avoids invalid-index signals).
+- Placeholder "No matching services" when the search/filter hides everything (HIG empty states).
+After-numbers: pending, manager will measure. NOT BUILT YET (QDBusAbstractInterface::asyncCall on
+QDBusConnectionInterface assumed available in Qt 6; not compiled).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/kded/kcmkded.cpp      | 25 ++++++++++++++++++++++++-
+ kcms/kded/kcmkded.h        |  8 ++++++++
+ kcms/kded/modulesmodel.cpp |  5 ++++-
+ kcms/kded/ui/main.qml      | 10 +++++++++-
+ 4 files changed, 45 insertions(+), 3 deletions(-)
+
+diff --git a/kcms/kded/kcmkded.cpp b/kcms/kded/kcmkded.cpp
+index b7a6912..e85bc17 100644
+--- a/kcms/kded/kcmkded.cpp
++++ b/kcms/kded/kcmkded.cpp
+@@ -11,6 +11,7 @@
+ #include "debug.h"
+ 
+ #include <qqml.h>
++#include <QTimer>
+ 
+ #include <QDBusConnection>
+ #include <QDBusConnectionInterface>
+@@ -59,7 +60,18 @@ KDEDConfig::KDEDConfig(QObject *parent, const KPluginMetaData &metaData)
+         Q_UNUSED(oldOwner)
+         setKdedRunning(!newOwner.isEmpty());
+     });
+-    setKdedRunning(QDBusConnection::sessionBus().interface()->isServiceRegistered(s_kdedServiceName));
++
++    // ksr: NameHasOwner used to be a blocking call in the constructor; ask asynchronously so the page opens first.
++    auto *registeredCall = new QDBusPendingCallWatcher(QDBusConnection::sessionBus().interface()->asyncCall(QStringLiteral("NameHasOwner"), s_kdedServiceName), this);
++    connect(registeredCall, &QDBusPendingCallWatcher::finished, this, [this](QDBusPendingCallWatcher *watcher) {
++        QDBusPendingReply<bool> reply = *watcher;
++        watcher->deleteLater();
++        setKdedRunning(reply.isValid() && reply.value());
++        if (!m_kdedStateKnown) {
++            m_kdedStateKnown = true;
++            Q_EMIT kdedStateKnownChanged();
++        }
++    });
+ }
+ 
+ ModulesModel *KDEDConfig::model() const
+@@ -182,6 +194,17 @@ void KDEDConfig::getModuleStatus()
+ 
+ void KDEDConfig::load()
+ {
++    if (!m_modelLoaded) {
++        // First load: scan the module plugins after the first frame instead of in the constructor/load() path.
++        m_modelLoaded = true;
++        QTimer::singleShot(0, this, [this] {
++            m_model->load();
++            setNeedsSave(false);
++            setRepresentsDefaults(m_model->representsDefault());
++        });
++        return;
++    }
++
+     m_model->load();
+ 
+     setNeedsSave(false);
+diff --git a/kcms/kded/kcmkded.h b/kcms/kded/kcmkded.h
+index a546282..473c624 100644
+--- a/kcms/kded/kcmkded.h
++++ b/kcms/kded/kcmkded.h
+@@ -35,6 +35,7 @@ class KDEDConfig : public KQuickConfigModule
+     Q_PROPERTY(FilterProxyModel *filteredModel READ filteredModel CONSTANT)
+ 
+     Q_PROPERTY(bool kdedRunning READ kdedRunning NOTIFY kdedRunningChanged)
++    Q_PROPERTY(bool kdedStateKnown READ kdedStateKnown NOTIFY kdedStateKnownChanged)
+ 
+ public:
+     explicit KDEDConfig(QObject *parent, const KPluginMetaData &metaData);
+@@ -61,6 +62,10 @@ public:
+     FilterProxyModel *filteredModel() const;
+ 
+     bool kdedRunning() const;
++    bool kdedStateKnown() const
++    {
++        return m_kdedStateKnown;
++    }
+ 
+     Q_INVOKABLE void startModule(const QString &moduleName);
+     Q_INVOKABLE void stopModule(const QString &moduleName);
+@@ -71,6 +76,7 @@ public:
+ 
+ Q_SIGNALS:
+     void kdedRunningChanged();
++    void kdedStateKnownChanged();
+ 
+     void errorMessage(const QString &errorString);
+     void showSelfDisablingModulesHint();
+@@ -89,6 +95,8 @@ private:
+ 
+     QDBusServiceWatcher *const m_kdedWatcher;
+     bool m_kdedRunning = false;
++    bool m_kdedStateKnown = false;
++    bool m_modelLoaded = false;
+ 
+     QString m_lastStartedModule;
+     QStringList m_runningModulesBeforeReconfigure;
+diff --git a/kcms/kded/modulesmodel.cpp b/kcms/kded/modulesmodel.cpp
+index ce0de2f..f6fc418 100644
+--- a/kcms/kded/modulesmodel.cpp
++++ b/kcms/kded/modulesmodel.cpp
+@@ -226,6 +226,9 @@ void ModulesModel::setRunningModulesKnown(bool known)
+ {
+     if (m_runningModulesKnown != known) {
+         m_runningModulesKnown = known;
++        if (m_data.isEmpty()) {
++            return; // model not filled yet (it is loaded after the first frame); rows read the state when they appear
++        }
+         Q_EMIT dataChanged(index(0, 0), index(m_data.count() - 1, 0), {StatusRole});
+     }
+ }
+@@ -242,7 +245,7 @@ void ModulesModel::setRunningModules(const QStringList &runningModules)
+     }
+ 
+     m_runningModules = runningModules;
+-    if (m_runningModulesKnown) {
++    if (m_runningModulesKnown && !m_data.isEmpty()) {
+         Q_EMIT dataChanged(index(0, 0), index(m_data.count() - 1, 0), {StatusRole});
+     }
+ }
+diff --git a/kcms/kded/ui/main.qml b/kcms/kded/ui/main.qml
+index e019132..e3f449e 100644
+--- a/kcms/kded/ui/main.qml
++++ b/kcms/kded/ui/main.qml
+@@ -56,7 +56,7 @@ KCM.ScrollViewKCM {
+             type: Kirigami.MessageType.Error
+             position: Kirigami.InlineMessage.Position.Header
+             showCloseButton: false
+-            visible: !kcm.kdedRunning
++            visible: kcm.kdedStateKnown && !kcm.kdedRunning  // ksr: kcm_kded/KdedNotRunning
+         }
+ 
+         Kirigami.InlineMessage {
+@@ -138,6 +138,14 @@ KCM.ScrollViewKCM {
+ 
+         model: kcm.filteredModel
+ 
++        Kirigami.PlaceholderMessage {
++            anchors.centerIn: parent
++            width: parent.width - (Kirigami.Units.largeSpacing * 4)
++            icon.name: "edit-none"
++            text: i18nc("@info:status placeholdermessage", "No matching services")
++            visible: list.count === 0 && (searchField.text.length > 0 || filterCombo.currentIndex > 0)
++        }
++
+         section.property: "type"
+         section.delegate: Kirigami.ListSectionHeader {
+             width: list.width

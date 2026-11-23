@@ -1,0 +1,79 @@
+From 446c6b8e5434bc0586bd759926d8834cfc6d1206 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 15:07:06 +0500
+Subject: [PATCH 33/34] bench: a preloaded page counts as on screen at its
+ first widget paint (no new scene-graph frame fires)
+
+KSR_BENCH_HOVER runs left frame_ms at -1 for pages the preloader had already rendered.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ app/SidebarMode.cpp | 38 +++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 37 insertions(+), 1 deletion(-)
+
+diff --git a/app/SidebarMode.cpp b/app/SidebarMode.cpp
+index f850b9c..7e2e7b0 100644
+--- a/app/SidebarMode.cpp
++++ b/app/SidebarMode.cpp
+@@ -38,6 +38,34 @@ using namespace Qt::StringLiterals;
+ #include <QTimer>
+ #include <functional>
+ #include <memory>
++
++namespace
++{
++// bench only: calls back on the first paint of a widget (a preloaded QQuickWidget page is shown by a widget paint
++// of its already-rendered texture, without a new scene-graph frame)
++class FirstPaintWatcher : public QObject
++{
++public:
++    FirstPaintWatcher(QObject *parent, std::function<void()> cb)
++        : QObject(parent)
++        , m_cb(std::move(cb))
++    {
++    }
++    bool eventFilter(QObject *, QEvent *e) override
++    {
++        if (e->type() == QEvent::Paint && m_cb) {
++            auto cb = std::move(m_cb);
++            m_cb = nullptr;
++            cb();
++            deleteLater();
++        }
++        return false;
++    }
++
++private:
++    std::function<void()> m_cb;
++};
++}
+ #include <QGraphicsOpacityEffect>
+ #include <QGuiApplication>
+ #include <QHBoxLayout>
+@@ -1047,7 +1075,12 @@ void SidebarMode::ksrBench()
+             }
+         }
+         auto tFrame = std::make_shared<qint64>(-1);
++        auto tPaint = std::make_shared<qint64>(-1);
++        const bool preloaded = qw && before.contains(qw);
+         if (qw) {
++            qw->installEventFilter(new FirstPaintWatcher(qw, [timer, tPaint] {
++                *tPaint = timer->elapsed();
++            }));
+             auto conn = std::make_shared<QMetaObject::Connection>();
+             *conn = connect(qw->quickWindow(), &QQuickWindow::afterFrameEnd, this, [timer, tFrame, conn] {
+                 *tFrame = timer->elapsed();
+@@ -1060,8 +1093,11 @@ void SidebarMode::ksrBench()
+         auto quiet = std::make_shared<int>(0);
+         auto tick = std::make_shared<std::function<void()>>();
+         const QString kind = qw ? QStringLiteral("qml") : QStringLiteral("widgets");
+-        *tick = [this, out, timer, tFrame, last, quiet, quietStart, tick, next, round, id, tSync, kind, qw]() {
++        *tick = [this, out, timer, tFrame, tPaint, preloaded, last, quiet, quietStart, tick, next, round, id, tSync, kind, qw]() {
+             const qint64 now = timer->elapsed();
++            if (preloaded && *tFrame < 0 && *tPaint >= 0) {
++                *tFrame = *tPaint; // already rendered while preloading: on screen with this widget paint
++            }
+             if (!qw && *tFrame < 0) {
+                 *tFrame = now; // widget pages paint in the first event loop pass after loading
+             }

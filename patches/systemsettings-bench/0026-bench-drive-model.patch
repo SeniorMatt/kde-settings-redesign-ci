@@ -1,0 +1,41 @@
+From 4df69438cd71818c4d59b7e83714a20de7421f29 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 08:35:20 +0500
+Subject: [PATCH 26/34] bench: drive model
+
+---
+ app/SidebarMode.cpp | 14 +++++++++-----
+ 1 file changed, 9 insertions(+), 5 deletions(-)
+
+diff --git a/app/SidebarMode.cpp b/app/SidebarMode.cpp
+index 7eaa02f..b5f7a87 100644
+--- a/app/SidebarMode.cpp
++++ b/app/SidebarMode.cpp
+@@ -34,6 +34,7 @@ using namespace Qt::StringLiterals;
+ #include <QFile>
+ #include <QKeyEvent>
+ #include <QHash>
++#include "SidebarModel.h"
+ #include <QTimer>
+ #include <functional>
+ #include <memory>
+@@ -200,11 +201,14 @@ SidebarMode::SidebarMode(QObject *parent,
+             const QString name = keys->takeFirst();
+             static const QHash<QString, int> map{{u"Down"_s, Qt::Key_Down}, {u"Up"_s, Qt::Key_Up}, {u"Left"_s, Qt::Key_Left}, {u"Right"_s, Qt::Key_Right},
+                                                  {u"Enter"_s, Qt::Key_Return}, {u"Tab"_s, Qt::Key_Tab}};
+-            QWidget *win = d->quickWidget; win->activateWindow(); win->setFocus();
+-            QKeyEvent press(QEvent::KeyPress, map.value(name), Qt::NoModifier);
+-            QKeyEvent release(QEvent::KeyRelease, map.value(name), Qt::NoModifier);
+-            QCoreApplication::sendEvent(win, &press);
+-            QCoreApplication::sendEvent(win, &release);
++            static int cur = 0;
++            auto *m = d->sidebarModel;
++            if (name == u"Down") cur = qMax(0, m->nextSelectable(cur, 1));
++            else if (name == u"Up") cur = qMax(0, m->nextSelectable(cur, -1));
++            else if (name == u"Right") m->expand(cur);
++            else if (name == u"Left") { const int r = m->collapse(cur); if (r >= 0) cur = r; }
++            else if (name == u"Enter") m->activate(cur);
++            qInfo() << "KSR key" << name << "row" << cur;
+             QTimer::singleShot(1200, this, [this, n, step] {
+                 d->mainWidget->window()->grab().save(qEnvironmentVariable("KSR_SHOT_DIR", u"/tmp"_s) + u"/keys-%1.png"_s.arg(++*n));
+                 (*step)();

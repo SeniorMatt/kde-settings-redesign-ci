@@ -1,0 +1,65 @@
+From 8cc18e51f2394dc3186de8810f8d17f18e8c771d Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 13:30:31 +0500
+Subject: [PATCH 29/34] bench: hover-then-click (KSR_BENCH_HOVER=ms), wait_ms
+ column (not built yet)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ app/SidebarMode.cpp | 22 ++++++++++++++++++++--
+ 1 file changed, 20 insertions(+), 2 deletions(-)
+
+diff --git a/app/SidebarMode.cpp b/app/SidebarMode.cpp
+index 0943042..f850b9c 100644
+--- a/app/SidebarMode.cpp
++++ b/app/SidebarMode.cpp
+@@ -996,7 +996,7 @@ void SidebarMode::ksrBench()
+         qWarning() << "ksr-bench: cannot write" << outPath;
+         return;
+     }
+-    out->write("round\tkcm\tkind\tsync_ms\tframe_ms\tready_ms\n");
++    out->write("round\tkcm\tkind\tsync_ms\tframe_ms\tready_ms\twait_ms\n");
+     auto queue = std::make_shared<QList<QPair<int, QString>>>();
+     for (int r = 1; r <= rounds; ++r) {
+         for (const QString &id : ids) {
+@@ -1019,6 +1019,22 @@ void SidebarMode::ksrBench()
+             QTimer::singleShot(0, this, [next] { (*next)(); });
+             return;
+         }
++        // KSR_BENCH_HOVER=ms: simulate a hover on the row, wait that long (a human's hover-to-click), then click.
++        // wait_ms = how late the click ran after its planned time (the hover preload blocks the event loop).
++        const int hoverMs = qEnvironmentVariableIntValue("KSR_BENCH_HOVER");
++        if (hoverMs > 0 && d->preloader && !d->moduleView->hasPage(item)) {
++            auto hoverT = std::make_shared<QElapsedTimer>();
++            hoverT->start();
++            d->preloader->hint(item);
++            QTimer::singleShot(hoverMs, this, [this, hoverT, hoverMs, item, round, id, next, out, queue]() {
++                queue->prepend({round, id});
++                qputenv("KSR_BENCH_WAIT_MS", QByteArray::number(qMax<qint64>(0, hoverT->elapsed() - hoverMs)));
++                qputenv("KSR_BENCH_HOVER", "0");   // the click part below runs without another hover
++                (*next)();
++                qputenv("KSR_BENCH_HOVER", QByteArray::number(hoverMs));
++            });
++            return;
++        }
+         const auto before = d->moduleView->findChildren<QQuickWidget *>();
+         auto timer = std::make_shared<QElapsedTimer>();
+         timer->start();
+@@ -1059,13 +1075,15 @@ void SidebarMode::ksrBench()
+             }
+             *last = now;
+             if (*quiet >= 3 || now > 15000) {
+-                out->write(QStringLiteral("%1\t%2\t%3\t%4\t%5\t%6\n")
++                out->write(QStringLiteral("%1\t%2\t%3\t%4\t%5\t%6\t%7\n")
+                                .arg(round)
+                                .arg(id, kind)
+                                .arg(tSync)
+                                .arg(*tFrame)
+                                .arg(*quiet >= 3 ? *quietStart : -1)
++                               .arg(qEnvironmentVariableIntValue("KSR_BENCH_WAIT_MS"))
+                                .toUtf8());
++                qputenv("KSR_BENCH_WAIT_MS", "0");
+                 out->flush();
+                 const QString shotDir = qEnvironmentVariable("KSR_SHOT_DIR");
+                 if (!shotDir.isEmpty() && round == 1) {

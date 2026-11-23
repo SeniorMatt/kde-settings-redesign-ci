@@ -1,0 +1,127 @@
+From 04c8d83541fc7cd0761eb7d376b8cd69292dab8b Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 02:54:00 +0500
+Subject: [PATCH 2/2] kcm_kup: empty state when there are no backup plans
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The CI smoke shot (and stock) showed an empty area under the top row. Now a centred 'No backup plans' message with a short
+explanation and an 'Add New Plan…' button (shown only while no plan exists; follows the same enabled state as the top button).
+Stock logic kept: the Add New Plan button is only enabled while 'Backups enabled' is checked (stock kupkcm.cpp:247). Not built.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcm/kupkcm.cpp | 44 ++++++++++++++++++++++++++++++++++++++++++++
+ kcm/kupkcm.h   |  2 ++
+ 2 files changed, 46 insertions(+)
+
+diff --git a/kcm/kupkcm.cpp b/kcm/kupkcm.cpp
+index 0e91844..debbc04 100644
+--- a/kcm/kupkcm.cpp
++++ b/kcm/kupkcm.cpp
+@@ -11,11 +11,13 @@
+ 
+ #include <QCheckBox>
+ #include <QDBusInterface>
++#include <QFont>
+ #include <QLabel>
+ #include <QProcess>
+ #include <QPushButton>
+ #include <QScrollArea>
+ #include <QStackedLayout>
++#include <QVBoxLayout>
+ 
+ #include <KAboutData>
+ #include <KConfigDialogManager>
+@@ -331,6 +333,35 @@ void KupKcm::createSettingsFrontPage()
+ 
+     mVerticalLayout->addStretch(1);
+     lCentralWidget->setLayout(mVerticalLayout);
++
++    // Empty state while there are no plans (same pattern as Kirigami.PlaceholderMessage on QML pages).
++    // ksr: kcm_kup/AddPlan
++    mEmptyState = new QWidget(lCentralWidget);
++    auto lEmptyLayout = new QVBoxLayout(mEmptyState);
++    auto lEmptyIcon = new QLabel;
++    lEmptyIcon->setPixmap(QIcon::fromTheme(QStringLiteral("kup")).pixmap(64, 64));
++    lEmptyIcon->setAlignment(Qt::AlignCenter);
++    auto lEmptyTitle = new QLabel(xi18nc("@info:status", "No backup plans"));
++    lEmptyTitle->setAlignment(Qt::AlignCenter);
++    QFont lTitleFont = lEmptyTitle->font();
++    lTitleFont.setBold(true);
++    lTitleFont.setPointSizeF(lTitleFont.pointSizeF() * 1.3);
++    lEmptyTitle->setFont(lTitleFont);
++    auto lEmptyText = new QLabel(xi18nc("@info:usagetip", "A backup plan copies the folders you choose to a drive or another computer on a schedule."));
++    lEmptyText->setAlignment(Qt::AlignCenter);
++    lEmptyText->setWordWrap(true);
++    auto lEmptyButton = new QPushButton(QIcon::fromTheme(QStringLiteral("list-add")), xi18nc("@action:button", "Add New Plan…"));
++    lEmptyButton->setEnabled(lAddPlanButton->isEnabled());
++    connect(lEmptyButton, &QPushButton::clicked, lAddPlanButton, &QPushButton::click);
++    connect(mEnableCheckBox, &QCheckBox::toggled, lEmptyButton, &QPushButton::setEnabled);
++    lEmptyLayout->addStretch(1);
++    lEmptyLayout->addWidget(lEmptyIcon);
++    lEmptyLayout->addWidget(lEmptyTitle);
++    lEmptyLayout->addWidget(lEmptyText);
++    lEmptyLayout->addWidget(lEmptyButton, 0, Qt::AlignHCenter);
++    lEmptyLayout->addStretch(1);
++    mVerticalLayout->insertWidget(0, mEmptyState, 10);
++    updateEmptyState();
+ }
+ 
+ void KupKcm::createPlanWidgets(int pIndex)
+@@ -376,6 +407,17 @@ void KupKcm::createPlanWidgets(int pIndex)
+     mStatusWidgets[pIndex] = lStatusWidget;
+     // always insert at end, before the stretch space at the bottom.
+     mVerticalLayout->insertWidget(mVerticalLayout->count() - 1, lStatusWidget);
++    updateEmptyState();
++}
++
++void KupKcm::updateEmptyState()
++{
++    if (!mEmptyState)
++        return;
++    bool lAny = false;
++    for (auto *lStatus : std::as_const(mStatusWidgets))
++        lAny = lAny || lStatus;
++    mEmptyState->setVisible(!lAny);
+ }
+ 
+ void KupKcm::completelyRemovePlan(int pIndex)
+@@ -384,6 +426,7 @@ void KupKcm::completelyRemovePlan(int pIndex)
+     delete mStatusWidgets.takeAt(pIndex);
+     delete mPlanWidgets.takeAt(pIndex);
+     delete mPlans.takeAt(pIndex);
++    updateEmptyState();
+ }
+ 
+ void KupKcm::partiallyRemovePlan(int pIndex)
+@@ -392,6 +435,7 @@ void KupKcm::partiallyRemovePlan(int pIndex)
+     mConfigManagers[pIndex] = nullptr;
+     mStatusWidgets.at(pIndex)->deleteLater();
+     mStatusWidgets[pIndex] = nullptr;
++    updateEmptyState();
+ }
+ 
+ #include "kupkcm.moc"
+diff --git a/kcm/kupkcm.h b/kcm/kupkcm.h
+index 2ff61bd..4cc8527 100644
+--- a/kcm/kupkcm.h
++++ b/kcm/kupkcm.h
+@@ -44,6 +44,7 @@ private:
+     void createPlanWidgets(int pIndex);
+     void completelyRemovePlan(int pIndex);
+     void partiallyRemovePlan(int pIndex);
++    void updateEmptyState();
+ 
+     KSharedConfigPtr mConfig;
+     KupSettings *mSettings{};
+@@ -56,6 +57,7 @@ private:
+     QLabel *mCheckingPage{};
+     QVBoxLayout *mVerticalLayout{};
+     QCheckBox *mEnableCheckBox{};
++    QWidget *mEmptyState{};
+     QString mBupVersion;
+     QString mRsyncVersion;
+     bool mPar2Available{false};

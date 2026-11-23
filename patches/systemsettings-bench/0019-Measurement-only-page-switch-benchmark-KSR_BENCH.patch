@@ -1,0 +1,151 @@
+From 52ad8f1a4667355b3da72abcb3d7d0a006fd8e2e Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 07:58:23 +0500
+Subject: [PATCH 19/34] Measurement-only page-switch benchmark (KSR_BENCH)
+
+---
+ app/SidebarMode.cpp | 104 ++++++++++++++++++++++++++++++++++++++++++++
+ app/SidebarMode.h   |   3 ++
+ 2 files changed, 107 insertions(+)
+
+diff --git a/app/SidebarMode.cpp b/app/SidebarMode.cpp
+index ba6fa87..4952098 100644
+--- a/app/SidebarMode.cpp
++++ b/app/SidebarMode.cpp
+@@ -29,6 +29,11 @@
+ 
+ #include <KLocalizedQmlContext>
+ #include <QAction>
++#include <QElapsedTimer>
++#include <QFile>
++#include <QTimer>
++#include <functional>
++#include <memory>
+ #include <QGraphicsOpacityEffect>
+ #include <QGuiApplication>
+ #include <QHBoxLayout>
+@@ -178,6 +183,9 @@ SidebarMode::SidebarMode(QObject *parent,
+     qmlRegisterAnonymousType<QAbstractItemModel>("", 1);
+     initEvent();
+     connect(moduleView(), &ModuleView::moduleChanged, this, &SidebarMode::viewChanged);
++    if (qEnvironmentVariableIsSet("KSR_BENCH")) {
++        QTimer::singleShot(0, this, &SidebarMode::ksrBench);
++    }
+ }
+ 
+ SidebarMode::~SidebarMode()
+@@ -919,4 +927,100 @@ void SidebarMode::retranslateQml()
+     d->engine->retranslate();
+ }
+ 
++// ---- measurement-only benchmark (not part of the redesign) ----
++// For each page: sync = time the click blocks the UI, frame = first frame of the page's QQuickWidget (widget pages:
++// first paint), ready = start of the first quiet stretch (3 ticks of a 1 ms precise timer, each < 8 ms apart) after
++// the frame, i.e. when the app answers input again. Rows: round, kcm, kind, sync_ms, frame_ms, ready_ms.
++void SidebarMode::ksrBench()
++{
++    const QStringList ids = qEnvironmentVariable("KSR_BENCH").split(u',', Qt::SkipEmptyParts);
++    const int rounds = qMax(1, qEnvironmentVariableIntValue("KSR_BENCH_ROUNDS"));
++    const QString outPath = qEnvironmentVariable("KSR_BENCH_OUT", QStringLiteral("/tmp/ksr-bench.tsv"));
++    auto out = std::make_shared<QFile>(outPath);
++    if (!out->open(QIODevice::WriteOnly | QIODevice::Text)) {
++        qWarning() << "ksr-bench: cannot write" << outPath;
++        return;
++    }
++    out->write("round\tkcm\tkind\tsync_ms\tframe_ms\tready_ms\n");
++    auto queue = std::make_shared<QList<QPair<int, QString>>>();
++    for (int r = 1; r <= rounds; ++r) {
++        for (const QString &id : ids) {
++            queue->append({r, id});
++        }
++    }
++    auto next = std::make_shared<std::function<void()>>();
++    *next = [this, out, queue, next]() {
++        if (queue->isEmpty()) {
++            out->close();
++            QTimer::singleShot(0, qApp, &QCoreApplication::quit);
++            return;
++        }
++        const auto entry = queue->takeFirst();
++        const int round = entry.first;
++        const QString id = entry.second;
++        MenuItem *item = d->rootItem->descendantForModule(id);
++        if (!item) {
++            out->write(QStringLiteral("%1\t%2\tmissing\t\t\t\n").arg(round).arg(id).toUtf8());
++            QTimer::singleShot(0, this, [next] { (*next)(); });
++            return;
++        }
++        const auto before = d->moduleView->findChildren<QQuickWidget *>();
++        auto timer = std::make_shared<QElapsedTimer>();
++        timer->start();
++        loadModule(d->model->indexForItem(item));
++        const qint64 tSync = timer->elapsed();
++        QQuickWidget *qw = nullptr;
++        for (QQuickWidget *w : d->moduleView->findChildren<QQuickWidget *>()) {
++            if (!before.contains(w) || w->isVisible()) {
++                qw = w; // newest page widget, or the visible one when it was cached
++            }
++        }
++        auto tFrame = std::make_shared<qint64>(-1);
++        if (qw) {
++            auto conn = std::make_shared<QMetaObject::Connection>();
++            *conn = connect(qw, &QQuickWidget::frameSwapped, this, [timer, tFrame, conn] {
++                *tFrame = timer->elapsed();
++                QObject::disconnect(*conn);
++            });
++            qw->update();
++        }
++        auto last = std::make_shared<qint64>(tSync);
++        auto quietStart = std::make_shared<qint64>(-1);
++        auto quiet = std::make_shared<int>(0);
++        auto tick = std::make_shared<std::function<void()>>();
++        const QString kind = qw ? QStringLiteral("qml") : QStringLiteral("widgets");
++        *tick = [this, out, timer, tFrame, last, quiet, quietStart, tick, next, round, id, tSync, kind, qw]() {
++            const qint64 now = timer->elapsed();
++            if (!qw && *tFrame < 0) {
++                *tFrame = now; // widget pages paint in the first event loop pass after loading
++            }
++            if (now - *last < 8 && *tFrame >= 0) {
++                if (*quiet == 0) {
++                    *quietStart = *last;
++                }
++                ++*quiet;
++            } else {
++                *quiet = 0;
++            }
++            *last = now;
++            if (*quiet >= 3 || now > 15000) {
++                out->write(QStringLiteral("%1\t%2\t%3\t%4\t%5\t%6\n")
++                               .arg(round)
++                               .arg(id, kind)
++                               .arg(tSync)
++                               .arg(*tFrame)
++                               .arg(*quiet >= 3 ? *quietStart : -1)
++                               .toUtf8());
++                out->flush();
++                QTimer::singleShot(400, this, [next] { (*next)(); });
++                return;
++            }
++            QTimer::singleShot(1, Qt::PreciseTimer, this, [tick] { (*tick)(); });
++        };
++        QTimer::singleShot(0, Qt::PreciseTimer, this, [tick] { (*tick)(); });
++    };
++    QTimer::singleShot(qEnvironmentVariableIntValue("KSR_BENCH_DELAY") > 0 ? qEnvironmentVariableIntValue("KSR_BENCH_DELAY") : 3000,
++                       this, [next] { (*next)(); });
++}
++
+ #include "moc_SidebarMode.cpp"
+diff --git a/app/SidebarMode.h b/app/SidebarMode.h
+index 43a5130..c3a3615 100644
+--- a/app/SidebarMode.h
++++ b/app/SidebarMode.h
+@@ -158,6 +158,9 @@ public:
+      */
+     Q_INVOKABLE bool loadModule(const QModelIndex &activeModule, const QStringList &args = QStringList());
+ 
++    // Measurement only (KSR_BENCH=kcm_a,kcm_b,...): opens each page in turn and writes timings, then quits.
++    void ksrBench();
++
+     /**
+      * Page preloading (PagePreloader): the pointer rests on a row, or a row got the keyboard focus. Only a hint: the page
+      * is built later, when the hint has been stable for a moment and the user is idle. @p search is for the rows of the

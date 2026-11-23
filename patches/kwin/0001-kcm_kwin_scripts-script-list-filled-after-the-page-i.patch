@@ -1,0 +1,240 @@
+From 0036f23fcd2bbc0e38e702e20ec230f01adeb4ee Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 11:06:29 +0500
+Subject: [PATCH 01/12] kcm_kwin_scripts: script list filled after the page is
+ shown (deferred scan, busy indicator after 150 ms)
+
+Page type: List (docs/page-design.md). kwinrc keys ([Plugins] <name>Enabled, [Script-<name>]), KPackage
+install/uninstall, D-Bus /Scripting start and the config dialog are unchanged.
+
+Moved / renamed:
+- "Get New..." is now "Get New Scripts..." (kcm_kwin_scripts/get-new). Install from File... kept.
+- Search field got a Kirigami.ContextualHelpButton beside it (new short text: what scripts are, Configure..., deletes
+  apply on Apply). Status InlineMessage stays first. Icon-only/Install actions got Accessible.name.
+- Empty list: PluginSelector already shows its own "No plugins found" placeholder.
+- Relabel table: inventory/relabel/kcm_kwin_scripts.tsv (outer repo). Inventory --strict: 8 rows ok, 0 lost.
+
+Speed (cause from code, not measured):
+- Module::load() called KWinScriptsData::pluginMetaDataList() (KPackage findPackages("KWin/Script") reads the metadata
+  of every installed script) and KPluginModel::addPlugins() (findConfig() per script, a QPluginLoader probe;
+  kcmutils/src/core/kpluginmodel.cpp:190-204), both synchronously before the first frame.
+- Now load() only clears state; the scan and addPlugins run one event-loop turn later (QTimer::singleShot(0)), with a
+  generation counter so a newer load/import/GHNS refresh cancels a pending fill. New property kcm.loading drives a
+  BusyIndicator shown only after 150 ms. Not moved to a worker thread: KPackage::PackageLoader thread safety could not
+  be checked here (no kpackage source in the tree), so I kept it on the GUI thread.
+- Not changed: KWinScriptsData::isDefaults() still rescans packages (used by the shell's changed-settings marker).
+- Numbers: before (build/bench/clean/before-slow.tsv, under load) 702 ms first frame at 0.5 CPU. After: pending,
+  manager will measure.
+
+HIG: HIG-001, HIG-005, HIG-006, HIG-019, HIG-020, HIG-047, HIG-058.
+
+Not built yet (freeze).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ src/kcms/scripts/module.cpp  | 30 +++++++++++++++++++++++++--
+ src/kcms/scripts/module.h    | 12 +++++++++++
+ src/kcms/scripts/ui/main.qml | 39 ++++++++++++++++++++++++++++++++----
+ 3 files changed, 75 insertions(+), 6 deletions(-)
+
+diff --git a/src/kcms/scripts/module.cpp b/src/kcms/scripts/module.cpp
+index a67631c..45d93d2 100644
+--- a/src/kcms/scripts/module.cpp
++++ b/src/kcms/scripts/module.cpp
+@@ -11,6 +11,7 @@
+ #include <QDBusPendingCall>
+ #include <QFileDialog>
+ #include <QStringList>
++#include <QTimer>
+ 
+ #include <KCMultiDialog>
+ #include <KConfigGroup>
+@@ -40,6 +41,8 @@ Module::Module(QObject *parent, const KPluginMetaData &data)
+ 
+ void Module::onGHNSEntriesChanged()
+ {
++    ++m_generation; // cancels a still pending load()
++    setLoading(false);
+     m_model->clear();
+     m_model->addPlugins(m_kwinScriptsData->pluginMetaDataList(), QString());
+ }
+@@ -70,6 +73,8 @@ void Module::importScript()
+             m_errorMessage.clear();
+             Q_EMIT messageChanged();
+ 
++            ++m_generation; // cancels a still pending load()
++            setLoading(false);
+             m_model->clear();
+             m_model->addPlugins(m_kwinScriptsData->pluginMetaDataList(), QString());
+ 
+@@ -108,14 +113,35 @@ void Module::defaults()
+     setNeedsSave(m_model->isSaveNeeded());
+ }
+ 
++void Module::setLoading(bool loading)
++{
++    if (m_loading != loading) {
++        m_loading = loading;
++        Q_EMIT loadingChanged();
++    }
++}
++
+ void Module::load()
+ {
+     m_model->clear();
+-    m_model->addPlugins(m_kwinScriptsData->pluginMetaDataList(), QString());
+     m_pendingDeletions.clear();
+     Q_EMIT pendingDeletionsChanged();
+-
+     setNeedsSave(false);
++
++    // findPackages("KWin/Script") reads the metadata of every installed script, and KPluginModel::addPlugins() then
++    // looks up each script's config module. Both used to run inside load(), before the page was shown. Run them one
++    // event-loop turn later; a newer load() makes an older, still pending one a no-op.
++    const quint64 generation = ++m_generation;
++    setLoading(true);
++    QTimer::singleShot(0, this, [this, generation]() {
++        if (generation != m_generation) {
++            return;
++        }
++        m_model->addPlugins(m_kwinScriptsData->pluginMetaDataList(), QString());
++        setLoading(false);
++        // Keep what the user changed while the list was filling (nothing, normally)
++        setNeedsSave(m_model->isSaveNeeded() || !m_pendingDeletions.isEmpty());
++    });
+ }
+ 
+ void Module::save()
+diff --git a/src/kcms/scripts/module.h b/src/kcms/scripts/module.h
+index db8fade..1a470ff 100644
+--- a/src/kcms/scripts/module.h
++++ b/src/kcms/scripts/module.h
+@@ -24,6 +24,8 @@ class Module : public KQuickConfigModule
+     Q_PROPERTY(QList<KPluginMetaData> pendingDeletions READ pendingDeletions NOTIFY pendingDeletionsChanged)
+     Q_PROPERTY(QString errorMessage READ errorMessage NOTIFY messageChanged)
+     Q_PROPERTY(QString infoMessage READ infoMessage NOTIFY messageChanged)
++    // true from load() until the script list is in the model (the page is already shown by then)
++    Q_PROPERTY(bool loading READ isLoading NOTIFY loadingChanged)
+ 
+ public:
+     explicit Module(QObject *parent, const KPluginMetaData &data);
+@@ -48,6 +50,11 @@ public:
+         return m_pendingDeletions;
+     }
+ 
++    bool isLoading() const
++    {
++        return m_loading;
++    }
++
+     QString errorMessage() const
+     {
+         return m_errorMessage;
+@@ -73,12 +80,17 @@ public:
+ 
+ Q_SIGNALS:
+     void messageChanged();
++    void loadingChanged();
+     void pendingDeletionsChanged();
+ 
+ private:
++    void setLoading(bool loading);
++
+     KWinScriptsData *m_kwinScriptsData;
+     QList<KPluginMetaData> m_pendingDeletions;
+     KPluginModel *m_model;
+     QString m_errorMessage;
+     QString m_infoMessage;
++    bool m_loading = false;
++    quint64 m_generation = 0;
+ };
+diff --git a/src/kcms/scripts/ui/main.qml b/src/kcms/scripts/ui/main.qml
+index b1fae73..ec4d9e0 100644
+--- a/src/kcms/scripts/ui/main.qml
++++ b/src/kcms/scripts/ui/main.qml
+@@ -7,6 +7,7 @@
+ 
+ import QtQuick
+ import QtQuick.Layouts
++import QtQuick.Controls as QQC2
+ 
+ import org.kde.config
+ import org.kde.kirigami as Kirigami
+@@ -17,14 +18,19 @@ KCMUtils.ScrollViewKCM {
+     implicitWidth: Kirigami.Units.gridUnit * 22
+     implicitHeight: Kirigami.Units.gridUnit * 20
+ 
++    // List page (docs/page-design.md). The page, its header and the toolbar are shown at once; the script list is read
++    // after the page is created (kcm.loading).
+     actions: [
+         Kirigami.Action {
++            // ksr: kcm_kwin_scripts/install-from-file
+             icon.name: "document-import"
+             text: i18n("Install from File…")
++            Accessible.name: text
+             onTriggered: kcm.importScript()
+         },
+         NewStuff.Action {
+-            text: i18nc("@action:button get new KWin scripts", "Get New…")
++            // ksr: kcm_kwin_scripts/get-new
++            text: i18nc("@action:button get new KWin scripts", "Get New Scripts…")
+             visible: KAuthorized.authorize(KAuthorized.GHNS)
+             configFile: "kwinscripts.knsrc"
+             onEntryEvent: (entry, event) => {
+@@ -39,15 +45,37 @@ KCMUtils.ScrollViewKCM {
+         spacing: Kirigami.Units.smallSpacing
+ 
+         Kirigami.InlineMessage {
++            // ksr: kcm_kwin_scripts/messages
+             Layout.fillWidth: true
+             visible: kcm.errorMessage || kcm.infoMessage
+             type: kcm.errorMessage ? Kirigami.MessageType.Error : Kirigami.MessageType.Information
+             text: kcm.errorMessage || kcm.infoMessage
+         }
+ 
+-        Kirigami.SearchField {
+-            Layout.fillWidth: true
+-            id: searchField
++        RowLayout {
++            spacing: Kirigami.Units.smallSpacing
++
++            Kirigami.SearchField {
++                // ksr: kcm_kwin_scripts/search
++                Layout.fillWidth: true
++                id: searchField
++            }
++
++            Kirigami.ContextualHelpButton {
++                toolTipText: i18nc("@info:tooltip", "KWin scripts add features to the window manager. Turn a script on to use it, and use Configure… for its options. Scripts you delete are removed when you click Apply.")
++            }
++        }
++
++        // Shown only when reading the script list takes longer than 150 ms, so a fast load never flashes it
++        Timer {
++            id: busyDelay
++            interval: 150
++            running: kcm.loading
++        }
++        QQC2.BusyIndicator {
++            Layout.alignment: Qt.AlignHCenter
++            running: kcm.loading && !busyDelay.running
++            visible: running
+         }
+     }
+ 
+@@ -57,11 +85,14 @@ KCMUtils.ScrollViewKCM {
+         query: searchField.text
+ 
+         delegate: KCMUtils.PluginDelegate {
++            // ksr: kcm_kwin_scripts/script-enabled
++            // ksr: kcm_kwin_scripts/script-configure
+             onConfigTriggered: kcm.configure(model.config)
+             additionalActions: [
+                 Kirigami.Action {
+                     enabled: kcm.canDeleteEntry(model.metaData)
+                     icon.name: kcm.pendingDeletions.indexOf(model.metaData) === -1 ? "delete" : "edit-undo"
++                    // ksr: kcm_kwin_scripts/script-delete
+                     text: i18nc("@info:tooltip", "Delete…")
+                     displayHint: Kirigami.DisplayHint.IconOnly
+ 

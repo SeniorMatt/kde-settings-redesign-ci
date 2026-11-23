@@ -1,0 +1,31 @@
+From b4440fd23733e9afcf3fce01f0e09439bc637d08 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 04:29:29 +0500
+Subject: [PATCH 28/31] kcm_tablet: isDefaults checks that the rebind groups
+ exist (isValid() is true for any named group)
+
+So Defaults was never disabled.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/tablet/kcmtablet.cpp | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/kcms/tablet/kcmtablet.cpp b/kcms/tablet/kcmtablet.cpp
+index 96df46e..6c6a0a4 100644
+--- a/kcms/tablet/kcmtablet.cpp
++++ b/kcms/tablet/kcmtablet.cpp
+@@ -341,10 +341,10 @@ bool Tablet::isDefaults() const
+         return false;
+ 
+     const auto cfg = KSharedConfig::openConfig("kcminputrc");
+-    if (cfg->group("ButtonRebinds").group("Tablet").isValid()) {
++    if (cfg->group("ButtonRebinds").group("Tablet").exists()) {
+         return false;
+     }
+-    if (cfg->group("ButtonRebinds").group("TabletTool").isValid()) {
++    if (cfg->group("ButtonRebinds").group("TabletTool").exists()) {
+         return false;
+     }
+     return m_tabletsModel->isDefaults();

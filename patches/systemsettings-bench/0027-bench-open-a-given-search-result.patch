@@ -1,0 +1,24 @@
+From 48af53b2de267d489ebf377b298e3c8b16ad688a Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 09:00:31 +0500
+Subject: [PATCH 27/34] bench: open a given search result
+
+---
+ app/SidebarMode.cpp | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/app/SidebarMode.cpp b/app/SidebarMode.cpp
+index b5f7a87..d374526 100644
+--- a/app/SidebarMode.cpp
++++ b/app/SidebarMode.cpp
+@@ -227,8 +227,8 @@ SidebarMode::SidebarMode(QObject *parent,
+                 const QString dir = qEnvironmentVariable("KSR_SHOT_DIR", QStringLiteral("/tmp"));
+                 d->mainWidget->window()->grab().save(dir + QStringLiteral("/search.png"));
+                 if (qEnvironmentVariableIsSet("KSR_SEARCH_OPEN")) {
+-                    loadModule(d->searchModel->index(0, 0));
+-                    QTimer::singleShot(1500, this, [this, dir] {
++                    openSearchResult(qEnvironmentVariableIntValue("KSR_SEARCH_OPEN"));
++                    QTimer::singleShot(qEnvironmentVariableIntValue("KSR_OPEN_WAIT") > 0 ? qEnvironmentVariableIntValue("KSR_OPEN_WAIT") : 1500, this, [this, dir] {
+                         d->mainWidget->window()->grab().save(dir + QStringLiteral("/search-opened.png"));
+                         QCoreApplication::quit();
+                     });

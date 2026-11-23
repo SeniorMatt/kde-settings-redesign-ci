@@ -1,0 +1,34 @@
+From 32b09f1a4ba0badd8c9da18f9360952fa5822b2a Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 03:58:11 +0500
+Subject: [PATCH 27/31] kcm_tablet: report representsDefaults (no managed
+ skeleton does it), count 'sync with mouse' in isDefaults
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/tablet/kcmtablet.cpp | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/kcms/tablet/kcmtablet.cpp b/kcms/tablet/kcmtablet.cpp
+index 15414dd..96df46e 100644
+--- a/kcms/tablet/kcmtablet.cpp
++++ b/kcms/tablet/kcmtablet.cpp
+@@ -324,6 +324,8 @@ Tablet::~Tablet()
+ void Tablet::refreshNeedsSave()
+ {
+     setNeedsSave(isSaveNeeded());
++    // no managed config skeleton reports this for us, so the Defaults button needs it here
++    setRepresentsDefaults(isDefaults());
+ }
+ 
+ bool Tablet::isSaveNeeded() const
+@@ -335,7 +337,7 @@ bool Tablet::isSaveNeeded() const
+ 
+ bool Tablet::isDefaults() const
+ {
+-    if (!m_unsavedMappings.isEmpty())
++    if (!m_unsavedMappings.isEmpty() || m_syncWithMouse)
+         return false;
+ 
+     const auto cfg = KSharedConfig::openConfig("kcminputrc");

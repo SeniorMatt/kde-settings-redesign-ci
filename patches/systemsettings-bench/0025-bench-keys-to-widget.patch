@@ -1,0 +1,22 @@
+From 0aac5771515d6aebcf9d46764e52c2bb6c7a1706 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 08:34:38 +0500
+Subject: [PATCH 25/34] bench: keys to widget
+
+---
+ app/SidebarMode.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/app/SidebarMode.cpp b/app/SidebarMode.cpp
+index c379281..7eaa02f 100644
+--- a/app/SidebarMode.cpp
++++ b/app/SidebarMode.cpp
+@@ -200,7 +200,7 @@ SidebarMode::SidebarMode(QObject *parent,
+             const QString name = keys->takeFirst();
+             static const QHash<QString, int> map{{u"Down"_s, Qt::Key_Down}, {u"Up"_s, Qt::Key_Up}, {u"Left"_s, Qt::Key_Left}, {u"Right"_s, Qt::Key_Right},
+                                                  {u"Enter"_s, Qt::Key_Return}, {u"Tab"_s, Qt::Key_Tab}};
+-            QQuickWindow *win = d->quickWidget->quickWindow();
++            QWidget *win = d->quickWidget; win->activateWindow(); win->setFocus();
+             QKeyEvent press(QEvent::KeyPress, map.value(name), Qt::NoModifier);
+             QKeyEvent release(QEvent::KeyRelease, map.value(name), Qt::NoModifier);
+             QCoreApplication::sendEvent(win, &press);

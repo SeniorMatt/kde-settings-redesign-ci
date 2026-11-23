@@ -1,0 +1,279 @@
+From 06cf7d3311cd11393f587846ddd6af3b619cbd56 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 01:29:31 +0500
+Subject: [PATCH 11/31] kcm_smserver: Form page, session restore first, logind
+ questions asynchronous
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Page type: Form (docs/page-design.md). Config keys, kcfg, D-Bus calls, defaults unchanged. Not built yet.
+
+Moved / renamed:
+- Session restore (login) is the first, untitled section; "Ignored applications" is indented under the restore radios and
+  disabled (not hidden) with "Start with an empty session" (kcm_smserver/loginMode, excludeApps).
+- "Ask for confirmation: On shutdown, restart, and logout" -> checkbox "Ask for confirmation on shutdown, restart, and
+  logout" in section "Logout and Shutdown" (kcm_smserver/confirmLogout; General was a non-noun title, HIG-057).
+- Firmware: Switch -> CheckBox "Enter UEFI firmware settings on next restart" (takes effect alone, docs/page-design.md §3);
+  section shown only when logind can do it (kcm_smserver/isUefi). Restart Now unchanged (RestartNow).
+- Shell name is "Startup & Shutdown" (ia/layout.json), old "Desktop Session" is an alias there.
+HIG ids: HIG-001/005/006 (order by use), HIG-057 (no General/Advanced). Accessible.name on the text field.
+
+Speed cause: the constructor called CanRebootToFirmwareSetup().value() and property("RebootToFirmwareSetup"), both blocking
+on the system bus (kcmsmserver.cpp ctor). Now QDBusPendingCallWatcher + async Properties.Get; isUefi and canFirmwareSetup
+are NOTIFY properties so the Firmware section appears when logind answers. After numbers: pending, manager will measure.
+
+Unconfirmed: org.freedesktop.DBus.Properties.Get result handled as QDBusPendingReply<QDBusVariant> (standard, not compiled).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/ksmserver/kcmsmserver.cpp | 54 ++++++++++++++++++------
+ kcms/ksmserver/kcmsmserver.h   |  5 ++-
+ kcms/ksmserver/ui/main.qml     | 76 ++++++++++++++++++----------------
+ 3 files changed, 86 insertions(+), 49 deletions(-)
+
+diff --git a/kcms/ksmserver/kcmsmserver.cpp b/kcms/ksmserver/kcmsmserver.cpp
+index 074d993..b846755 100644
+--- a/kcms/ksmserver/kcmsmserver.cpp
++++ b/kcms/ksmserver/kcmsmserver.cpp
+@@ -15,6 +15,7 @@
+ #include <QDBusConnection>
+ #include <QDBusPendingCallWatcher>
+ #include <QDBusPendingReply>
++#include <QDBusVariant>
+ #include <QFileInfo>
+ 
+ #include <KDesktopFile>
+@@ -42,19 +43,30 @@ SMServerConfig::SMServerConfig(QObject *parent, const KPluginMetaData &metaData)
+                                                                this))
+     , m_settings(new SMServerSettings(this))
+ {
+-    checkFirmwareSetupRequested();
+-    m_restartInSetupScreenInitial = m_restartInSetupScreen;
+-
+     setButtons(Help | Apply | Default);
+ 
+-    const QString canFirmwareSetup = m_login1Manager->CanRebootToFirmwareSetup().value();
+-    if (canFirmwareSetup == QLatin1String("yes") || canFirmwareSetup == QLatin1String("challenge")) {
+-        m_canFirmwareSetup = true;
+-        // now check whether we're UEFI to provide a more descriptive button label
+-        if (QFileInfo(QStringLiteral("/sys/firmware/efi")).isDir()) {
+-            m_isUefi = true;
++    // ksr: speed. Both logind questions used to be blocking calls (.value() / property()) in the constructor, so the
++    // first frame waited on the system bus. They are asynchronous now; the Firmware section appears when the answers
++    // arrive (canFirmwareSetupChanged / restartInSetupScreenChanged).
++    checkFirmwareSetupRequested();
++
++    QDBusPendingReply<QString> canReply = m_login1Manager->CanRebootToFirmwareSetup();
++    auto canWatcher = new QDBusPendingCallWatcher(canReply, this);
++    connect(canWatcher, &QDBusPendingCallWatcher::finished, this, [this](QDBusPendingCallWatcher *watcher) {
++        QDBusPendingReply<QString> reply = *watcher;
++        watcher->deleteLater();
++        if (reply.isError()) {
++            return;
+         }
+-    }
++        const QString canFirmwareSetup = reply.value();
++        if (canFirmwareSetup == QLatin1String("yes") || canFirmwareSetup == QLatin1String("challenge")) {
++            m_canFirmwareSetup = true;
++            // now check whether we're UEFI to provide a more descriptive button label
++            m_isUefi = QFileInfo(QStringLiteral("/sys/firmware/efi")).isDir();
++            Q_EMIT isUefiChanged();
++            Q_EMIT canFirmwareSetupChanged();
++        }
++    });
+ }
+ 
+ SMServerConfig::~SMServerConfig() = default;
+@@ -135,8 +147,26 @@ void SMServerConfig::reboot()
+ 
+ void SMServerConfig::checkFirmwareSetupRequested()
+ {
+-    m_restartInSetupScreen = m_login1Manager->property("RebootToFirmwareSetup").toBool();
+-    Q_EMIT restartInSetupScreenChanged();
++    // Asynchronous org.freedesktop.DBus.Properties.Get; QObject::property() on the interface would block on the bus.
++    QDBusMessage message = QDBusMessage::createMethodCall(m_login1Manager->service(),
++                                                          m_login1Manager->path(),
++                                                          QStringLiteral("org.freedesktop.DBus.Properties"),
++                                                          QStringLiteral("Get"));
++    message.setArguments({m_login1Manager->interface(), QStringLiteral("RebootToFirmwareSetup")});
++    QDBusPendingReply<QDBusVariant> reply = m_login1Manager->connection().asyncCall(message);
++    auto watcher = new QDBusPendingCallWatcher(reply, this);
++    connect(watcher, &QDBusPendingCallWatcher::finished, this, [this](QDBusPendingCallWatcher *w) {
++        QDBusPendingReply<QDBusVariant> r = *w;
++        w->deleteLater();
++        if (r.isError()) {
++            return;
++        }
++        const bool requested = r.value().variant().toBool();
++        if (requested != m_restartInSetupScreen) {
++            m_restartInSetupScreen = requested;
++            Q_EMIT restartInSetupScreenChanged();
++        }
++    });
+ }
+ 
+ bool SMServerConfig::canFirmwareSetup() const
+diff --git a/kcms/ksmserver/kcmsmserver.h b/kcms/ksmserver/kcmsmserver.h
+index 9645d65..53fdc33 100644
+--- a/kcms/ksmserver/kcmsmserver.h
++++ b/kcms/ksmserver/kcmsmserver.h
+@@ -25,7 +25,7 @@ class SMServerConfig : public KQuickManagedConfigModule
+     Q_OBJECT
+ 
+     /// True if we are in an UEFI system.
+-    Q_PROPERTY(bool isUefi READ isUefi CONSTANT)
++    Q_PROPERTY(bool isUefi READ isUefi NOTIFY isUefiChanged)
+ 
+     /// Config telling if we should restart in the setup screen next time we boot.
+     Q_PROPERTY(bool restartInSetupScreen READ restartInSetupScreen WRITE setRestartInSetupScreen NOTIFY restartInSetupScreenChanged)
+@@ -34,7 +34,7 @@ class SMServerConfig : public KQuickManagedConfigModule
+     Q_PROPERTY(QString error READ error NOTIFY errorChanged)
+ 
+     /// Can setup the firmware
+-    Q_PROPERTY(bool canFirmwareSetup READ canFirmwareSetup CONSTANT)
++    Q_PROPERTY(bool canFirmwareSetup READ canFirmwareSetup NOTIFY canFirmwareSetupChanged)
+ 
+     Q_PROPERTY(SMServerSettings *settings READ settings CONSTANT)
+ 
+@@ -63,6 +63,7 @@ public Q_SLOTS:
+ 
+ Q_SIGNALS:
+     void isUefiChanged();
++    void canFirmwareSetupChanged();
+     void restartInSetupScreenChanged();
+     void errorChanged();
+     void ksmserverSettingsChanged();
+diff --git a/kcms/ksmserver/ui/main.qml b/kcms/ksmserver/ui/main.qml
+index 44eba79..3231352 100644
+--- a/kcms/ksmserver/ui/main.qml
++++ b/kcms/ksmserver/ui/main.qml
+@@ -22,6 +22,7 @@ KCM.SimpleKCM {
+         spacing : 0
+ 
+         Kirigami.InlineMessage {
++            // ksr: kcm_smserver/RestartNow
+             Layout.fillWidth: true
+             position: Kirigami.InlineMessage.Position.Header
+             type: kcm.error.length > 0 ? Kirigami.MessageType.Error : Kirigami.MessageType.Information
+@@ -39,34 +40,16 @@ KCM.SimpleKCM {
+         }
+     }
+ 
++    // Form page (docs/page-design.md). Most common task first: what happens at login (session restore); then what
++    // happens when leaving; firmware only when logind says the machine can. Plain QQC2 controls, no custom styling.
+     Kirigami.FormLayout {
+ 
+-        Item {
+-            Kirigami.FormData.isSection: true
+-            Kirigami.FormData.label: i18nc("@title:group", "General")
+-        }
+-
+-        CheckBox {
+-            id: logoutScreenCheckbox
+-        Kirigami.FormData.label: i18nc("@label beginning of the logical sentence 'Ask for confirmation on shutdown, restart, and logout.'", "Ask for confirmation:")
+-            text: i18nc("@option:check end of the logical sentence 'Ask for confirmation on shutdown, restart, and logout.'", "On shutdown, restart, and logout")
+-            checked: kcm.settings.confirmLogout
+-            onToggled: kcm.settings.confirmLogout = checked
+-            KCM.SettingStateBinding {
+-                configObject: kcm.settings
+-                settingName: "confirmLogout"
+-            }
+-        }
+-
+-        Item {
+-            Kirigami.FormData.isSection: true
+-            Kirigami.FormData.label: i18nc("@title:group", "Session Restore")
+-        }
+-
++        // ---- At login (first section, no title) ----
+         ButtonGroup {
+             buttons: [loginRestore, loginManual, loginEmpty]
+         }
+         RadioButton {
++            // ksr: kcm_smserver/loginMode
+             id: loginRestore
+             Kirigami.FormData.label: i18nc("@title:group prefix for radiobuttons", "On login, launch apps that were open:")
+             text: i18nc("@option:radio Automatic style of session restoration", "On last logout")
+@@ -105,19 +88,22 @@ KCM.SimpleKCM {
+             }
+         }
+ 
+-        Item {
+-            Kirigami.FormData.isSection: true
+-        }
+-
++        // A child option of the restore choices: indented, disabled (not hidden) while they are off.
+         RowLayout {
+-            Kirigami.FormData.label: i18nc("@label:textbox", "Ignored applications:")
+-
+-            spacing: 0
++            // ksr: kcm_smserver/excludeApps
++            Layout.leftMargin: Kirigami.Units.gridUnit
++            spacing: Kirigami.Units.smallSpacing
+ 
++            Label {
++                text: i18nc("@label:textbox", "Ignored applications:")
++                enabled: !loginEmpty.checked
++            }
+             TextField {
+-                Layout.preferredWidth: Kirigami.Units.gridUnit * 16
++                id: excludeAppsField
++                Layout.preferredWidth: Kirigami.Units.gridUnit * 14
+                 text: kcm.settings.excludeApps
+                 enabled: !loginEmpty.checked
++                Accessible.name: i18nc("@label:textbox", "Ignored applications:")
+                 // onTextEdited instead of onAccepted because otherwise the apply and
+                 // reset buttons won't work, since otherwise in many case no change will
+                 // be sent to the kconfigXt backend.
+@@ -126,6 +112,7 @@ KCM.SimpleKCM {
+                 KCM.SettingStateBinding {
+                     configObject: kcm.settings
+                     settingName: "excludeApps"
++                    extraEnabledConditions: !loginEmpty.checked
+                 }
+             }
+             Kirigami.ContextualHelpButton {
+@@ -133,17 +120,36 @@ KCM.SimpleKCM {
+             }
+         }
+ 
+-        Item {
++        // ---- Shutdown ----
++        Kirigami.Separator {
++            Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18nc("@title:group", "Logout and Shutdown")
++        }
++
++        CheckBox {
++            // ksr: kcm_smserver/confirmLogout
++            id: logoutScreenCheckbox
++            text: i18nc("@option:check", "Ask for confirmation on shutdown, restart, and logout")
++            checked: kcm.settings.confirmLogout
++            onToggled: kcm.settings.confirmLogout = checked
++            KCM.SettingStateBinding {
++                configObject: kcm.settings
++                settingName: "confirmLogout"
++            }
++        }
++
++        // ---- Firmware: hidden when the machine cannot do it (hardware-dependent exception) ----
++        Kirigami.Separator {
+             Kirigami.FormData.isSection: true
+             Kirigami.FormData.label: i18nc("@title:group", "Firmware")
+             visible: uefi.visible
+         }
+ 
+-        Switch {
++        CheckBox {
++            // ksr: kcm_smserver/isUefi
+             id: uefi
+-            Kirigami.FormData.label: i18nc("@label:check part of a sentence: After next restart enter UEFI/Firmware setup screen", "After next restart:")
+-            text: kcm.isUefi ? i18nc("@option:check", "Enter UEFI firmware settings")
+-                            : i18nc("@option:check", "Enter firmware setup screen")
++            text: kcm.isUefi ? i18nc("@option:check", "Enter UEFI firmware settings on next restart")
++                             : i18nc("@option:check", "Enter firmware setup screen on next restart")
+             visible: kcm.canFirmwareSetup
+             checked: kcm.restartInSetupScreen
+             onToggled: kcm.restartInSetupScreen = checked

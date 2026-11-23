@@ -1,0 +1,264 @@
+From 00c0bdae7cfbfb76e32d0073af1fe1ce07b4dbe2 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 14:08:03 +0500
+Subject: [PATCH 04/12] kcm_kwindecoration: gallery first, buttons and border
+ size on one sub-page, previews off the first frame
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Page type: Gallery (docs/page-design.md section 1). Config keys, kcfg, KDecoration plugins, KNS and the reload
+D-Bus signal are unchanged.
+
+Moved / renamed (inventory/relabel/kcm_kwindecoration.tsv):
+- Toolbar now holds only "Buttons and Borders…" (was "Configure Titlebar Buttons…") and "Get New…".
+- "Window border size:" moved from the toolbar to the top of that sub-page, now "Titlebar Buttons and Borders"
+  (kcm_kwindecoration/borderSize, configure-titlebar). The combo is the same control with the same highlighter.
+- ksr: markers on the changed and text-only rows (edit-theme, buttons-hint, get-new).
+
+Speed (cause from code, not measured):
+- Every grid cell built a KDecoration Bridge + Settings + two live Decoration previews synchronously inside
+  its delegate (Themes.qml, old lines 40-60). They now live in a Component behind a Loader { asynchronous: true },
+  so the grid, labels and toolbar are shown first and the previews fill in cell by cell.
+- The per-theme "Edit … Theme…" bridge is created only when that action is used (it shared the preview bridge before).
+- Not changed: DecorationsModel::init() still does findPlugins + instantiatePlugin (dlopen) on the UI thread, one
+  queued event-loop turn after construction (decorationmodel.cpp:115-130); moving it needs a build to test.
+- Numbers: before ~1.7 s under load (ranking only). After: pending, manager will measure.
+
+HIG: HIG-001, HIG-005, HIG-006, HIG-019, HIG-057.
+
+Not built yet (freeze). Unconfirmed: async Loader around KDecoration.Decoration items (previews were created with
+anchors.fill: parent; the Loader item is the parent now) and creating KDecoration.Bridge through Component.createObject.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ src/kcms/decoration/ui/Buttons.qml           |   1 +
+ src/kcms/decoration/ui/ConfigureTitlebar.qml |  18 +++-
+ src/kcms/decoration/ui/Themes.qml            | 107 ++++++++++++-------
+ src/kcms/decoration/ui/main.qml              |  23 +---
+ 4 files changed, 88 insertions(+), 61 deletions(-)
+
+diff --git a/src/kcms/decoration/ui/Buttons.qml b/src/kcms/decoration/ui/Buttons.qml
+index ed70263..c3e4a2e 100644
+--- a/src/kcms/decoration/ui/Buttons.qml
++++ b/src/kcms/decoration/ui/Buttons.qml
+@@ -282,6 +282,7 @@ Rectangle {
+             Layout.fillWidth: true
+             Layout.margins: Kirigami.Units.gridUnit * 3
+             horizontalAlignment: Text.AlignHCenter
++            // ksr: kcm_kwindecoration/buttons-hint
+             text: i18n("Drag buttons between here and the titlebar")
+         }
+     }
+diff --git a/src/kcms/decoration/ui/ConfigureTitlebar.qml b/src/kcms/decoration/ui/ConfigureTitlebar.qml
+index 37adea2..82b566a 100644
+--- a/src/kcms/decoration/ui/ConfigureTitlebar.qml
++++ b/src/kcms/decoration/ui/ConfigureTitlebar.qml
+@@ -13,7 +13,23 @@ import org.kde.kcmutils as KCM
+ import org.kde.kirigami as Kirigami
+ 
+ KCM.AbstractKCM {
+-    title: i18n("Titlebar Buttons")
++    title: i18n("Titlebar Buttons and Borders")
++
++    header: Kirigami.FormLayout {
++        QQC2.ComboBox {
++            id: borderSizeComboBox
++            // ksr: kcm_kwindecoration/borderSize
++            Kirigami.FormData.label: i18nc("Selector label", "Window border size:")
++            currentIndex: kcm.borderIndex
++            model: kcm.borderSizesModel
++
++            onActivated: kcm.borderIndex = currentIndex
++
++            KCM.SettingHighlighter {
++                highlight: kcm.borderIndex !== 0
++            }
++        }
++    }
+ 
+     Buttons {
+         anchors.fill: parent
+diff --git a/src/kcms/decoration/ui/Themes.qml b/src/kcms/decoration/ui/Themes.qml
+index ddb2ccf..7a7e39a 100644
+--- a/src/kcms/decoration/ui/Themes.qml
++++ b/src/kcms/decoration/ui/Themes.qml
+@@ -32,70 +32,97 @@ KCM.GridView {
+         id: delegate
+         text: model.display
+ 
++        // Only created when "Edit … Theme…" is used, so no plugin is loaded for it up front.
++        Component {
++            id: configureBridgeComponent
++
++            KDecoration.Bridge {}
++        }
++
+         thumbnailAvailable: true
+         thumbnail: Rectangle {
+             anchors.fill: parent
+             color: palette.base
+             clip: true
+ 
+-            KDecoration.Bridge {
+-                id: bridgeItem
+-                plugin: model.plugin
+-                theme: model.theme
+-                kcmoduleName: model.kcmoduleName
+-            }
+-            KDecoration.Settings {
+-                id: settingsItem
+-                bridge: bridgeItem.bridge
+-                Component.onCompleted: {
+-                    settingsItem.borderSizesIndex = kcm.borderSize;
+-                }
+-            }
+-            KDecoration.Decoration {
+-                id: inactivePreview
+-                bridge: bridgeItem.bridge
+-                settings: settingsItem
++            // The two live decoration previews (bridge, settings, active + inactive window) are the expensive part of
++            // every cell; they are created asynchronously so the grid and the toolbar show first.
++            Loader {
+                 anchors.fill: parent
+-                onShadowChanged: updateDecoration(inactivePreview, 0, client.decoration.titleBar.height)
+-                Component.onCompleted: {
+-                    client.active = false;
+-                    client.caption = model.display;
+-                    updateDecoration(inactivePreview, 0, client.decoration.titleBar.height);
+-                }
+-            }
+-            KDecoration.Decoration {
+-                id: activePreview
+-                bridge: bridgeItem.bridge
+-                settings: settingsItem
+-                anchors.fill: parent
+-                onShadowChanged: updateDecoration(activePreview, client.decoration.titleBar.height, 0)
+-                Component.onCompleted: {
+-                    client.active = true;
+-                    client.caption = model.display;
+-                    updateDecoration(activePreview, client.decoration.titleBar.height, 0);
+-                }
++                asynchronous: true
++                sourceComponent: previewComponent
+             }
+             MouseArea {
+                 anchors.fill: parent
+                 onClicked: delegate.clicked()
+                 onDoubleClicked: delegate.doubleClicked()
+             }
+-            Connections {
+-                target: kcm
+-                function onBorderSizeChanged() {
+-                    settingsItem.borderSizesIndex = kcm.borderSize;
++
++            Component {
++                id: previewComponent
++
++                Item {
++                    KDecoration.Bridge {
++                        id: bridgeItem
++                        plugin: model.plugin
++                        theme: model.theme
++                        kcmoduleName: model.kcmoduleName
++                    }
++                    KDecoration.Settings {
++                        id: settingsItem
++                        bridge: bridgeItem.bridge
++                        Component.onCompleted: {
++                            settingsItem.borderSizesIndex = kcm.borderSize;
++                        }
++                    }
++                    KDecoration.Decoration {
++                        id: inactivePreview
++                        bridge: bridgeItem.bridge
++                        settings: settingsItem
++                        anchors.fill: parent
++                        onShadowChanged: updateDecoration(inactivePreview, 0, client.decoration.titleBar.height)
++                        Component.onCompleted: {
++                            client.active = false;
++                            client.caption = model.display;
++                            updateDecoration(inactivePreview, 0, client.decoration.titleBar.height);
++                        }
++                    }
++                    KDecoration.Decoration {
++                        id: activePreview
++                        bridge: bridgeItem.bridge
++                        settings: settingsItem
++                        anchors.fill: parent
++                        onShadowChanged: updateDecoration(activePreview, client.decoration.titleBar.height, 0)
++                        Component.onCompleted: {
++                            client.active = true;
++                            client.caption = model.display;
++                            updateDecoration(activePreview, client.decoration.titleBar.height, 0);
++                        }
++                    }
++                    Connections {
++                        target: kcm
++                        function onBorderSizeChanged() {
++                            settingsItem.borderSizesIndex = kcm.borderSize;
++                        }
++                    }
+                 }
+             }
+         }
+         actions: [
+             Kirigami.Action {
+                 icon.name: "edit-entry"
++                // ksr: kcm_kwindecoration/edit-theme
+                 tooltip: i18n("Edit %1 Theme…", model.display)
+                 enabled: model.configurable
+                 onTriggered: {
+                     kcm.theme = index;
+                     view.currentIndex = index;
+-                    bridgeItem.bridge.configure(delegate);
++                    const configureBridge = configureBridgeComponent.createObject(delegate, {
++                        plugin: model.plugin,
++                        theme: model.theme,
++                        kcmoduleName: model.kcmoduleName
++                    });
++                    configureBridge.bridge.configure(delegate);
+                 }
+             }
+         ]
+diff --git a/src/kcms/decoration/ui/main.qml b/src/kcms/decoration/ui/main.qml
+index b00cff8..a83cb17 100644
+--- a/src/kcms/decoration/ui/main.qml
++++ b/src/kcms/decoration/ui/main.qml
+@@ -24,32 +24,15 @@ KCM.AbstractKCM {
+     implicitHeight: Kirigami.Units.gridUnit * 33
+ 
+     actions: [
+-        Kirigami.Action {
+-            id: borderSizeComboBox
+-            text: i18nc("Selector label", "Window border size:")
+-
+-            displayComponent: RowLayout {
+-                QQC2.ComboBox {
+-                    id: borderSizeComboBox
+-                    currentIndex: kcm.borderIndex
+-                    flat: true
+-                    model: kcm.borderSizesModel
+-
+-                    onActivated: kcm.borderIndex = currentIndex
+-
+-                    KCM.SettingHighlighter {
+-                        highlight: kcm.borderIndex !== 0
+-                    }
+-                }
+-            }
+-        },
+         Kirigami.Action {
+             icon.name: "configure"
+-            text: i18nc("button text", "Configure Titlebar Buttons…")
++            // ksr: kcm_kwindecoration/configure-titlebar
++            text: i18nc("button text", "Buttons and Borders…")
+ 
+             onTriggered: kcm.push("ConfigureTitlebar.qml")
+         },
+         NewStuff.Action {
++            // ksr: kcm_kwindecoration/get-new
+             configFile: "window-decorations.knsrc"
+             text: i18nc("@action:button as in, \"Get New Window Decorations\"", "Get New…")
+ 

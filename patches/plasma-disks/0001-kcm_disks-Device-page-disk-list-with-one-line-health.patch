@@ -1,0 +1,406 @@
+From 5df8d80420571f465d69441969eac44b00060f29 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 02:21:26 +0500
+Subject: [PATCH] kcm_disks: Device page: disk list with one-line health, a
+ page per disk with Monitoring and Report
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Page type: Device (docs/page-design.md 1). kded smart module, D-Bus model, the Ignores/<udi> flag and the report text are unchanged.
+
+Moved / renamed:
+- Main page was a column of cards, each with the full health paragraph, Monitor/Ignore and Show Details buttons. It is now a
+  ScrollViewKCM list: icon, 'product (path)', one-line summary (Working as expected / Early signs of problems / Failing: back up your
+  data now, plus 'not monitored'). Row kcm_disks/DeviceStatus. Clicking a row pushes ui/DevicePage.qml (new).
+- DevicePage.qml (Form): Disk, Health, the full explanation (own row, maximumWidth gridUnit*24 so FormLayout stays wide), the list of
+  early signs (was a <ul> inside one label), section Monitoring with checkbox 'Warn about problems with this disk' (replaces the
+  Monitor/Ignore toggle button, inverted onto device.ignore; row kcm_disks/DeviceMonitor, with a help line), section Report with
+  'Show SMART Report…' (was Show Details; row kcm_disks/ShowDetails) opening the unchanged ReportPage (Copy to Clipboard, marker added).
+- Toolbar: 'Perform Backup' -> 'Back Up Files…', 'Open Partition Manager' -> 'Open Partition Manager…' (buttons that open something end in …).
+- Empty states keep their texts (KdedNotRunning, NoSmartDevices) and now use visible instead of an opacity animation; new BusyIndicator shown
+  only if the first GetManagedObjects answer takes over 150 ms. health.js holds the shared wording.
+- Relabel: inventory/relabel/kcm_disks.tsv. Inventory --strict: 0 lost.
+HIG ids: HIG-001/005/006, HIG-019, HIG-057, HIG-058.
+
+Speed cause (code): nothing blocking in the KCM (devicemodel.cpp reads managed objects with an async watcher; smartctl runs in kded). The
+old page built a Card with a banner and a StyledText <ul> for every disk up front; the list row is one light delegate and the report text
+is only built on its own page. After-numbers: pending, manager will measure. Not built yet.
+Unconfirmed without a build: required-property names on the delegate (product, path, failed, instabilities, ignore, object) come from
+DeviceModel::initRoleNames (QObject property names + 'object'); the model property names are read from the first object, so an empty model has
+no roles until a disk appears (as before); health.js is picked up by kcmutils_add_qml_kcm like kcm_bolt's utils.js; the old translated
+<ul> string is replaced by plain strings, so those lose translations.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ src/kcm/ui/DevicePage.qml | 100 +++++++++++++++++++++++++++
+ src/kcm/ui/ReportPage.qml |   1 +
+ src/kcm/ui/health.js      |  39 +++++++++++
+ src/kcm/ui/main.qml       | 141 +++++++++++++++++++-------------------
+ 4 files changed, 209 insertions(+), 72 deletions(-)
+ create mode 100644 src/kcm/ui/DevicePage.qml
+ create mode 100644 src/kcm/ui/health.js
+
+diff --git a/src/kcm/ui/DevicePage.qml b/src/kcm/ui/DevicePage.qml
+new file mode 100644
+index 0000000..6cd826f
+--- /dev/null
++++ b/src/kcm/ui/DevicePage.qml
+@@ -0,0 +1,100 @@
++// SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++// SPDX-FileCopyrightText: 2020-2021 Harald Sitter <sitter@kde.org>
++
++import QtQuick
++import QtQuick.Layouts
++import QtQuick.Controls as QQC2
++
++import org.kde.kirigami as Kirigami
++import org.kde.kcmutils as KCM
++
++import "health.js" as Health
++
++// Sub-page of one disk (Device page, docs/page-design.md 1): state first, then what the user can change.
++KCM.SimpleKCM {
++    id: root
++
++    // The Device QObject from the model's "object" role: failed, instabilities, ignore, advancedReport, product, path.
++    required property var device
++
++    Kirigami.FormLayout {
++        // Same row grammar as the Thunderbolt device page.
++        QQC2.Label {
++            Kirigami.FormData.label: i18nc("@label", "Disk:")
++            text: "%1 (%2)".arg(root.device.product).arg(root.device.path)
++        }
++
++        RowLayout {
++            Kirigami.FormData.label: i18nc("@label", "Health:")
++            spacing: Kirigami.Units.smallSpacing
++
++            Kirigami.Icon {
++                source: Health.icon(root.device.failed, root.device.instabilities)
++                implicitWidth: Kirigami.Units.iconSizes.smallMedium
++                implicitHeight: Kirigami.Units.iconSizes.smallMedium
++            }
++            QQC2.Label {
++                text: Health.summary(root.device.failed, root.device.instabilities)
++            }
++        }
++
++        // Long text on its own row, with a maximum width so the form does not switch to narrow mode.
++        QQC2.Label {
++            Layout.fillWidth: true
++            Layout.maximumWidth: Kirigami.Units.gridUnit * 24
++            wrapMode: Text.Wrap
++            text: Health.explanation(root.device.failed, root.device.instabilities)
++        }
++
++        Repeater {
++            model: root.device.instabilities
++
++            QQC2.Label {
++                required property string modelData
++                required property int index
++
++                Kirigami.FormData.label: index === 0 ? i18nc("@label", "Early signs:") : ""
++                Layout.fillWidth: true
++                Layout.maximumWidth: Kirigami.Units.gridUnit * 24
++                wrapMode: Text.Wrap
++                text: modelData
++            }
++        }
++
++        Kirigami.Separator {
++            Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18nc("@title:group", "Monitoring")
++        }
++
++        QQC2.CheckBox {
++            // ksr: kcm_disks/DeviceMonitor
++            text: i18nc("@option:check", "Warn about problems with this disk")
++            Accessible.name: text
++            checked: !root.device.ignore
++            onToggled: root.device.ignore = !checked
++        }
++
++        QQC2.Label {
++            Layout.fillWidth: true
++            Layout.maximumWidth: Kirigami.Units.gridUnit * 24
++            wrapMode: Text.Wrap
++            font: Kirigami.Theme.smallFont
++            text: i18nc("@info", "When off, SMART problems of this disk are ignored and no notification is shown.")
++        }
++
++        Kirigami.Separator {
++            Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18nc("@title:group", "Report")
++            visible: root.device.advancedReport !== ""
++        }
++
++        QQC2.Button {
++            // ksr: kcm_disks/ShowDetails
++            visible: root.device.advancedReport !== ""
++            text: i18nc("@action/button show detailed smart report", "Show SMART Report…")
++            icon.name: "showinfo-symbolic"
++            // NB: push hardcodes ui/ as prefix.
++            onClicked: kcm.push("ReportPage.qml", {title: root.device.product, text: root.device.advancedReport})
++        }
++    }
++}
+diff --git a/src/kcm/ui/ReportPage.qml b/src/kcm/ui/ReportPage.qml
+index 3f4cec5..18e1f1e 100644
+--- a/src/kcm/ui/ReportPage.qml
++++ b/src/kcm/ui/ReportPage.qml
+@@ -20,6 +20,7 @@ KCM.SimpleKCM {
+ 
+     actions: [
+         Kirigami.Action {
++            // ksr: kcm_disks/CopyReport
+             icon.name: "edit-copy-symbolic"
+             text: i18nc("@action:button copies all displayed text", "Copy to Clipboard")
+             onTriggered: clipboard.content = root.text
+diff --git a/src/kcm/ui/health.js b/src/kcm/ui/health.js
+new file mode 100644
+index 0000000..42f2148
+--- /dev/null
++++ b/src/kcm/ui/health.js
+@@ -0,0 +1,39 @@
++// SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++// SPDX-FileCopyrightText: 2020-2021 Harald Sitter <sitter@kde.org>
++
++// One place for the words used for a disk's SMART state, so the list and the device page agree.
++
++function icon(failed, instabilities) {
++    if (failed) {
++        return "data-warning";
++    }
++    if (instabilities.length !== 0) {
++        return "data-information";
++    }
++    return "data-success";
++}
++
++function summary(failed, instabilities) {
++    if (failed) {
++        return i18nc("@info:status short disk health", "Failing: back up your data now");
++    }
++    if (instabilities.length !== 0) {
++        return i18nc("@info:status short disk health", "Early signs of problems");
++    }
++    return i18nc("@info:status short disk health", "Working as expected");
++}
++
++function explanation(failed, instabilities) {
++    if (failed) {
++        return i18nc("@info",
++            "The SMART system of this device is reporting problems. This may be a sign of imminent device failure or data reliability being compromised. " +
++            "Back up your data and replace this drive as soon as possible to avoid losing any data.");
++    }
++    if (instabilities.length !== 0) {
++        return i18nc("@info",
++            "The SMART firmware is not reporting a failure, but there are early signs of malfunction. " +
++            "This might not point at imminent device failure but requires longer term analysis. " +
++            "Back up your data and contact the manufacturer of this disk, or replace it preemptively just to be safe.");
++    }
++    return i18nc("@info", "This device appears to be working as expected.");
++}
+diff --git a/src/kcm/ui/main.qml b/src/kcm/ui/main.qml
+index 0146a6c..0b782fc 100644
+--- a/src/kcm/ui/main.qml
++++ b/src/kcm/ui/main.qml
+@@ -2,7 +2,6 @@
+ // SPDX-FileCopyrightText: 2020-2021 Harald Sitter <sitter@kde.org>
+ 
+ import QtQuick
+-import QtQml.Models
+ import QtQuick.Layouts
+ import QtQuick.Controls as QQC2
+ 
+@@ -11,15 +10,15 @@ import org.kde.kirigami as Kirigami
+ import SMART as SMART
+ import org.kde.kcmutils as KCM
+ 
+-KCM.SimpleKCM {
++import "health.js" as Health
++
++// Page type: Device (docs/page-design.md 1). The list answers "is any of my disks in trouble"; each disk opens its own page.
++KCM.ScrollViewKCM {
+     id: root
+ 
+     implicitWidth: Kirigami.Units.gridUnit * 28
+     implicitHeight: Kirigami.Units.gridUnit * 20
+ 
+-    Kirigami.Theme.colorSet: Kirigami.Theme.Window
+-    Kirigami.Theme.inherit: false
+-
+     SMART.ServiceRunner {
+         id: partitionManagerRunner
+         name: "org.kde.partitionmanager"
+@@ -32,32 +31,40 @@ KCM.SimpleKCM {
+ 
+     actions: [
+         Kirigami.Action {
+-            visible: partitionManagerRunner.canRun
+-            text: i18nc("@action/button action button to start partition manager", "Open Partition Manager")
+-            icon.name: "partitionmanager"
+-            onTriggered: partitionManagerRunner.run()
+-        },
+-        Kirigami.Action {
++            // ksr: kcm_disks/PerformBackup
+             visible: kupRunner.canRun
+-            text: i18nc("@action/button action button to start backup program", "Perform Backup")
++            text: i18nc("@action/button action button to start backup program", "Back Up Files…")
+             icon.name: "kup"
+             onTriggered: kupRunner.run()
++        },
++        Kirigami.Action {
++            // ksr: kcm_disks/OpenPartitionManager
++            visible: partitionManagerRunner.canRun
++            text: i18nc("@action/button action button to start partition manager", "Open Partition Manager…")
++            icon.name: "partitionmanager"
++            onTriggered: partitionManagerRunner.run()
+         }
+     ]
+ 
+-    Kirigami.CardsListView {
++    SMART.DeviceModel { id: deviceModel }
++
++    // Busy indicator only if the first answer from KDED takes longer than 150 ms (docs/page-design.md 3).
++    Timer {
++        id: busyDelay
++        interval: 150
++        running: deviceModel.waiting
++    }
++
++    view: ListView {
+         id: listView
+-        width: 110
+-        height: 160
+-        model: SMART.DeviceModel { id: deviceModel }
++        model: deviceModel
+ 
+         Kirigami.PlaceholderMessage {
+             anchors.centerIn: parent
+             width: parent.width - (Kirigami.Units.largeSpacing * 4)
+ 
+-            opacity: !deviceModel.valid
+-            Behavior on opacity { NumberAnimation { duration: Kirigami.Units.longDuration; easing.type: Easing.InOutQuad } }
+-
++            // ksr: kcm_disks/KdedNotRunning
++            visible: !deviceModel.valid
+             icon.name: "messagebox_warning"
+             text: i18nc("@info/status", "Unable to obtain data. KDED is not running.")
+         }
+@@ -66,68 +73,58 @@ KCM.SimpleKCM {
+             anchors.centerIn: parent
+             width: parent.width - (Kirigami.Units.largeSpacing * 4)
+ 
+-            opacity: deviceModel.valid && !deviceModel.waiting && parent.count <= 0
+-            Behavior on opacity { NumberAnimation { duration: Kirigami.Units.longDuration; easing.type: Easing.InOutQuad } }
+-
++            // ksr: kcm_disks/NoSmartDevices
++            visible: deviceModel.valid && !deviceModel.waiting && listView.count <= 0
+             icon.name: "edit-none"
+             text: i18nc("@info/status", "No S.M.A.R.T. devices found.")
+         }
+ 
+-        delegate: Kirigami.Card {
+-            banner.title: "%1 (%2)".arg(product).arg(path)
+-            banner.titleIcon: {
+-                if (failed) {
+-                    return "data-warning";
++        QQC2.BusyIndicator {
++            anchors.centerIn: parent
++            running: deviceModel.valid && deviceModel.waiting && !busyDelay.running
++            visible: running
++        }
++
++        delegate: QQC2.ItemDelegate {
++            id: delegate
++
++            required property var object
++            required property string product
++            required property string path
++            required property bool failed
++            required property var instabilities
++            required property bool ignore
++
++            width: ListView.view.width
++
++            // ksr: kcm_disks/DeviceStatus
++            contentItem: RowLayout {
++                spacing: Kirigami.Units.largeSpacing
++
++                Kirigami.Icon {
++                    source: Health.icon(delegate.failed, delegate.instabilities)
++                    implicitWidth: Kirigami.Units.iconSizes.medium
++                    implicitHeight: Kirigami.Units.iconSizes.medium
+                 }
+-                if (instabilities.length !== 0) {
+-                    return "data-information";
++
++                Kirigami.TitleSubtitle {
++                    Layout.fillWidth: true
++                    title: "%1 (%2)".arg(delegate.product).arg(delegate.path)
++                    subtitle: delegate.ignore
++                        ? i18nc("@info:status %1 is the short health summary", "%1, not monitored", Health.summary(delegate.failed, delegate.instabilities))
++                        : Health.summary(delegate.failed, delegate.instabilities)
++                    selected: delegate.highlighted || delegate.down
+                 }
+-                return "data-success";
+-            }
+-            banner.titleMinimumIconSize: Kirigami.Units.iconSizes.sizeForLabels
+-
+-            contentItem: QQC2.Label {
+-                wrapMode: Text.Wrap
+-                textFormat: Text.StyledText
+-                text: {
+-                    if (failed) {
+-                        return i18nc("@info",
+-                            "The SMART system of this device is reporting problems. This may be a sign of imminent device failure or data reliability being compromised. " +
+-                            "Back up your data and replace this drive as soon as possible to avoid losing any data.");
+-                    }
+-                    if (instabilities.length !== 0) {
+-                        const items = instabilities.map(item => "<li>%1</li>".arg(item));
+-                        return i18nc("@info %1 is a bunch of <li> with the strings from instabilities.cpp",
+-                            "<p>The SMART firmware is not reporting a failure, but there are early signs of malfunction. " +
+-                            "This might not point at imminent device failure but requires longer term analysis. " +
+-                            "Back up your data and contact the manufacturer of this disk, or replace it preemptively just to be safe.</p>" +
+-                            "<ul>%1</ul>", items.join(''));
+-                    }
+-                    return i18nc("@info",
+-                            "This device appears to be working as expected.");
++
++                Kirigami.Icon {
++                    source: "go-next-symbolic"
++                    implicitWidth: Kirigami.Units.iconSizes.small
++                    implicitHeight: Kirigami.Units.iconSizes.small
+                 }
+             }
+ 
+-            actions: [
+-                Kirigami.Action {
+-                    text: ignore
+-                          ? i18nc("@action/button action button to monitor a device for smart failure", "Monitor")
+-                          : i18nc("@action/button action button to ignore smart failures for a device", "Ignore")
+-                    icon.name: ignore ? "view-visible" : "view-hidden"
+-                    onTriggered: {
+-                        model.ignore = !ignore
+-                    }
+-                },
+-                Kirigami.Action {
+-                    visible: model.advancedReport !== ''
+-                    text: i18nc("@action/button show detailed smart report", "Show Details")
+-                    icon.name: "showinfo-symbolic"
+-                    onTriggered: {
+-                        // NB: push daftly hardcodes ui/ as prefix....
+-                        kcm.push("ReportPage.qml", {title: product, text: advancedReport})
+-                    }
+-                }
+-            ]
++            // NB: push hardcodes ui/ as prefix.
++            onClicked: kcm.push("DevicePage.qml", {device: delegate.object, title: delegate.product})
+         }
+     }
+ }

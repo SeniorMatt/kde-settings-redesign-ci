@@ -1,0 +1,40 @@
+From c0ca18290d35171401a5ccf70dedb4964e3d6596 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 02:14:13 +0500
+Subject: [PATCH 8/9] info pages: CommandOutputKCM is an AbstractKCM, not a
+ SimpleKCM
+
+SimpleKCM is a ScrollablePage whose default content item (a ScrollView anchored to the header/footer) is replaced here by our own
+ColumnLayout; the orphaned ScrollView logged 'Cannot anchor to an item that isn't a parent or sibling' and TypeErrors on
+top/bottom/left/right at ScrollablePage.qml:255-263 on all 19 pages. The page scrolls inside its own ScrollView and never used
+the outer flickable, so AbstractKCM (no ScrollView) is enough; flickable.contentWidth is dropped.
+Not built when committed; checked after the batch 6 headless run.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ src/qml/CommandOutputKCM.qml | 4 +---
+ 1 file changed, 1 insertion(+), 3 deletions(-)
+
+diff --git a/src/qml/CommandOutputKCM.qml b/src/qml/CommandOutputKCM.qml
+index 45b13fd..c0f1da5 100644
+--- a/src/qml/CommandOutputKCM.qml
++++ b/src/qml/CommandOutputKCM.qml
+@@ -18,7 +18,7 @@ import org.kde.ki18n
+ 
+ import org.kde.kinfocenter.private as Private
+ 
+-KCM.SimpleKCM {
++KCM.AbstractKCM {
+     id: root
+ 
+     implicitWidth: Kirigami.Units.gridUnit * 20
+@@ -31,8 +31,6 @@ KCM.SimpleKCM {
+     property int wrapMode: TextEdit.NoWrap
+     property int textFormat: output.textFormat
+ 
+-    flickable.contentWidth: wrapMode === TextEdit.NoWrap ? contentLoader.implicitWidth : -1
+-
+     Clipboard { id: clipboard }
+ 
+     Component {

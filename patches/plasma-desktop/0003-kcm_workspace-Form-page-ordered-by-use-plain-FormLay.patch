@@ -1,0 +1,890 @@
+From 5caae06dcfe57ae6a497397de98b91f406ee3c64 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 10:49:47 +0500
+Subject: [PATCH 03/31] kcm_workspace: Form page ordered by use, plain
+ FormLayout instead of Kirigami.Form
+
+Page type: Form (docs/page-design.md). Config keys, kcfg files, D-Bus signals and behaviour are unchanged.
+
+Moved / renamed:
+- First section (no title) is now "how do clicks work": click files or folders (kcm_workspace/singleClick), double-click
+  interval with the test folder (doubleClickInterval), middle-click paste (primarySelection, Wayland only).
+  Before, the page opened with Plasma tooltips/OSD.
+- Then Scrolling, Text Cursor, Drag and Drop, "Tablet Mode" (was "Touch"; tabletMode) and "Tooltips and Popups"
+  (was "Plasma"; delay, osdEnabled) as the rare ones at the bottom.
+- "Allow Plasma to show: Panel and widget tooltips / OSD popups for status changes" -> checkboxes "Show panel and widget
+  tooltips" and "Show OSD popups for status changes" (kcm_workspace/delay, osdEnabled).
+- New "Keyboard Layout Popup..." button opens kcm_keyboard, which owns OSD/kbdLayoutChangedEnabled
+  (ia/duplicates.md); kcm_workspace keeps only the master OSD switch (kcm_workspace/osdKbdLayoutChangedEnabled).
+- Radio hints are small labels under the radio instead of FormEntry subtitles; the restart message is unchanged
+  (kcm_workspace/RestartPrimarySelection).
+- Relabel table: inventory/relabel/kcm_workspace.tsv (outer repo). 12 inventory rows kept, 0 lost (--strict).
+
+Speed:
+- Nothing in the KCM blocks: workspaceoptions.cpp only builds three KCoreConfigSkeleton objects (kdeglobals, kwinrc,
+  plasmarc) in the constructor; save() only emits D-Bus signals. The cost is the QML tree.
+- Kirigami.Form/FormGroup/FormEntry build a title/subtitle/trailing-items layout for each of ~25 rows; replaced by
+  Kirigami.FormLayout rows with at most one RowLayout each. Estimate from code only, not measured.
+- Numbers: before (build/bench/clean/before-*.tsv, measured under load). After: pending, manager will measure.
+
+HIG: HIG-001, HIG-005, HIG-006, HIG-013, HIG-017, HIG-019, HIG-020, HIG-047, HIG-058.
+
+Not built yet (freeze).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/workspaceoptions/ui/main.qml | 750 ++++++++++++++++--------------
+ 1 file changed, 401 insertions(+), 349 deletions(-)
+
+diff --git a/kcms/workspaceoptions/ui/main.qml b/kcms/workspaceoptions/ui/main.qml
+index 8dc79b9..a826b3f 100644
+--- a/kcms/workspaceoptions/ui/main.qml
++++ b/kcms/workspaceoptions/ui/main.qml
+@@ -18,6 +18,7 @@ KCM.SimpleKCM {
+     implicitWidth: Kirigami.Units.gridUnit * 40
+ 
+     headerPaddingEnabled: false // Let the InlineMessage touch the edges
++    // ksr: kcm_workspace/RestartPrimarySelection
+     header: Kirigami.InlineMessage {
+         id: primarySelectionRebootMessage
+         position: Kirigami.InlineMessage.Position.Header
+@@ -40,438 +41,489 @@ KCM.SimpleKCM {
+         }
+     }
+ 
+-    Kirigami.Form {
+-        Layout.fillWidth: true
+-        Kirigami.FormGroup {
+-            title: i18nc("@title:group", "Plasma")
+-            // Visual behavior settings
+-            Kirigami.FormEntry {
+-                title: i18nc("Part of the sentence 'Allow Plasma to show panel and widget tooltips'", "Allow Plasma to show:")
+-                contentItem: QQC2.CheckBox {
+-                    id: tooltipDisablerCheckbox
+-                    text: i18nc("Part of the sentence 'Allow Plasma to show panel and widget tooltips'", "Panel and widget tooltips")
+-                    checked: kcm.plasmaSettings.delay > 0
+-                    onCheckedChanged: kcm.plasmaSettings.delay = (checked ? 0.7 : -1)
+-
+-                    KCM.SettingStateBinding {
+-                        configObject: kcm.plasmaSettings
+-                        settingName: "delay"
+-                    }
+-                }
+-
+-                trailingItems: Kirigami.ContextualHelpButton {
+-                    toolTipText: i18nc("@info:whatsthis contextualhelpbutton tooltip", "Allows all Plasma panel and desktop widgets to show descriptive tooltips when hovered with the pointer. This setting has no effect on the small tooltips displayed when hovering over individual buttons and other user interface elements.")
+-                }
++    // Form page (docs/page-design.md). Most common question first (how clicking files works), then rarer sections.
++    // Everything below the header is plain FormLayout rows: no Kirigami.Form/FormGroup/FormEntry, which instantiate a
++    // heavier item tree per row (each FormEntry builds title, subtitle, trailing items and a layout).
++    Kirigami.FormLayout {
++        // ---- Clicking (first section, no title) ----
++        QQC2.RadioButton {
++            // ksr: kcm_workspace/singleClick
++            id: doubleClick
++            Kirigami.FormData.label: i18nc("part of a sentence: 'Clicking files or folders [opens them/selects them]'", "Clicking files or folders:")
++            text: i18nc("part of a sentence: 'Clicking files or folders selects them'", "Selects them")
++            Accessible.description: i18nc("@info:usagetip", "Open by double-clicking instead")
++            checked: !kcm.globalsSettings.singleClick
++            onToggled: kcm.globalsSettings.singleClick = false
++            QQC2.ButtonGroup.group: singleClickGroup
++
++            KCM.SettingStateBinding {
++                configObject: kcm.globalsSettings
++                settingName: "singleClick"
++                extraEnabledConditions: singleClick.enabled
+             }
++        }
+ 
+-            Kirigami.FormEntry {
+-                contentItem: QQC2.CheckBox {
+-                    id: osdDisablerCheckbox
+-                    text: i18nc("Part of the sentence 'Allow Plasma to show OSD popups for status changes'", "OSD popups for status changes")
+-                    checked: kcm.plasmaSettings.osdEnabled
+-                    onCheckedChanged: kcm.plasmaSettings.osdEnabled = checked
++        QQC2.Label {
++            Layout.fillWidth: true
++            Layout.leftMargin: Kirigami.Units.gridUnit
++            text: doubleClick.Accessible.description
++            textFormat: Text.PlainText
++            wrapMode: Text.Wrap
++            font: Kirigami.Theme.smallFont
++        }
+ 
+-                    KCM.SettingStateBinding {
+-                        configObject: kcm.plasmaSettings
+-                        settingName: "osdEnabled"
+-                    }
+-                }
+-                trailingItems: Kirigami.ContextualHelpButton {
+-                    Layout.alignment: Qt.AlignRight
+-                    toolTipText: i18nc("@info:whatsthis contextualhelpbutton tooltip", "Allows all Plasma widgets to show on-screen display (OSD) popups for changes like volume and brightness level, or audio device switching.")
+-                }
++        QQC2.RadioButton {
++            id: singleClick
++            text: i18nc("part of a sentence: 'Clicking files or folders opens them'", "Opens them")
++            Accessible.description: i18nc("@info:usagetip", "Select by clicking on item's selection marker")
++            checked: kcm.globalsSettings.singleClick
++            onToggled: kcm.globalsSettings.singleClick = true
++            QQC2.ButtonGroup { id: singleClickGroup }
++            QQC2.ButtonGroup.group: singleClickGroup
++
++            KCM.SettingStateBinding {
++                configObject: kcm.globalsSettings
++                settingName: "singleClick"
+             }
+         }
+ 
++        QQC2.Label {
++            Layout.fillWidth: true
++            Layout.leftMargin: Kirigami.Units.gridUnit
++            text: singleClick.Accessible.description
++            textFormat: Text.PlainText
++            wrapMode: Text.Wrap
++            font: Kirigami.Theme.smallFont
++        }
++
++        ColumnLayout {
++            // ksr: kcm_workspace/doubleClickInterval
++            Kirigami.FormData.label: i18nc("@label:spinbox", "Double-click interval:")
++            Kirigami.FormData.buddyFor: spinbox
++            spacing: Kirigami.Units.smallSpacing
+ 
+-        Kirigami.FormGroup {
+-            title: i18nc("@title:group", "Scrolling")
++            RowLayout {
++                spacing: Kirigami.Units.smallSpacing
+ 
+-            Kirigami.FormEntry {
+-                contentItem: QQC2.RadioButton {
+-                    Kirigami.FormData.label: i18nc("@title:group prefix radiobutton group", "Clicking in scrollbar track:")
+-                    text: i18nc("@radio part of a complete sentence: 'Clicking in scrollbar track scrolls to the clicked location'", "Scrolls to the clicked location")
+-                    checked: !kcm.globalsSettings.scrollbarLeftClickNavigatesByPage
+-                    onToggled: kcm.globalsSettings.scrollbarLeftClickNavigatesByPage = false
+-                    QQC2.ButtonGroup { id: scrollHandleBehaviorGroup }
+-                    QQC2.ButtonGroup.group: scrollHandleBehaviorGroup
++                QQC2.SpinBox {
++                    id: spinbox
++                    from: 100
++                    to: 2000
++                    stepSize: 100
+ 
+-                    KCM.SettingStateBinding {
+-                        configObject: kcm.globalsSettings
+-                        settingName: "scrollbarLeftClickNavigatesByPage"
+-                        extraEnabledConditions: scrollbarLeftClickNavigatesByPage.enabled
++                    validator: IntValidator {
++                        bottom: Math.min(spinbox.from, spinbox.to)
++                        top: Math.max(spinbox.from, spinbox.to)
+                     }
+-                }
+-            }
+ 
+-            Kirigami.FormEntry {
+-                subtitle: scrollbarLeftClickNavigatesByPage.Accessible.description
+-                contentItem: QQC2.RadioButton {
+-                    id: scrollbarLeftClickNavigatesByPage
+-                    text: i18nc("@radio part of a complete sentence: 'Clicking in scrollbar track scrolls one page up or down'", "Scrolls one page up or down")
+-                    Accessible.description: i18nc("@info:usagetip", "Middle-click to scroll to clicked location")
+-                    checked: kcm.globalsSettings.scrollbarLeftClickNavigatesByPage
+-                    onToggled: kcm.globalsSettings.scrollbarLeftClickNavigatesByPage = true
+-                    QQC2.ButtonGroup.group: scrollHandleBehaviorGroup
++                    textFromValue: (value, locale) => {
++                        return i18ncp("short for millisecond(s)", "%1 ms", "%1 ms", value)
++                    }
+ 
+-                    KCM.SettingStateBinding {
+-                        configObject: kcm.globalsSettings
+-                        settingName: "scrollbarLeftClickNavigatesByPage"
++                    valueFromText: (text, locale) => {
++                        return Number.fromLocaleString(locale, text.replace(i18nc("short for millisecond(s)", "ms"), ""))
+                     }
+-                }
+-            }
+ 
+-            Kirigami.FormSeparator {}
++                    onValueModified: kcm.globalsSettings.doubleClickInterval = value
+ 
+-            Kirigami.FormEntry {
+-                contentItem: QQC2.CheckBox {
+-                    id: smoothScrollingCheckbox
+-                    text: i18nc("@option:check", "Prefer smooth scrolling")
+-                    checked: kcm.globalsSettings.smoothScroll
+-                    onToggled: kcm.globalsSettings.smoothScroll = checked
++                    value: kcm.globalsSettings.doubleClickInterval
+ 
+                     KCM.SettingStateBinding {
+                         configObject: kcm.globalsSettings
+-                        settingName: "smoothScroll"
++                        settingName: "doubleClickInterval"
+                     }
+                 }
+-                trailingItems: Kirigami.ContextualHelpButton {
+-                    Layout.alignment: Qt.AlignRight
+-                    toolTipText: i18nc("@info:tooltip", "This setting enables or disables animated transitions when scrolling with a mouse wheel or the keyboard. Some applications may not honor this setting because they either do not support smooth scrolling, or have their own setting for enabling and disabling it.")
++
++                Kirigami.ContextualHelpButton {
++                    toolTipText: i18nc("@info:whatsthis contextualhelpbutton tooltip", "Two clicks within this duration are considered a double-click. Some applications may not honor this setting.")
+                 }
+             }
+-        }
+ 
+-        Kirigami.FormGroup {
+-            title: i18nc("@title:group", "Clicking")
++            RowLayout {
++                Layout.fillWidth: true
++                spacing: Kirigami.Units.smallSpacing
++
++                QQC2.Label {
++                    Layout.fillWidth: true
++                    Layout.preferredWidth: Kirigami.Units.gridUnit * 16
++                    text: i18nc("Test double-click speed", "Double-click the folder to test. If it does not change its appearance, increase double-click interval.")
++                    textFormat: Text.PlainText
++                    wrapMode: Text.WordWrap
++                    font: Kirigami.Theme.smallFont
++                }
+ 
+-            Kirigami.FormEntry {
+-                title: i18nc("part of a sentence: 'Clicking files or folders [opens them/selects them]'", "Clicking files or folders:")
+-                subtitle: doubleClick.Accessible.description
+-                contentItem: QQC2.RadioButton {
+-                    id: doubleClick
+-                    text: i18nc("part of a sentence: 'Clicking files or folders selects them'", "Selects them")
+-                    Accessible.description: i18nc("@info:usagetip", "Open by double-clicking instead")
+-                    checked: !kcm.globalsSettings.singleClick
+-                    onToggled: kcm.globalsSettings.singleClick = false
+-                    QQC2.ButtonGroup.group: singleClickGroup
++                QQC2.Frame {
++                    Layout.preferredWidth: Kirigami.Units.iconSizes.large
++                    Layout.preferredHeight: Kirigami.Units.iconSizes.large
++                    Kirigami.Theme.colorSet: Kirigami.Theme.View
+ 
+-                    KCM.SettingStateBinding {
+-                        configObject: kcm.globalsSettings
+-                        settingName: "singleClick"
+-                        extraEnabledConditions: singleClick.enabled
++                    Kirigami.Icon {
++                        id: doubleClickTestIcon
++                        property bool checked: false
++                        anchors.fill: parent
++                        source: checked ? "folder-open" : "folder"
+                     }
+-                }
+-            }
+ 
+-            Kirigami.FormEntry {
+-                subtitle: singleClick.Accessible.description
+-                contentItem: QQC2.RadioButton {
+-                    id: singleClick
+-                    text: i18nc("part of a sentence: 'Clicking files or folders opens them'", "Opens them")
+-                    Accessible.description: i18nc("@info:usagetip", "Select by clicking on item's selection marker")
+-                    checked: kcm.globalsSettings.singleClick
+-                    onToggled: kcm.globalsSettings.singleClick = true
+-                    QQC2.ButtonGroup { id: singleClickGroup }
+-                    QQC2.ButtonGroup.group: singleClickGroup
++                    MouseArea {
++                        anchors.fill: parent
++                        hoverEnabled: true // for onExited to properly work.
++                        onPressed: {
++                            if (testDoubleClickTimer.running) {
++                                doubleClickTestIcon.checked = !doubleClickTestIcon.checked
++                                testDoubleClickTimer.stop()
++                            } else {
++                                testDoubleClickTimer.start()
++                            }
++                        }
++                        onExited: testDoubleClickTimer.stop()
++                    }
+ 
+-                    KCM.SettingStateBinding {
+-                        configObject: kcm.globalsSettings
+-                        settingName: "singleClick"
++                    Timer {
++                        id: testDoubleClickTimer
++                        interval: kcm.globalsSettings.doubleClickInterval
+                     }
+                 }
+             }
++        }
+ 
+-            Kirigami.FormSeparator {
+-                visible: KWindowSystem.isPlatformWayland
++        QQC2.CheckBox {
++            // ksr: kcm_workspace/primarySelection
++            // Hidden on X11: the setting only exists on Wayland (hardware-dependent exception to "disable, don't hide").
++            // There is no label for what middle-clicking does when using the "click to zoom the handle" behavior
++            // because Qt doesn't invert the middle-click functionality when using this; see QTBUG-80728
++            Kirigami.FormData.label: i18nc("@label for checkbox, part of a complete sentence: 'Middle-click pastes selected text'", "Middle-click:")
++            visible: KWindowSystem.isPlatformWayland
++            text: i18nc("@option:check part of a complete sentence: 'Middle click pastes selected text'", "Pastes selected text")
++            checked: kcm.kwinSettings.primarySelection
++            onToggled: kcm.kwinSettings.primarySelection = checked
++
++            KCM.SettingStateBinding {
++                configObject: kcm.kwinSettings
++                settingName: "primarySelection"
+             }
++        }
+ 
+-            Kirigami.FormEntry {
+-                title: i18nc("@label for checkbox, part of a complete sentence: 'Middle-click pastes selected text'", "Middle-click:")
+-                visible: KWindowSystem.isPlatformWayland
+-                contentItem: QQC2.CheckBox {
+-                    id: primarySelectionRadio
+-                    text: i18nc("@option:check part of a complete sentence: 'Middle click pastes selected text'", "Pastes selected text")
+-                    checked: kcm.kwinSettings.primarySelection
+-                    onToggled: kcm.kwinSettings.primarySelection = checked
++        // ---- Scrolling ----
++        Kirigami.Separator {
++            Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18nc("@title:group", "Scrolling")
++        }
+ 
+-                    KCM.SettingStateBinding {
+-                        configObject: kcm.kwinSettings
+-                        settingName: "primarySelection"
+-                    }
+-                }
++        QQC2.RadioButton {
++            // ksr: kcm_workspace/scrollbarLeftClickNavigatesByPage
++            Kirigami.FormData.label: i18nc("@title:group prefix radiobutton group", "Clicking in scrollbar track:")
++            text: i18nc("@radio part of a complete sentence: 'Clicking in scrollbar track scrolls to the clicked location'", "Scrolls to the clicked location")
++            checked: !kcm.globalsSettings.scrollbarLeftClickNavigatesByPage
++            onToggled: kcm.globalsSettings.scrollbarLeftClickNavigatesByPage = false
++            QQC2.ButtonGroup { id: scrollHandleBehaviorGroup }
++            QQC2.ButtonGroup.group: scrollHandleBehaviorGroup
++
++            KCM.SettingStateBinding {
++                configObject: kcm.globalsSettings
++                settingName: "scrollbarLeftClickNavigatesByPage"
++                extraEnabledConditions: scrollbarLeftClickNavigatesByPage.enabled
+             }
+-            // There is no label for what middle-clicking does when using the
+-            // "click to zoom the handle" behavior because Qt doesn't invert the
+-            // middle-click functionality when using this; see
+-            // https://bugreports.qt.io/browse/QTBUG-80728
+-
+-            Kirigami.FormSeparator {}
+-
+-            Kirigami.FormEntry {
+-                title: i18nc("@label:spinbox", "Double-click interval:")
+-                contentItem: ColumnLayout {
+-                    Kirigami.FormData.buddyFor: spinbox
+-                    spacing: Kirigami.Units.smallSpacing
+-
+-                    RowLayout {
+-                        spacing: Kirigami.Units.smallSpacing
+-
+-                        QQC2.SpinBox {
+-                            id: spinbox
+-                            from: 100
+-                            to: 2000
+-                            stepSize: 100
+-
+-                            validator: IntValidator {
+-                                bottom: Math.min(spinbox.from, spinbox.to)
+-                                top: Math.max(spinbox.from, spinbox.to)
+-                            }
++        }
+ 
+-                            textFromValue: (value, locale) => {
+-                                return i18ncp("short for millisecond(s)", "%1 ms", "%1 ms", value)
+-                            }
++        QQC2.RadioButton {
++            id: scrollbarLeftClickNavigatesByPage
++            text: i18nc("@radio part of a complete sentence: 'Clicking in scrollbar track scrolls one page up or down'", "Scrolls one page up or down")
++            Accessible.description: i18nc("@info:usagetip", "Middle-click to scroll to clicked location")
++            checked: kcm.globalsSettings.scrollbarLeftClickNavigatesByPage
++            onToggled: kcm.globalsSettings.scrollbarLeftClickNavigatesByPage = true
++            QQC2.ButtonGroup.group: scrollHandleBehaviorGroup
++
++            KCM.SettingStateBinding {
++                configObject: kcm.globalsSettings
++                settingName: "scrollbarLeftClickNavigatesByPage"
++            }
++        }
+ 
+-                            valueFromText: (text, locale) => {
+-                                return Number.fromLocaleString(locale, text.replace(i18nc("short for millisecond(s)", "ms"), ""))
+-                            }
++        QQC2.Label {
++            Layout.fillWidth: true
++            Layout.leftMargin: Kirigami.Units.gridUnit
++            text: scrollbarLeftClickNavigatesByPage.Accessible.description
++            textFormat: Text.PlainText
++            wrapMode: Text.Wrap
++            font: Kirigami.Theme.smallFont
++        }
+ 
+-                            onValueModified: kcm.globalsSettings.doubleClickInterval = value
++        RowLayout {
++            // ksr: kcm_workspace/smoothScroll
++            spacing: Kirigami.Units.smallSpacing
+ 
+-                            value: kcm.globalsSettings.doubleClickInterval
++            QQC2.CheckBox {
++                id: smoothScrollingCheckbox
++                text: i18nc("@option:check", "Prefer smooth scrolling")
++                checked: kcm.globalsSettings.smoothScroll
++                onToggled: kcm.globalsSettings.smoothScroll = checked
+ 
+-                            KCM.SettingStateBinding {
+-                                configObject: kcm.globalsSettings
+-                                settingName: "doubleClickInterval"
+-                            }
+-                        }
+-
+-                        Kirigami.ContextualHelpButton {
+-                            Layout.alignment: Qt.AlignRight
+-                            toolTipText: i18nc("@info:whatsthis contextualhelpbutton tooltip", "Two clicks within this duration are considered a double-click. Some applications may not honor this setting.")
+-                        }
+-                    }
++                KCM.SettingStateBinding {
++                    configObject: kcm.globalsSettings
++                    settingName: "smoothScroll"
++                }
++            }
+ 
+-                    RowLayout {
+-                        Layout.fillWidth: true
+-                        spacing: Kirigami.Units.smallSpacing
+-
+-                        QQC2.Label {
+-                            Layout.fillWidth: true
+-                            Layout.preferredWidth: Kirigami.Units.gridUnit * 16
+-                            text: i18nc("Test double-click speed", "Double-click the folder to test. If it does not change its appearance, increase double-click interval.")
+-                            textFormat: Text.PlainText
+-                            wrapMode: Text.WordWrap
+-                            font: Kirigami.Theme.smallFont
+-                        }
++            Kirigami.ContextualHelpButton {
++                toolTipText: i18nc("@info:tooltip", "This setting enables or disables animated transitions when scrolling with a mouse wheel or the keyboard. Some applications may not honor this setting because they either do not support smooth scrolling, or have their own setting for enabling and disabling it.")
++            }
++        }
+ 
+-                        QQC2.Frame {
+-                            Layout.preferredWidth: Kirigami.Units.iconSizes.large
+-                            Layout.preferredHeight: Kirigami.Units.iconSizes.large
+-                            Kirigami.Theme.colorSet: Kirigami.Theme.View
++        // ---- Text cursor ----
++        Kirigami.Separator {
++            Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18nc("@title:group", "Text Cursor")
++        }
+ 
+-                            Kirigami.Icon {
+-                                id: doubleClickTestIcon
+-                                property bool checked: false
+-                                anchors.fill: parent
+-                                source: checked ? "folder-open" : "folder"
+-                            }
++        RowLayout {
++            // ksr: kcm_workspace/cursorBlinkRate
++            spacing: Kirigami.Units.smallSpacing
+ 
+-                            MouseArea {
+-                                anchors.fill: parent
+-                                hoverEnabled: true // for onExited to properly work.
+-                                onPressed: {
+-                                    if (testDoubleClickTimer.running) {
+-                                        doubleClickTestIcon.checked = !doubleClickTestIcon.checked
+-                                        testDoubleClickTimer.stop()
+-                                    } else {
+-                                        testDoubleClickTimer.start()
+-                                    }
+-                                }
+-                                onExited: testDoubleClickTimer.stop()
+-                            }
++            QQC2.CheckBox {
++                id: cursorBlinkCheckbox
++                text: i18nc("@option:check followed by a spinbox", "Blink with interval:")
++                checked: kcm.globalsSettings.cursorBlinkRate > 0
++                onToggled: kcm.globalsSettings.cursorBlinkRate = checked ? cursorBlinkSpinbox.value : 0
+ 
+-                            Timer {
+-                                id: testDoubleClickTimer
+-                                interval: kcm.globalsSettings.doubleClickInterval
+-                            }
+-                        }
+-                    }
++                KCM.SettingStateBinding {
++                    configObject: kcm.globalsSettings
++                    settingName: "cursorBlinkRate"
+                 }
+             }
+-        }
+ 
++            QQC2.SpinBox {
++                id: cursorBlinkSpinbox
++                from: 200
++                to: 2000
++                stepSize: 100
+ 
+-        Kirigami.FormGroup {
+-            title: i18nc("@title:group", "Text Cursor")
++                validator: IntValidator {
++                    bottom: Math.min(cursorBlinkSpinbox.from, cursorBlinkSpinbox.to)
++                    top: Math.max(cursorBlinkSpinbox.from, cursorBlinkSpinbox.to)
++                }
+ 
+-            Kirigami.FormEntry {
+-                contentItem: RowLayout {
+-                    spacing: Kirigami.Units.smallSpacing
++                textFromValue: (value, locale) => {
++                    return i18ncp("short for millisecond(s)", "%1 ms", "%1 ms", value)
++                }
+ 
+-                    QQC2.CheckBox {
+-                        id: cursorBlinkCheckbox
+-                        text: i18nc("@option:check followed by a spinbox", "Blink with interval:")
+-                        checked: kcm.globalsSettings.cursorBlinkRate > 0
+-                        onToggled: kcm.globalsSettings.cursorBlinkRate = checked ? cursorBlinkSpinbox.value : 0
++                valueFromText: (text, locale) => {
++                    return Number.fromLocaleString(locale, text.replace(i18nc("short for millisecond(s)", "ms"), ""))
++                }
+ 
+-                        KCM.SettingStateBinding {
+-                            configObject: kcm.globalsSettings
+-                            settingName: "cursorBlinkRate"
+-                        }
+-                    }
++                // Show the default interval while blinking is off
++                value: kcm.globalsSettings.cursorBlinkRate > 0 ? kcm.globalsSettings.cursorBlinkRate : 1000
++                onValueModified: kcm.globalsSettings.cursorBlinkRate = value
+ 
+-                    QQC2.SpinBox {
+-                        id: cursorBlinkSpinbox
+-                        from: 200
+-                        to: 2000
+-                        stepSize: 100
++                Accessible.name: i18nc("@label:spinbox accessible", "Text cursor blink interval")
+ 
+-                        validator: IntValidator {
+-                            bottom: Math.min(cursorBlinkSpinbox.from, cursorBlinkSpinbox.to)
+-                            top: Math.max(cursorBlinkSpinbox.from, cursorBlinkSpinbox.to)
+-                        }
++                KCM.SettingStateBinding {
++                    configObject: kcm.globalsSettings
++                    settingName: "cursorBlinkRate"
++                    extraEnabledConditions: cursorBlinkCheckbox.checked
++                }
++            }
+ 
+-                        textFromValue: (value, locale) => {
+-                            return i18ncp("short for millisecond(s)", "%1 ms", "%1 ms", value)
+-                        }
++            Kirigami.ContextualHelpButton {
++                toolTipText: i18nc("@info:whatsthis contextualhelpbutton tooltip", "Applies to KDE, Qt and GTK apps, including Firefox and Chromium-based browsers. May be ignored by apps with their own cursor settings, such as some terminals and code editors.")
++            }
++        }
+ 
+-                        valueFromText: (text, locale) => {
+-                            return Number.fromLocaleString(locale, text.replace(i18nc("short for millisecond(s)", "ms"), ""))
+-                        }
++        // ---- Drag and drop ----
++        Kirigami.Separator {
++            Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18nc("@title:group prefix radiobutton group", "Drag and Drop")
++        }
+ 
+-                        // Show the default interval while blinking is off
+-                        value: kcm.globalsSettings.cursorBlinkRate > 0 ? kcm.globalsSettings.cursorBlinkRate : 1000
+-                        onValueModified: kcm.globalsSettings.cursorBlinkRate = value
++        QQC2.RadioButton {
++            // ksr: kcm_workspace/dndBehavior
++            id: dndBehaviorAsk
++            Kirigami.FormData.label: i18nc("@title:group prefix radiobutton group", "When dragging files or folders:")
++            text: i18nc("@option:radio When dragging...", "Always ask what to do")
++            Accessible.description: xi18nc("@info", "Hold <shortcut>Shift</shortcut> to move, <shortcut>Ctrl</shortcut> to copy, and <shortcut>Shift+Ctrl</shortcut> to create a symlink. Otherwise show a dialog.")
++            enabled: !kcm.globalsSettings.isImmutable("dndBehavior")
++            checked: kcm.globalsSettings.dndBehavior === WorkspaceOptionsGlobalsSettings.AlwaysAsk
++            onToggled: kcm.globalsSettings.dndBehavior = WorkspaceOptionsGlobalsSettings.AlwaysAsk
++            QQC2.ButtonGroup { id: dndBehaviorGroup }
++            QQC2.ButtonGroup.group: dndBehaviorGroup
++
++            KCM.SettingStateBinding {
++                configObject: kcm.globalsSettings
++                settingName: "dndBehavior"
++            }
++        }
+ 
+-                        Accessible.name: i18nc("@label:spinbox accessible", "Text cursor blink interval")
++        QQC2.Label {
++            Layout.fillWidth: true
++            Layout.leftMargin: Kirigami.Units.gridUnit
++            text: dndBehaviorAsk.Accessible.description
++            textFormat: Text.RichText
++            wrapMode: Text.Wrap
++            font: Kirigami.Theme.smallFont
++        }
+ 
+-                        KCM.SettingStateBinding {
+-                            configObject: kcm.globalsSettings
+-                            settingName: "cursorBlinkRate"
+-                            extraEnabledConditions: cursorBlinkCheckbox.checked
+-                        }
+-                    }
+-                }
+-                trailingItems: Kirigami.ContextualHelpButton {
+-                    Layout.alignment: Qt.AlignRight
+-                    toolTipText: i18nc("@info:whatsthis contextualhelpbutton tooltip", "Applies to KDE, Qt and GTK apps, including Firefox and Chromium-based browsers. May be ignored by apps with their own cursor settings, such as some terminals and code editors.")
+-                }
++        QQC2.RadioButton {
++            id: dndBehaviorMove
++            text: i18nc("@option:radio When dragging…", "Move if on the same device")
++            Accessible.description: xi18nc("@info", "Hold <shortcut>Shift</shortcut> when dropping to show other options.")
++            enabled: !kcm.globalsSettings.isImmutable("dndBehavior")
++            checked: kcm.globalsSettings.dndBehavior === WorkspaceOptionsGlobalsSettings.MoveIfSameDevice
++            onToggled: kcm.globalsSettings.dndBehavior = WorkspaceOptionsGlobalsSettings.MoveIfSameDevice
++            QQC2.ButtonGroup.group: dndBehaviorGroup
++
++            KCM.SettingStateBinding {
++                configObject: kcm.globalsSettings
++                settingName: "dndBehavior"
+             }
+         }
+ 
+-        Kirigami.FormGroup {
+-            title: i18nc("@title:group prefix radiobutton group", "Drag and Drop")
+-
+-            Kirigami.FormEntry {
+-                title: i18nc("@title:group prefix radiobutton group", "When dragging files or folders:")
+-                subtitle: dndBehaviorAsk.Accessible.description
+-                contentItem: QQC2.RadioButton {
+-                    id: dndBehaviorAsk
+-                    text: i18nc("@option:radio When dragging...", "Always ask what to do")
+-                    Accessible.description: xi18nc("@info", "Hold <shortcut>Shift</shortcut> to move, <shortcut>Ctrl</shortcut> to copy, and <shortcut>Shift+Ctrl</shortcut> to create a symlink. Otherwise show a dialog.")
+-                    enabled: !kcm.globalsSettings.isImmutable("dndBehavior")
+-                    checked: kcm.globalsSettings.dndBehavior === WorkspaceOptionsGlobalsSettings.AlwaysAsk
+-                    onToggled: kcm.globalsSettings.dndBehavior = WorkspaceOptionsGlobalsSettings.AlwaysAsk
+-                    QQC2.ButtonGroup { id: dndBehaviorGroup }
+-                    QQC2.ButtonGroup.group: dndBehaviorGroup
++        QQC2.Label {
++            Layout.fillWidth: true
++            Layout.leftMargin: Kirigami.Units.gridUnit
++            text: dndBehaviorMove.Accessible.description
++            textFormat: Text.RichText
++            wrapMode: Text.Wrap
++            font: Kirigami.Theme.smallFont
++        }
++
++        // ---- Tablet mode ----
++        Kirigami.Separator {
++            Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18nc("@title:group", "Tablet Mode")
++        }
+ 
+-                    KCM.SettingStateBinding {
+-                        configObject: kcm.globalsSettings
+-                        settingName: "dndBehavior"
++        RowLayout {
++            // ksr: kcm_workspace/tabletMode
++            Kirigami.FormData.label: i18nc("@title:group prefix radiobutton group", "Enable Tablet Mode:")
++            Kirigami.FormData.buddyFor: touchEnabledRadio
++            spacing: Kirigami.Units.smallSpacing
++
++            QQC2.RadioButton {
++                id: touchEnabledRadio
++                text: KWindowSystem.isPlatformWayland ? i18nc("As in: 'Tablet Mode is automatically enabled as needed'", "Automatically enable as needed") : i18nc("As in: 'Tablet Mode is never enabled'", "Never enabled")
++                Accessible.description: touchModeAlwaysOffRadioButton.Accessible.description
++                checked: kcm.kwinSettings.tabletMode === "auto"
++                onToggled: {
++                    if (checked) {
++                        kcm.kwinSettings.tabletMode = "auto"
+                     }
+                 }
++                QQC2.ButtonGroup { id: tabletModeBehaviorGroup }
++                QQC2.ButtonGroup.group: tabletModeBehaviorGroup
++
++                KCM.SettingStateBinding {
++                    configObject: kcm.kwinSettings
++                    settingName: "tabletMode"
++                }
+             }
+ 
+-            Kirigami.FormEntry {
+-                subtitle: dndBehaviorMove.Accessible.description
+-                contentItem: QQC2.RadioButton {
+-                    id: dndBehaviorMove
+-                    text: i18nc("@option:radio When dragging…", "Move if on the same device")
+-                    Accessible.description: xi18nc("@info", "Hold <shortcut>Shift</shortcut> when dropping to show other options.")
+-                    enabled: !kcm.globalsSettings.isImmutable("dndBehavior")
+-                    checked: kcm.globalsSettings.dndBehavior === WorkspaceOptionsGlobalsSettings.MoveIfSameDevice
+-                    onToggled: kcm.globalsSettings.dndBehavior = WorkspaceOptionsGlobalsSettings.MoveIfSameDevice
+-                    QQC2.ButtonGroup.group: dndBehaviorGroup
++            Kirigami.ContextualHelpButton {
++                visible: KWindowSystem.isPlatformWayland
++                toolTipText: i18nc("@info:whatsthis contextualhelpbutton tooltip", "Tablet Mode will be automatically enabled whenever the system detects a touchscreen but no mouse or touchpad. For example: when a transformable laptop's keyboard is flipped around or detached.")
++            }
++        }
+ 
+-                    KCM.SettingStateBinding {
+-                        configObject: kcm.globalsSettings
+-                        settingName: "dndBehavior"
+-                    }
++        QQC2.RadioButton {
++            text: i18nc("As in: 'Tablet Mode is always enabled'", "Always enabled")
++            Accessible.description: touchModeAlwaysOffRadioButton.Accessible.description
++            checked: kcm.kwinSettings.tabletMode === "on"
++            onToggled: {
++                if (checked) {
++                    kcm.kwinSettings.tabletMode = "on"
+                 }
+             }
+-        }
++            QQC2.ButtonGroup.group: tabletModeBehaviorGroup
+ 
+-        Kirigami.FormGroup {
+-            title: i18nc("@title:group", "Touch")
+-
+-            Kirigami.FormEntry {
+-                title: i18nc("@title:group prefix radiobutton group", "Enable Tablet Mode:")
+-                contentItem: QQC2.RadioButton {
+-                    id: touchEnabledRadio
+-                    text: KWindowSystem.isPlatformWayland ? i18nc("As in: 'Tablet Mode is automatically enabled as needed'", "Automatically enable as needed") : i18nc("As in: 'Tablet Mode is never enabled'", "Never enabled")
+-                    Accessible.description: touchModeAlwaysOffRadioButton.Accessible.description
+-                    checked: kcm.kwinSettings.tabletMode === "auto"
+-                    onToggled: {
+-                        if (checked) {
+-                            kcm.kwinSettings.tabletMode = "auto"
+-                        }
+-                    }
+-                    QQC2.ButtonGroup { id: tabletModeBehaviorGroup }
+-                    QQC2.ButtonGroup.group: tabletModeBehaviorGroup
++            KCM.SettingStateBinding {
++                configObject: kcm.kwinSettings
++                settingName: "tabletMode"
++            }
++        }
+ 
+-                    KCM.SettingStateBinding {
+-                        configObject: kcm.kwinSettings
+-                        settingName: "tabletMode"
+-                    }
+-                }
+-                trailingItems: Kirigami.ContextualHelpButton {
+-                    Layout.alignment: Qt.AlignRight
+-                    visible: KWindowSystem.isPlatformWayland
+-                    toolTipText: i18nc("@info:whatsthis contextualhelpbutton tooltip", "Tablet Mode will be automatically enabled whenever the system detects a touchscreen but no mouse or touchpad. For example: when a transformable laptop's keyboard is flipped around or detached.")
++        QQC2.RadioButton {
++            // Hidden on X11: "Disabled" only exists on Wayland.
++            id: touchModeAlwaysOffRadioButton
++            visible: KWindowSystem.isPlatformWayland
++            text: i18nc("As in: 'Tablet Mode is never enabled'", "Disabled")
++            Accessible.description: i18nc("@info:usagetip", "In Tablet Mode, the virtual keyboard will appear when needed.")
++            checked: kcm.kwinSettings.tabletMode === "off"
++            onToggled: {
++                if (checked) {
++                    kcm.kwinSettings.tabletMode = "off"
+                 }
+             }
++            QQC2.ButtonGroup.group: tabletModeBehaviorGroup
+ 
+-            Kirigami.FormEntry {
+-                contentItem: QQC2.RadioButton {
+-                    text: i18nc("As in: 'Tablet Mode is always enabled'", "Always enabled")
+-                    Accessible.description: touchModeAlwaysOffRadioButton.Accessible.description
+-                    checked: kcm.kwinSettings.tabletMode === "on"
+-                    onToggled: {
+-                        if (checked) {
+-                            kcm.kwinSettings.tabletMode = "on"
+-                        }
+-                    }
+-                    QQC2.ButtonGroup.group: tabletModeBehaviorGroup
++            KCM.SettingStateBinding {
++                configObject: kcm.kwinSettings
++                settingName: "tabletMode"
++            }
++        }
+ 
+-                    KCM.SettingStateBinding {
+-                        configObject: kcm.kwinSettings
+-                        settingName: "tabletMode"
+-                    }
++        QQC2.Label {
++            Layout.fillWidth: true
++            Layout.leftMargin: Kirigami.Units.gridUnit
++            visible: KWindowSystem.isPlatformWayland
++            text: touchModeAlwaysOffRadioButton.Accessible.description
++            textFormat: Text.PlainText
++            wrapMode: Text.Wrap
++            font: Kirigami.Theme.smallFont
++        }
++
++        // ---- Tooltips and popups (Plasma) ----
++        Kirigami.Separator {
++            Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18nc("@title:group", "Tooltips and Popups")
++        }
++
++        RowLayout {
++            // ksr: kcm_workspace/delay
++            spacing: Kirigami.Units.smallSpacing
++
++            QQC2.CheckBox {
++                id: tooltipDisablerCheckbox
++                text: i18nc("@option:check", "Show panel and widget tooltips")
++                checked: kcm.plasmaSettings.delay > 0
++                onCheckedChanged: kcm.plasmaSettings.delay = (checked ? 0.7 : -1)
++
++                KCM.SettingStateBinding {
++                    configObject: kcm.plasmaSettings
++                    settingName: "delay"
+                 }
+             }
+ 
+-            Kirigami.FormEntry {
+-                subtitle: touchModeAlwaysOffRadioButton.Accessible.description
+-                visible: KWindowSystem.isPlatformWayland
+-                contentItem: QQC2.RadioButton {
+-                    id: touchModeAlwaysOffRadioButton
+-                    text: i18nc("As in: 'Tablet Mode is never enabled'", "Disabled")
+-                    Accessible.description: i18nc("@info:usagetip", "In Tablet Mode, the virtual keyboard will appear when needed.")
+-                    checked: kcm.kwinSettings.tabletMode === "off"
+-                    onToggled: {
+-                        if (checked) {
+-                            kcm.kwinSettings.tabletMode = "off"
+-                        }
+-                    }
+-                    QQC2.ButtonGroup.group: tabletModeBehaviorGroup
++            Kirigami.ContextualHelpButton {
++                toolTipText: i18nc("@info:whatsthis contextualhelpbutton tooltip", "Allows all Plasma panel and desktop widgets to show descriptive tooltips when hovered with the pointer. This setting has no effect on the small tooltips displayed when hovering over individual buttons and other user interface elements.")
++            }
++        }
+ 
+-                    KCM.SettingStateBinding {
+-                        configObject: kcm.kwinSettings
+-                        settingName: "tabletMode"
+-                    }
++        RowLayout {
++            // ksr: kcm_workspace/osdEnabled
++            spacing: Kirigami.Units.smallSpacing
++
++            QQC2.CheckBox {
++                id: osdDisablerCheckbox
++                text: i18nc("@option:check", "Show OSD popups for status changes")
++                checked: kcm.plasmaSettings.osdEnabled
++                onCheckedChanged: kcm.plasmaSettings.osdEnabled = checked
++
++                KCM.SettingStateBinding {
++                    configObject: kcm.plasmaSettings
++                    settingName: "osdEnabled"
+                 }
+             }
++
++            Kirigami.ContextualHelpButton {
++                toolTipText: i18nc("@info:whatsthis contextualhelpbutton tooltip", "Allows all Plasma widgets to show on-screen display (OSD) popups for changes like volume and brightness level, or audio device switching.")
++            }
++        }
++
++        QQC2.Button {
++            // The keyboard layout OSD (kcfg OSD/kbdLayoutChangedEnabled)
++            // ksr: kcm_workspace/osdKbdLayoutChangedEnabled
++            // is owned by the keyboard page (ia/duplicates.md); link to it instead of duplicating the control.
++            icon.name: "input-keyboard"
++            text: i18nc("@action:button opens the keyboard settings page", "Keyboard Layout Popup…")
++            onClicked: KCM.KCMLauncher.openSystemSettings("kcm_keyboard")
+         }
+     }
+ }

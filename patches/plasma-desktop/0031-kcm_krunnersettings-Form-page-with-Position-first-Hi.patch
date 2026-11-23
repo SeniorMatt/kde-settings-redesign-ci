@@ -1,0 +1,107 @@
+From 4298b127c364151e7d956d03041116ed1730f551 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 15:08:22 +0500
+Subject: [PATCH 31/31] kcm_krunnersettings: Form page with Position first,
+ History and Search Plugins sections
+
+Page type: Form (FormLayout, as the sibling kcm_plasmasearch page). Position on screen stays first (unlabelled-section rule);
+the old "History:" group label became a "History" section title (noun, HIG-006/057); the plugin link sits in a
+"Search Plugins" section and points at kcm_plasmasearch (the page that owns the runner list, ia/duplicates.md).
+Spacer Items replaced by section Separators; the button is a plain visible-bound item instead of a Loader; history radios
+get KCM.SettingStateBinding (changed-settings highlight). Behaviour, keys and authorisation check unchanged.
+ksr markers: historyBehavior, historyBehavior-2, ClearHistoryActivity, Configure-Enabled-Search-Plugins (strict: 0 lost).
+Speed: nothing blocks the first frame in the C++ (history keys read from one small rc file; ActivityModel already created
+lazily on first Clear History click). After-numbers: pending, manager will measure. NOT BUILT YET.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/runners/krunner/ui/main.qml | 45 +++++++++++++++++---------------
+ 1 file changed, 24 insertions(+), 21 deletions(-)
+
+diff --git a/kcms/runners/krunner/ui/main.qml b/kcms/runners/krunner/ui/main.qml
+index a0688b4..4edd246 100644
+--- a/kcms/runners/krunner/ui/main.qml
++++ b/kcms/runners/krunner/ui/main.qml
+@@ -47,12 +47,15 @@ KCM.SimpleKCM {
+             }
+         }
+ 
+-        Item {
+-            Kirigami.FormData.isSection: false
++        // Form page (docs/page-design.md): position first, then history, then the link to the plugin list.
++        // Sections use Separators, like the plasmasearch page.
++        Kirigami.Separator {
++            Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18nc("@title:group section", "History")
+         }
+ 
+         QQC2.RadioButton {
+-            Kirigami.FormData.label: i18nc("@title:group prefix for radiobutton group", "History:")
++            // ksr: kcm_krunnersettings/krunnerSettings-historyBehavior (the "History:" label became the section title)
+             checked: kcm.krunnerSettings.historyBehavior === KRunnerSettings.Disabled
+             onToggled: kcm.krunnerSettings.historyBehavior = KRunnerSettings.Disabled
+             text: i18nc("@option:radio History is disabled", "Disabled")
+@@ -66,10 +69,15 @@ KCM.SimpleKCM {
+             checked: kcm.krunnerSettings.historyBehavior === KRunnerSettings.ImmediateCompletion
+             onToggled: kcm.krunnerSettings.historyBehavior = KRunnerSettings.ImmediateCompletion
+             text: i18nc("@option:radio The thing being enabled is search history", "Enable auto-complete")
++
++            KCM.SettingStateBinding {
++                configObject: kcm.krunnerSettings
++                settingName: "historyBehavior"
++            }
+         }
+ 
+         QQC2.Button {
+-            id: clearHistoryButton
++            id: clearHistoryButton  // ksr: kcm_krunnersettings/krunnerSettings-historyBehavior-2
+             enabled: kcm.krunnerSettings.historyBehavior !== KRunnerSettings.Disabled && kcm.historyKeys.length > 0
+ 
+             icon.name: Application.layoutDirection === Qt.LeftToRight ? "edit-clear-locationbar-ltr" : "edit-clear-locationbar-rtl"
+@@ -105,7 +113,7 @@ KCM.SimpleKCM {
+                 id: activityList
+ 
+                 QQC2.MenuItem {
+-                    enabled: kcm.historyKeys.includes(model.id)
++                    enabled: kcm.historyKeys.includes(model.id)  // ksr: kcm_krunnersettings/ClearHistoryActivity
+ 
+                     icon.source: model.iconSource
+                     text: i18nc("@item:inmenu delete krunner history for this activity", "For activity \"%1\"", model.name)
+@@ -115,25 +123,20 @@ KCM.SimpleKCM {
+             }
+         }
+ 
+-        Item {
+-            visible: pluginButton.visible
+-            Kirigami.FormData.isSection: false
++        Kirigami.Separator {
++            visible: kcm.doesShowPluginButton
++            Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18nc("@title:group section", "Search Plugins")
+         }
+ 
+-        Loader {
+-            id: pluginButton
+-            active: kcm.doesShowPluginButton
+-            visible: active
+-
+-            Kirigami.FormData.label: i18nc("@label", "Plugins:")
+-
+-            sourceComponent: QQC2.Button {
+-                enabled: KConfig.KAuthorized.authorizeControlModule("kcm_krunnersettings")
+-                text: i18nc("@action:button", "Configure Enabled Search Plugins…")
+-                icon.name: "settings-configure"
++        QQC2.Button {
++            // ksr: kcm_krunnersettings/Configure-Enabled-Search-Plugins
++            visible: kcm.doesShowPluginButton
++            enabled: KConfig.KAuthorized.authorizeControlModule("kcm_krunnersettings")
++            text: i18nc("@action:button", "Configure Enabled Search Plugins…")
++            icon.name: "settings-configure"
+ 
+-                onClicked: KCM.KCMLauncher.openSystemSettings("kcm_plasmasearch")
+-            }
++            onClicked: KCM.KCMLauncher.openSystemSettings("kcm_plasmasearch")
+         }
+     }
+ }

@@ -1,0 +1,616 @@
+From 5e0f817bf9f2d08535b7b169a6cd49b635bf94eb Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 11:06:29 +0500
+Subject: [PATCH 02/12] kcm_animations: effect list scanned after the page is
+ shown; Form page with Windows / Desktop / Popups and sessions
+
+Page type: Form (docs/page-design.md). kwinrc [Plugins] <effect>Enabled, kdeglobals AnimationDurationFactor, KGlobalSettings
+notify and the effect config dialogs are unchanged.
+
+Moved / renamed:
+- Kirigami.Form/FormGroup/FormEntry replaced by Kirigami.FormLayout (works on 6.8.3 too) with sections
+  "Windows" (was "Window animations"), "Desktop" (was "Desktop animations"), new title "Popups and sessions" for the
+  untitled other-effects group. Speed slider stays first, no title; its legend and help button kept.
+- Each combo + Configure... is one new component, ui/AnimationRow.qml (same controls as before, icon buttons have
+  Accessible.name; combos have a minimum width so rows align).
+- "More effects settings:" row became a "More effects:" button "Desktop Effects..." using
+  KCMLauncher.openSystemSettings("kcm_kwin_effects") (fixed label; no KService lookup). kcm.launchEffectsKCM() stays in
+  C++ for compatibility; effectsKCMData() removed (it was only used by that row).
+- Combos and effect check boxes are disabled until the list is loaded. Busy indicator after 150 ms.
+- Relabel table: inventory/relabel/kcm_animations.tsv (outer repo). Inventory --strict: 12 rows ok, 0 lost.
+
+Speed (cause from code, not measured):
+- AnimationsKCM::load() ran EffectsModel::load() synchronously: built-in effect list, KPackage scan for JS effects and
+  findPlugins for plugin effects (common/effectsmodel.cpp:373-380) before the page existed; the constructor also builds
+  7 subset models. The page bound effectsKCMData() -> KService::serviceByStorageId synchronously (kcm.cpp, old line 102).
+- Now load() reads only the small kdeglobals settings; EffectsModel::load() runs one event-loop turn later
+  (QTimer::singleShot(0), guarded against double scheduling); the existing D-Bus areEffectsSupported call stays async.
+  New property kcm.loading (cleared on EffectsModel::loaded). The KService lookup is gone. Caveat: if KWin returns a
+  mismatching list, EffectsModel never emits loaded() (existing behaviour), so the combos would stay disabled.
+- Numbers: before (build/bench/clean/before-slow.tsv, under load) 604 ms first frame at 0.5 CPU. After: pending,
+  manager will measure.
+
+HIG: HIG-001, HIG-005, HIG-006, HIG-019, HIG-020, HIG-047, HIG-058.
+
+Not built yet (freeze).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ src/kcms/animations/kcm.cpp             |  37 ++-
+ src/kcms/animations/kcm.h               |  15 +-
+ src/kcms/animations/ui/AnimationRow.qml |  47 +++
+ src/kcms/animations/ui/main.qml         | 364 +++++++++++-------------
+ 4 files changed, 247 insertions(+), 216 deletions(-)
+ create mode 100644 src/kcms/animations/ui/AnimationRow.qml
+
+diff --git a/src/kcms/animations/kcm.cpp b/src/kcms/animations/kcm.cpp
+index a1e7e2b..7e34c26 100644
+--- a/src/kcms/animations/kcm.cpp
++++ b/src/kcms/animations/kcm.cpp
+@@ -7,9 +7,9 @@
+ #include <QDBusConnection>
+ #include <QDBusMessage>
+ #include <QProcess>
++#include <QTimer>
+ 
+ #include <KPluginFactory>
+-#include <KService>
+ 
+ #include "effectsmodel.h"
+ 
+@@ -41,6 +41,9 @@ AnimationsKCM::AnimationsKCM(QObject *parent, const KPluginMetaData &metaData)
+     connect(m_animationsGlobalsSettings, &AnimationsGlobalsSettings::animationDurationFactorChanged, this, &AnimationsKCM::updateNeedsSave);
+     connect(m_model, &EffectsModel::dataChanged, this, &AnimationsKCM::updateNeedsSave);
+     connect(m_model, &EffectsModel::loaded, this, &AnimationsKCM::updateNeedsSave);
++    connect(m_model, &EffectsModel::loaded, this, [this]() {
++        setLoading(false);
++    });
+ 
+     qmlRegisterAnonymousType<AnimationsGlobalsSettings>("org.kde.plasma.kcm.animations", 0);
+     qmlRegisterUncreatableType<EffectsModel>("org.kde.plasma.kcm.animations", 0, 0, "EffectsModel", "Role enums only");
+@@ -99,28 +102,36 @@ void AnimationsKCM::configure(const QString &pluginId, QQuickItem *context) cons
+     m_model->requestConfigure(index, context);
+ }
+ 
+-QVariantMap AnimationsKCM::effectsKCMData() const
++void AnimationsKCM::launchEffectsKCM() const
+ {
+-    if (KService::Ptr kcm = KService::serviceByStorageId(QStringLiteral("kcm_kwin_effects"))) {
+-        QVariantMap data;
+-        data["icon"] = kcm->icon();
+-        data["name"] = kcm->name();
+-        return data;
+-    }
+-
+-    return {};
++    // Kept for compatibility; the page now opens it through KCMLauncher.openSystemSettings
++    QProcess::startDetached(QStringLiteral("systemsettings"), QStringList{QStringLiteral("kcm_kwin_effects")});
+ }
+ 
+-void AnimationsKCM::launchEffectsKCM() const
++void AnimationsKCM::setLoading(bool loading)
+ {
+-    QProcess::startDetached(QStringLiteral("systemsettings"), QStringList{QStringLiteral("kcm_kwin_effects")});
++    if (m_loading != loading) {
++        m_loading = loading;
++        Q_EMIT loadingChanged();
++    }
+ }
+ 
+ void AnimationsKCM::load()
+ {
+     m_animationsGlobalsSettings->load();
+-    m_model->load();
+     setNeedsSave(false);
++
++    // EffectsModel::load() scans the built-in effect list, the KPackage "KWin/Effect" packages and the effect plugins
++    // synchronously before it asks KWin over D-Bus which are supported. Run it one event-loop turn later so the page
++    // (slider, labels) is created first; the combo boxes stay disabled until EffectsModel::loaded().
++    setLoading(true);
++    if (!m_loadScheduled) {
++        m_loadScheduled = true;
++        QTimer::singleShot(0, this, [this]() {
++            m_loadScheduled = false;
++            m_model->load();
++        });
++    }
+ }
+ 
+ void AnimationsKCM::save()
+diff --git a/src/kcms/animations/kcm.h b/src/kcms/animations/kcm.h
+index 029c1ff..63ccbbd 100644
+--- a/src/kcms/animations/kcm.h
++++ b/src/kcms/animations/kcm.h
+@@ -26,6 +26,8 @@ class AnimationsKCM : public KQuickConfigModule
+     Q_PROPERTY(EffectsSubsetModel *peekDesktopAnimations READ peekDesktopAnimations CONSTANT)
+     Q_PROPERTY(EffectsSubsetModel *virtualDesktopAnimations READ virtualDesktopAnimations CONSTANT)
+     Q_PROPERTY(EffectsSubsetModel *otherEffects READ otherEffects CONSTANT)
++    // true from load() until the effect list has been scanned (the page is already shown by then)
++    Q_PROPERTY(bool loading READ isLoading NOTIFY loadingChanged)
+ 
+ public:
+     AnimationsKCM(QObject *parent, const KPluginMetaData &metaData);
+@@ -41,9 +43,16 @@ public:
+     EffectsSubsetModel *otherEffects() const;
+ 
+     Q_INVOKABLE void configure(const QString &pluginId, QQuickItem *context) const;
+-    Q_INVOKABLE QVariantMap effectsKCMData() const;
+     Q_INVOKABLE void launchEffectsKCM() const;
+ 
++    bool isLoading() const
++    {
++        return m_loading;
++    }
++
++Q_SIGNALS:
++    void loadingChanged();
++
+ public Q_SLOTS:
+     void load() override;
+     void save() override;
+@@ -53,6 +62,8 @@ private Q_SLOTS:
+     void updateNeedsSave();
+ 
+ private:
++    void setLoading(bool loading);
++
+     AnimationsGlobalsSettings *m_animationsGlobalsSettings;
+     EffectsModel *m_model;
+     EffectsSubsetModel *m_windowOpenCloseAnimations;
+@@ -62,6 +73,8 @@ private:
+     EffectsSubsetModel *m_peekDesktopAnimations;
+     EffectsSubsetModel *m_virtualDesktopAnimations;
+     EffectsSubsetModel *m_otherEffects;
++    bool m_loading = false;
++    bool m_loadScheduled = false;
+ 
+     Q_DISABLE_COPY(AnimationsKCM)
+ };
+diff --git a/src/kcms/animations/ui/AnimationRow.qml b/src/kcms/animations/ui/AnimationRow.qml
+new file mode 100644
+index 0000000..6777863
+--- /dev/null
++++ b/src/kcms/animations/ui/AnimationRow.qml
+@@ -0,0 +1,47 @@
++/*
++    SPDX-FileCopyrightText: 2025 Oliver Beard <olib141@outlook.com>
++
++    SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++*/
++
++import QtQuick
++import QtQuick.Layouts
++import QtQuick.Controls as QQC2
++
++import org.kde.kirigami as Kirigami
++import org.kde.kcmutils as KCM
++
++// One form row: the animation combo box plus its "Configure…" button (docs/page-design.md, section 3)
++RowLayout {
++    id: row
++
++    required property var animationsModel
++
++    Kirigami.FormData.buddyFor: animationComboBox
++    spacing: Kirigami.Units.smallSpacing
++    // Disabled while the effect list is still being scanned, and when animations are switched off
++    enabled: kcm.globalsSettings.animationDurationFactor != 0 && !kcm.loading
++
++    AnimationComboBox {
++        id: animationComboBox
++        Layout.minimumWidth: Kirigami.Units.gridUnit * 14
++        animationsModel: row.animationsModel
++        KCM.SettingHighlighter {
++            highlight: !animationComboBox.isDefault && kcm.globalsSettings.animationDurationFactor != 0
++        }
++    }
++    QQC2.Button {
++        icon.name: "configure"
++        text: i18nc("@info:tooltip", "Configure…")
++        display: QQC2.AbstractButton.IconOnly
++        Accessible.name: text
++
++        QQC2.ToolTip.text: text
++        QQC2.ToolTip.visible: hovered || visualFocus
++        QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
++
++        enabled: animationComboBox.isConfigurable
++        visible: animationComboBox.isAnyConfigurable
++        onClicked: kcm.configure(animationComboBox.configurePluginId, row)
++    }
++}
+diff --git a/src/kcms/animations/ui/main.qml b/src/kcms/animations/ui/main.qml
+index 907ce42..7a6e3a6 100644
+--- a/src/kcms/animations/ui/main.qml
++++ b/src/kcms/animations/ui/main.qml
+@@ -15,227 +15,187 @@ import org.kde.plasma.kcm.animations
+ 
+ KCM.SimpleKCM {
+     id: root
+-    Kirigami.SizeGroup {
+-        id: contentItemSizeGroup
+-        mode: Kirigami.SizeGroup.Width
+-        items: [
+-            animationSpeedSlider
+-        ]
+-        function appendItem(item: Item) {
+-            contentItemSizeGroup.items.push(item);
+-        }
+-        function removeItem(item: Item) {
+-            contentItemSizeGroup.items = contentItemSizeGroup.items.filter((e) => e !== item)
+-        }
+-    }
+-    Kirigami.Form {
+-        Kirigami.FormGroup {
+-            // We want to show the slider in a logarithmic way. ie
+-            // move from 4x, 3x, 2x, 1x, 0.5x, 0.25x, 0.125x
+-            // 0 is a special case, which means "instant speed / no animations"
+-            Kirigami.FormEntry {
+-                title: i18n("Global animation speed:")
+-                contentItem: ColumnLayout {
+-                    Kirigami.FormData.buddyFor: animationSpeedSlider
+-                    spacing: Kirigami.Units.smallSpacing
+-                    QQC2.Slider {
+-                        id: animationSpeedSlider
+-                        // Use same values as plasma-desktop/kcms/landingpage/ui/main.qml
+-                        property var valueMapping: [
+-                            4,
+-                            2,
+-                            1.5,
+-                            1,
+-                            0.75,
+-                            0.5,
+-                            0,
+-                        ]
+-                        from: 0
+-                        to: valueMapping.length - 1
+-                        stepSize: 1
+-                        Kirigami.StyleHints.tickMarkStepSize: stepSize
+-                        snapMode: QQC2.Slider.SnapAlways
+-                        onMoved: kcm.globalsSettings.animationDurationFactor = valueMapping[value]
+-                        value: {
+-                            let factor = kcm.globalsSettings.animationDurationFactor
+-                            let index = valueMapping.findIndex(item => item <= factor)
+-                            return index >= 0 ? index : valueMapping.length - 1
+-                        }
+-                        // vertically center align slider with help button
+-                        Layout.topMargin: Math.max(0, (animationSpeedHelpButton.height - height) / 2)
+-                        KCM.SettingStateBinding {
+-                            configObject: kcm.globalsSettings
+-                            settingName: "animationDurationFactor"
+-                        }
++
++    // Form page (docs/page-design.md). The slider and the labels are shown at once; the effect list is scanned after
++    // the page is created (kcm.loading), and the combo boxes below stay disabled until it is in.
++    readonly property bool animationsOn: kcm.globalsSettings.animationDurationFactor != 0
++
++    Kirigami.FormLayout {
++        // ksr: kcm_animations/animationDurationFactor
++        // We want to show the slider in a logarithmic way. ie
++        // move from 4x, 3x, 2x, 1x, 0.5x, 0.25x, 0.125x
++        // 0 is a special case, which means "instant speed / no animations"
++        RowLayout {
++            Kirigami.FormData.label: i18n("Global animation speed:")
++            Kirigami.FormData.buddyFor: animationSpeedSlider
++            spacing: Kirigami.Units.smallSpacing
++
++            ColumnLayout {
++                spacing: Kirigami.Units.smallSpacing
++                QQC2.Slider {
++                    id: animationSpeedSlider
++                    Layout.fillWidth: true
++                    Layout.minimumWidth: Kirigami.Units.gridUnit * 14
++                    // Use same values as plasma-desktop/kcms/landingpage/ui/main.qml
++                    property var valueMapping: [
++                        4,
++                        2,
++                        1.5,
++                        1,
++                        0.75,
++                        0.5,
++                        0,
++                    ]
++                    from: 0
++                    to: valueMapping.length - 1
++                    stepSize: 1
++                    Kirigami.StyleHints.tickMarkStepSize: stepSize
++                    snapMode: QQC2.Slider.SnapAlways
++                    onMoved: kcm.globalsSettings.animationDurationFactor = valueMapping[value]
++                    value: {
++                        let factor = kcm.globalsSettings.animationDurationFactor
++                        let index = valueMapping.findIndex(item => item <= factor)
++                        return index >= 0 ? index : valueMapping.length - 1
+                     }
+-                    RowLayout {
+-                        id: animationSpeedLegend
+-                        Layout.maximumWidth: animationSpeedSlider.width
+-                        Layout.fillWidth: true
+-                        Layout.bottomMargin: animationSpeedSlider.Layout.topMargin
+-                        spacing: 0
+-                        QQC2.Label {
+-                            Layout.fillWidth: true
+-                            text: i18nc("Animation speed", "Slow")
+-                            textFormat: Text.PlainText
+-                            horizontalAlignment: Text.AlignLeft
+-                        }
+-                        QQC2.Label {
+-                            Layout.fillWidth: true
+-                            text: i18nc("Animation speed", "Instant")
+-                            textFormat: Text.PlainText
+-                            horizontalAlignment: Text.AlignRight
+-                        }
++                    KCM.SettingStateBinding {
++                        configObject: kcm.globalsSettings
++                        settingName: "animationDurationFactor"
+                     }
+                 }
+-                trailingItems: [
+-                    Kirigami.ContextualHelpButton {
+-                        id: animationSpeedHelpButton
+-                        Layout.alignment: Qt.AlignTop
+-                        toolTipText: xi18nc("@info:tooltip", "Some applications do not support this setting: in particular, GTK applications cannot change animation duration, but will still disable animations when <interface>animation speed</interface> is <interface>Instant</interface>.")
++                RowLayout {
++                    Layout.fillWidth: true
++                    spacing: 0
++                    QQC2.Label {
++                        Layout.fillWidth: true
++                        text: i18nc("Animation speed", "Slow")
++                        textFormat: Text.PlainText
++                        horizontalAlignment: Text.AlignLeft
+                     }
+-                ]
+-            }
+-        }
+-
+-        Kirigami.FormGroup {
+-            title: i18nc("@title:group", "Window animations")
+-            Repeater {
+-                model: [{"animationsModel": kcm.windowOpenCloseAnimations,  "label": i18nc("@label:listbox", "Open/close:")        },
+-                        {"animationsModel": kcm.windowMaximizeAnimations,   "label": i18nc("@label:listbox", "Maximize:")          },
+-                        {"animationsModel": kcm.windowMinimizeAnimations,   "label": i18nc("@label:listbox", "Minimize:")          },
+-                        {"animationsModel": kcm.windowFullscreenAnimations, "label": i18nc("@label:listbox", "Full screen:")       }]
+-                delegate: Kirigami.FormEntry {
+-                    id: delegate
+-                    required property var modelData
+-                    title: modelData.label
+-                    enabled: kcm.globalsSettings.animationDurationFactor != 0
+-                    contentItem: AnimationComboBox {
+-                        id: animationComboBox
+-                        animationsModel: delegate.modelData.animationsModel
+-                        KCM.SettingHighlighter {
+-                            highlight: !animationComboBox.isDefault && kcm.globalsSettings.animationDurationFactor != 0
+-                        }
+-                        Component.onCompleted: contentItemSizeGroup.appendItem(this);
+-                        Component.onDestruction: contentItemSizeGroup.removeItem(this);
++                    QQC2.Label {
++                        Layout.fillWidth: true
++                        text: i18nc("Animation speed", "Instant")
++                        textFormat: Text.PlainText
++                        horizontalAlignment: Text.AlignRight
+                     }
+-                    trailingItems: [
+-                        QQC2.Button {
+-                            id: animationConfigure
+-                            icon.name: "configure"
+-                            text: i18nc("@info:tooltip", "Configure…")
+-                            display: QQC2.AbstractButton.IconOnly
+-
+-                            QQC2.ToolTip.text: text
+-                            QQC2.ToolTip.visible: hovered || visualFocus
+-                            QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
+-
+-                            enabled: animationComboBox.isConfigurable
+-                            visible: animationComboBox.isAnyConfigurable
+-                            onClicked: kcm.configure(animationComboBox.configurePluginId, root)
+-                        }
+-                    ]
+                 }
+             }
++            Kirigami.ContextualHelpButton {
++                Layout.alignment: Qt.AlignTop
++                toolTipText: xi18nc("@info:tooltip", "Some applications do not support this setting: in particular, GTK applications cannot change animation duration, but will still disable animations when <interface>animation speed</interface> is <interface>Instant</interface>.")
++            }
+         }
+ 
+-        Kirigami.FormGroup {
+-            title: i18nc("@title:group", "Desktop animations")
+-            Repeater {
+-                model: [{"animationsModel": kcm.peekDesktopAnimations,    "label": i18nc("@label:listbox", "Peek at desktop:")        },
+-                        {"animationsModel": kcm.virtualDesktopAnimations, "label": i18nc("@label:listbox", "Switch virtual desktops:")}]
+-                delegate: Kirigami.FormEntry {
+-                    id: delegate
+-                    required property var modelData
+-                    title: modelData.label
+-                    enabled: kcm.globalsSettings.animationDurationFactor != 0
+-                    contentItem: AnimationComboBox {
+-                        id: animationComboBox
+-                        animationsModel: delegate.modelData.animationsModel
+-                        KCM.SettingHighlighter {
+-                            highlight: !animationComboBox.isDefault && kcm.globalsSettings.animationDurationFactor != 0
+-                        }
+-                        Component.onCompleted: contentItemSizeGroup.appendItem(this);
+-                        Component.onDestruction: contentItemSizeGroup.removeItem(this);
+-                    }
+-                    trailingItems: [
+-                        QQC2.Button {
+-                            id: animationConfigure
+-                            icon.name: "configure"
+-                            text: i18nc("@info:tooltip", "Configure…")
+-                            display: QQC2.AbstractButton.IconOnly
+-
+-                            QQC2.ToolTip.text: text
+-                            QQC2.ToolTip.visible: hovered
+-                            QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
+-
+-                            enabled: animationComboBox.isConfigurable
+-                            visible: animationComboBox.isAnyConfigurable
+-                            onClicked: kcm.configure(animationComboBox.configurePluginId, root)
+-                        }
+-                    ]
+-                }
++        // Shown only when scanning the effects takes longer than 150 ms, so a fast load never flashes it
++        Timer {
++            id: busyDelay
++            interval: 150
++            running: kcm.loading
++        }
++        QQC2.BusyIndicator {
++            Layout.alignment: Qt.AlignHCenter
++            running: kcm.loading && !busyDelay.running
++            visible: running
++        }
++
++        Kirigami.Separator {
++            Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18nc("@title:group", "Windows")
++        }
++
++        Repeater {
++            // ksr: kcm_animations/window-openclose
++            // ksr: kcm_animations/window-maximize
++            // ksr: kcm_animations/window-minimize
++            // ksr: kcm_animations/window-fullscreen
++            // ksr: kcm_animations/configure
++            model: [{"animationsModel": kcm.windowOpenCloseAnimations,  "label": i18nc("@label:listbox", "Open/close:")        },
++                    {"animationsModel": kcm.windowMaximizeAnimations,   "label": i18nc("@label:listbox", "Maximize:")          },
++                    {"animationsModel": kcm.windowMinimizeAnimations,   "label": i18nc("@label:listbox", "Minimize:")          },
++                    {"animationsModel": kcm.windowFullscreenAnimations, "label": i18nc("@label:listbox", "Full screen:")       }]
++            delegate: AnimationRow {
++                required property var modelData
++                Kirigami.FormData.label: modelData.label
++                animationsModel: modelData.animationsModel
+             }
+         }
+ 
+-        Kirigami.FormGroup {
+-            Connections {
+-                target: kcm.otherEffects
+-                function onModelReset() { otherEffectsRepeater.model = kcm.otherEffects.rowCount(); }
++        Kirigami.Separator {
++            Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18nc("@title:group", "Desktop")
++        }
++
++        Repeater {
++            // ksr: kcm_animations/desktop-peek
++            // ksr: kcm_animations/desktop-switch
++            // ksr: kcm_animations/configure-2
++            model: [{"animationsModel": kcm.peekDesktopAnimations,    "label": i18nc("@label:listbox", "Peek at desktop:")        },
++                    {"animationsModel": kcm.virtualDesktopAnimations, "label": i18nc("@label:listbox", "Switch virtual desktops:")}]
++            delegate: AnimationRow {
++                required property var modelData
++                Kirigami.FormData.label: modelData.label
++                animationsModel: modelData.animationsModel
+             }
++        }
+ 
+-            Repeater {
+-                id: otherEffectsRepeater
+-                model: kcm.otherEffects.rowCount()
+-                delegate: Kirigami.FormEntry {
+-                    id: delegate
+-                    required property int index
+-                    title: i18nc("@option:check %1 is the name of an animation, e.g. 'Login' or 'Logout'",
+-                                                    "%1:",
+-                                                    kcm.otherEffects.data(kcm.otherEffects.index(index, 0), EffectsModel.NameRole))
+-                    enabled: kcm.globalsSettings.animationDurationFactor != 0
+-                    contentItem: AnimationCheckBox {
+-                        id: animationCheckBox
+-                        animationsModel: kcm.otherEffects
+-                        index: delegate.index
+-                        text: kcm.otherEffects.data(kcm.otherEffects.index(index, 0), EffectsModel.DescriptionRole)
+-                        KCM.SettingHighlighter {
+-                            highlight: !animationCheckBox.isDefault && kcm.globalsSettings.animationDurationFactor != 0
+-                        }
+-                        Component.onCompleted: contentItemSizeGroup.appendItem(this);
+-                        Component.onDestruction: contentItemSizeGroup.removeItem(this);
++        Kirigami.Separator {
++            Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18nc("@title:group", "Popups and sessions")
++        }
++
++        Connections {
++            target: kcm.otherEffects
++            function onModelReset() { otherEffectsRepeater.model = kcm.otherEffects.rowCount(); }
++        }
++
++        Repeater {
++            // ksr: kcm_animations/otherEffects
++            // ksr: kcm_animations/configure-3
++            id: otherEffectsRepeater
++            model: kcm.otherEffects.rowCount()
++            delegate: RowLayout {
++                id: delegate
++                required property int index
++                Kirigami.FormData.label: i18nc("@option:check %1 is the name of an animation, e.g. 'Login' or 'Logout'",
++                                               "%1:",
++                                               kcm.otherEffects.data(kcm.otherEffects.index(index, 0), EffectsModel.NameRole))
++                Kirigami.FormData.buddyFor: animationCheckBox
++                spacing: Kirigami.Units.smallSpacing
++                enabled: root.animationsOn && !kcm.loading
++
++                AnimationCheckBox {
++                    id: animationCheckBox
++                    animationsModel: kcm.otherEffects
++                    index: delegate.index
++                    text: kcm.otherEffects.data(kcm.otherEffects.index(index, 0), EffectsModel.DescriptionRole)
++                    KCM.SettingHighlighter {
++                        highlight: !animationCheckBox.isDefault && root.animationsOn
+                     }
+-                    trailingItems: [
+-                        QQC2.Button {
+-                            icon.name: "configure"
+-                            text: i18nc("@info:tooltip", "Configure…")
+-                            display: QQC2.AbstractButton.IconOnly
+-
+-                            QQC2.ToolTip.text: text
+-                            QQC2.ToolTip.visible: hovered || visualFocus
+-                            QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
+-
+-                            enabled: animationCheckBox.checked
+-                            visible: animationCheckBox.isConfigurable
+-                            onClicked: kcm.configure(animationCheckBox.configurePluginId, root)
+-                        }
+-                    ]
++                }
++                QQC2.Button {
++                    icon.name: "configure"
++                    text: i18nc("@info:tooltip", "Configure…")
++                    display: QQC2.AbstractButton.IconOnly
++                    Accessible.name: text
++
++                    QQC2.ToolTip.text: text
++                    QQC2.ToolTip.visible: hovered || visualFocus
++                    QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
++
++                    enabled: animationCheckBox.checked
++                    visible: animationCheckBox.isConfigurable
++                    onClicked: kcm.configure(animationCheckBox.configurePluginId, root)
+                 }
+             }
+         }
+ 
+-        Kirigami.FormGroup {
+-            id: effectsKCMGroup
+-            readonly property var kcmData: kcm.effectsKCMData()
+-            visible: "icon" in kcmData && "name" in kcmData
+-            Kirigami.FormAction {
+-                title: i18nc("@title:group translate as short as possible", "More effects settings:")
+-                action: QQC2.Action {
+-                    icon.name: effectsKCMGroup.kcmData.icon ?? ""
+-                    text: effectsKCMGroup.kcmData.name ?? ""
+-                    onTriggered: kcm.launchEffectsKCM()
+-                }
+-            }
++        // Link out: turning whole effects on and off, and the other effects, lives on the Desktop Effects page
++        QQC2.Button {
++            // ksr: kcm_animations/more-effects (was kcm.launchEffectsKCM())
++            Kirigami.FormData.label: i18nc("@label link to the effects page", "More effects:")
++            icon.name: "preferences-desktop-effects"
++            text: i18nc("@action:button opens the Desktop Effects page", "Desktop Effects…")
++            Accessible.name: text
++            onClicked: KCM.KCMLauncher.openSystemSettings("kcm_kwin_effects")
+         }
+     }
+ }

@@ -1,0 +1,945 @@
+From 8c88d8bd3859aedd6a013932f5b3a77b85ddeaea Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 13:59:45 +0500
+Subject: [PATCH] kcm_krdpserver: state first, settings on two sub-pages,
+ certificate generation off the GUI thread
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Page type: List (allowed users), with the state of the server above it. The two forms that sat in the list's footer
+(a ToolBar positioned by a bottomMargin expression) became sub-pages reached from toolbar buttons. Config keys,
+kcfg, systemd calls, KWallet use and the phone layout are unchanged.
+
+Moved / renamed:
+- Top of the page: "Remote desktop is on/off" (bold) + the addresses while it runs + "Start automatically on login"
+  (was "Start server: Automatically on login" in Server Settings). The toolbar switch stays.
+- "Server Settings" -> sub-page "Connection Settings…": sections "Connection" (listening port, operating mode) and
+  "Video quality" (quality, adaptive quality). "Enable exclusive mode" -> "Exclusive mode"; "Automatically adjust
+  quality for network conditions" -> "Adjust quality automatically for network conditions".
+- "Security Certificates" -> sub-page "Certificates…" ("Generate certificates: Automatically" -> "Certificate:
+  Generate automatically"; paths shown only when not automatic, as before).
+- Kirigami.Form replaced by Kirigami.FormLayout on the sub-pages (page-design.md section 2).
+HIG ids: HIG-001/005/006 (state and users first), HIG-013/015 (rare options on named sub-pages), HIG-023,
+HIG-047 (FormLayout), HIG-057 (no "Advanced"). Page-design.md sections 1, 2, 6, 7.
+
+Speed cause (code evidence): on the first start with "generate automatically" and empty paths the constructor ran
+generateCertificate(): QProcess openssl + waitForFinished() on the GUI thread before the first frame. It now uses
+QProcess::finished; the result signals are emitted when it exits. The address list called
+QNetworkInterface::allInterfaces() in the Repeater model even while hidden; it now waits until the server runs. The
+H264 probe (QtConcurrent) and the systemd state (async QDBusPendingCallWatcher) were already asynchronous in master.
+Also: m_currentServerStatus is now initialised to Unknown (it was uninitialised, so the first reply could be dropped).
+After-numbers: pending, manager will measure. Not built yet.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ src/kcm/kcmkrdpserver.cpp         |  70 +++---
+ src/kcm/kcmkrdpserver.h           |   4 +-
+ src/kcm/ui/Certificates.qml       | 168 +++++++++++++++
+ src/kcm/ui/ConnectionSettings.qml | 142 +++++++++++++
+ src/kcm/ui/EditUserModal.qml      |   3 +
+ src/kcm/ui/UserListView.qml       |   3 +
+ src/kcm/ui/main.qml               | 341 ++++--------------------------
+ src/kcm/ui/main_phone.qml         |   1 +
+ 8 files changed, 407 insertions(+), 325 deletions(-)
+ create mode 100644 src/kcm/ui/Certificates.qml
+ create mode 100644 src/kcm/ui/ConnectionSettings.qml
+
+diff --git a/src/kcm/kcmkrdpserver.cpp b/src/kcm/kcmkrdpserver.cpp
+index 1995727..e9e319b 100644
+--- a/src/kcm/kcmkrdpserver.cpp
++++ b/src/kcm/kcmkrdpserver.cpp
+@@ -329,36 +329,50 @@ void KRDPServerConfig::generateCertificate()
+     QString certificatePath(defaultCertificatePath());
+     QString certificateKeyPath(defaultCertificateKeyPath());
+     qDebug(KRDPKCM) << "Generating certificate files to: " << certificatePath << " and " << certificateKeyPath;
+-    QProcess sslProcess;
+-    sslProcess.start(u"openssl"_s,
+-                     {
+-                         u"req"_s,
+-                         u"-nodes"_s,
+-                         u"-new"_s,
+-                         u"-x509"_s,
+-                         u"-keyout"_s,
+-                         certificateKeyPath,
+-                         u"-out"_s,
+-                         certificatePath,
+-                         u"-days"_s,
+-                         u"3650"_s,
+-                         u"-batch"_s,
+-                     });
+-    sslProcess.waitForFinished();
+-
+-    m_serverSettings->setCertificate(certificatePath);
+-    m_serverSettings->setCertificateKey(certificateKeyPath);
+-
+-    // Check that the path is valid
+-    if (QFileInfo::exists(certificatePath) && QFileInfo::exists(certificateKeyPath)) {
+-        qDebug(KRDPKCM) << "Certificate generated; ready to accept connections.";
+-        Q_EMIT generateCertificateSucceeded();
+-    } else {
+-        qCritical(KRDPKCM) << "Could not generate a certificate. A valid TLS certificate and key should be provided.";
+-        Q_EMIT generateCertificateFailed();
++    // ksr: this used to be a QProcess + waitForFinished() on the GUI thread, run from the constructor on the first
++    // start (openssl RSA key generation). Now the process runs on its own and the result is reported when it exits.
++    if (m_certificateProcess) {
++        return; // already generating
+     }
++    m_certificateProcess = new QProcess(this);
++    connect(m_certificateProcess, &QProcess::finished, this, [this, certificatePath, certificateKeyPath](int, QProcess::ExitStatus) {
++        m_certificateProcess->deleteLater();
++        m_certificateProcess = nullptr;
++
++        m_serverSettings->setCertificate(certificatePath);
++        m_serverSettings->setCertificateKey(certificateKeyPath);
++
++        // Check that the path is valid
++        if (QFileInfo::exists(certificatePath) && QFileInfo::exists(certificateKeyPath)) {
++            qDebug(KRDPKCM) << "Certificate generated; ready to accept connections.";
++            Q_EMIT generateCertificateSucceeded();
++        } else {
++            qCritical(KRDPKCM) << "Could not generate a certificate. A valid TLS certificate and key should be provided.";
++            Q_EMIT generateCertificateFailed();
++        }
+ 
+-    m_serverSettings->save();
++        m_serverSettings->save();
++    });
++    connect(m_certificateProcess, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
++        if (error == QProcess::FailedToStart && m_certificateProcess) {
++            // finished() is not emitted when the process never started
++            Q_EMIT m_certificateProcess->finished(-1, QProcess::CrashExit);
++        }
++    });
++    m_certificateProcess->start(u"openssl"_s,
++                                {
++                                    u"req"_s,
++                                    u"-nodes"_s,
++                                    u"-new"_s,
++                                    u"-x509"_s,
++                                    u"-keyout"_s,
++                                    certificateKeyPath,
++                                    u"-out"_s,
++                                    certificatePath,
++                                    u"-days"_s,
++                                    u"3650"_s,
++                                    u"-batch"_s,
++                                });
+ }
+ 
+ void KRDPServerConfig::updateServerStatus()
+diff --git a/src/kcm/kcmkrdpserver.h b/src/kcm/kcmkrdpserver.h
+index 618df2f..ae102b3 100644
+--- a/src/kcm/kcmkrdpserver.h
++++ b/src/kcm/kcmkrdpserver.h
+@@ -14,6 +14,7 @@
+ 
+ class KRDPServerConfigImpl;
+ class QAbstractItemModel;
++class QProcess;
+ 
+ namespace SystemdService
+ {
+@@ -125,7 +126,8 @@ private:
+     UsersModel *m_usersModel;
+     Q_SLOT void servicePropertiesChanged();
+     H264::Support m_h264Support{H264::Unknown};
+-    SystemdService::Status m_currentServerStatus;
++    SystemdService::Status m_currentServerStatus{SystemdService::Unknown};
++    QProcess *m_certificateProcess = nullptr;
+     QString m_lastErrorMessage;
+ 
+     template<typename Output, typename Input>
+diff --git a/src/kcm/ui/Certificates.qml b/src/kcm/ui/Certificates.qml
+new file mode 100644
+index 0000000..08e8284
+--- /dev/null
++++ b/src/kcm/ui/Certificates.qml
+@@ -0,0 +1,168 @@
++// SPDX-FileCopyrightText: 2024 Akseli Lahtinen <akselmo@akselmo.dev>
++//
++// SPDX-License-Identifier: LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL
++
++import QtQuick
++import QtQuick.Controls as QQC2
++import QtQuick.Layouts
++
++import org.kde.kirigami as Kirigami
++import org.kde.kcmutils as KCM
++
++// Sub-page of the Remote Desktop page (kcm.push): the TLS certificate the server uses.
++// These were the "Security Certificates" form in the footer of the main page.
++KCM.SimpleKCM {
++    id: root
++
++    property var settings: kcm.settings()
++
++    readonly property bool showManualCertUI: !autoGenCertSwitch.checked
++
++    title: i18nc("@title", "Certificates")
++
++    // SimpleKCM takes one child item
++    ColumnLayout {
++        Kirigami.InlineMessage {
++            id: certificateError
++            // The same message as on the main page: generation can also be started from here
++            Layout.fillWidth: true
++            type: Kirigami.MessageType.Error
++            visible: false
++            text: i18nc("@info:status", "Generating certificates automatically has failed!")
++        }
++        Connections {
++            target: kcm
++            function onGenerateCertificateSucceeded(): void {
++                certificateError.visible = false;
++            }
++            function onGenerateCertificateFailed(): void {
++                certificateError.visible = true;
++            }
++        }
++
++        Kirigami.FormLayout {
++            Layout.fillWidth: true
++            QQC2.CheckBox {
++                // ksr: kcm_krdpserver/autogenerateCertificates (was "Generate certificates: Automatically")
++                id: autoGenCertSwitch
++
++                Kirigami.FormData.label: i18n("Certificate:")
++                text: i18nc("@option:check", "Generate automatically")
++                checked: root.settings.autogenerateCertificates
++                onCheckedChanged: {
++                    root.settings.autogenerateCertificates = checked;
++                    if (checked) {
++                        kcm.generateCertificate();
++
++                        certPathField.text = kcm.defaultCertificatePath;
++                        certKeyPathField.text = kcm.defaultCertificateKeyPath;
++                    }
++                }
++
++                KCM.SettingStateBinding {
++                    configObject: root.settings
++                    settingName: "autogenerateCertificates"
++                }
++            }
++
++            RowLayout {
++                // ksr: kcm_krdpserver/settings-certificate
++                // ksr: kcm_krdpserver/Choose-certificate-file
++                Kirigami.FormData.label: i18n("Certificate path:")
++                Kirigami.FormData.buddyFor: certPathField
++                visible: root.showManualCertUI
++                spacing: Kirigami.Units.smallSpacing
++
++                Kirigami.ActionTextField {
++                    id: certPathField
++                    placeholderText: i18nc("@info:placeholder", "Enter certificate path…")
++
++                    rightActions: Kirigami.Action {
++                        icon.name: "edit-clear-symbolic"
++                        visible: certPathField.text !== ""
++                        onTriggered: {
++                            certPathField.text = ""
++                        }
++                    }
++
++                    text: root.settings.certificate
++                    onAccepted: root.settings.certificate = text
++
++                    KCM.SettingHighlighter {
++                        highlight: certPathField.text !== kcm.defaultCertificatePath
++                    }
++                }
++
++                QQC2.Button {
++                    icon.name: "folder-open-symbolic"
++                    text: i18nc("@action:button", "Choose certificate file…")
++                    display: QQC2.AbstractButton.IconOnly
++
++                    onClicked: {
++                        certLoader.selectKey = false;
++                        certLoader.active = true;
++                    }
++
++                    QQC2.ToolTip.visible: hovered || activeFocus
++                    QQC2.ToolTip.text: text
++                    QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
++
++                    Accessible.description: i18n("Opens a file picker for the certificate file")
++                    Accessible.onPressAction: onClicked()
++                }
++            }
++
++            RowLayout {
++                // ksr: kcm_krdpserver/settings-certificateKey
++                // ksr: kcm_krdpserver/Choose-certificate-key-file
++                Kirigami.FormData.label: i18n("Certificate key path:")
++                Kirigami.FormData.buddyFor: certKeyPathField
++                visible: root.showManualCertUI
++                spacing: Kirigami.Units.smallSpacing
++
++                Kirigami.ActionTextField {
++                    id: certKeyPathField
++                    placeholderText: i18nc("@info:placeholder", "Enter certificate key path…")
++
++                    rightActions: Kirigami.Action {
++                        icon.name: "edit-clear-symbolic"
++                        visible: certKeyPathField.text !== ""
++                        onTriggered: {
++                            certKeyPathField.text = ""
++                        }
++                    }
++
++                    text: root.settings.certificateKey
++                    onAccepted: root.settings.certificateKey = text
++
++                    KCM.SettingHighlighter {
++                        highlight: certKeyPathField.text !== kcm.defaultCertificateKeyPath
++                    }
++                }
++
++                QQC2.Button {
++                    icon.name: "folder-open-symbolic"
++                    text: i18nc("@action:button", "Choose certificate key file…")
++                    display: QQC2.AbstractButton.IconOnly
++
++                    onClicked: {
++                        certLoader.selectKey = true;
++                        certLoader.active = true;
++                    }
++
++                    QQC2.ToolTip.visible: hovered || activeFocus
++                    QQC2.ToolTip.text: text
++                    QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
++
++                    Accessible.description: i18n("Opens a file picker for the certificate key file")
++                    Accessible.onPressAction: onClicked()
++                }
++            }
++        }
++
++        CertLoader {
++            id: certLoader
++            visible: false
++        }
++    }
++}
+diff --git a/src/kcm/ui/ConnectionSettings.qml b/src/kcm/ui/ConnectionSettings.qml
+new file mode 100644
+index 0000000..2fcfa7b
+--- /dev/null
++++ b/src/kcm/ui/ConnectionSettings.qml
+@@ -0,0 +1,142 @@
++// SPDX-FileCopyrightText: 2024 Akseli Lahtinen <akselmo@akselmo.dev>
++//
++// SPDX-License-Identifier: LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL
++
++import QtQuick
++import QtQuick.Controls as QQC2
++import QtQuick.Layouts
++
++import org.kde.kirigami as Kirigami
++import org.kde.kcmutils as KCM
++
++// Sub-page of the Remote Desktop page (kcm.push): port, operating mode and video quality.
++// These were the "Server Settings" form in the footer of the main page.
++KCM.SimpleKCM {
++    id: root
++
++    property var settings: kcm.settings()
++
++    title: i18nc("@title", "Connection Settings")
++
++    Kirigami.FormLayout {
++        Item {
++            // ksr: kcm_krdpserver/settings-listenPort (section Connection, was Server Settings)
++            Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18nc("@title:group", "Connection")
++        }
++
++        QQC2.SpinBox {
++            id: portField
++            Kirigami.FormData.label: i18n("Listening port:")
++
++            from: 1024
++            to: 65535
++            stepSize: 1
++            validator: IntValidator {
++                bottom: portField.from
++                top: portField.to
++            }
++
++            value: root.settings.listenPort
++            onValueModified: root.settings.listenPort = value
++
++            textFromValue: (value, locale) => {
++                // Commas should not appear in port numbers
++                locale.numberOptions = Locale.OmitGroupSeparator;
++                return Number(value).toLocaleString(locale, 'f', 0);
++            }
++
++            KCM.SettingStateBinding {
++                configObject: root.settings
++                settingName: "listenPort"
++            }
++        }
++
++        QQC2.CheckBox {
++            // ksr: kcm_krdpserver/settings-exclusiveMode (was "Enable exclusive mode")
++            Kirigami.FormData.label: i18n("Operating mode:")
++            text: i18n("Exclusive mode")
++            checked: root.settings.exclusiveMode
++            onToggled: root.settings.exclusiveMode = checked
++
++            KCM.SettingStateBinding {
++                configObject: root.settings
++                settingName: "exclusiveMode"
++            }
++        }
++
++        QQC2.Label {
++            Layout.fillWidth: true
++            Layout.maximumWidth: Kirigami.Units.gridUnit * 16
++            text: i18nc("@info:usagetip", "Displays will be locked, and the remote user will see a virtual screen.")
++            textFormat: Text.PlainText
++            wrapMode: Text.Wrap
++            font: Kirigami.Theme.smallFont
++        }
++
++        Item {
++            // ksr: kcm_krdpserver/settings-quality (section Video quality, was Server Settings)
++            Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18nc("@title:group", "Video quality")
++        }
++
++        ColumnLayout {
++            Kirigami.FormData.label: i18n("Quality:")
++            Kirigami.FormData.buddyFor: qualitySlider
++            spacing: Kirigami.Units.smallSpacing
++
++            QQC2.Slider {
++                id: qualitySlider
++                Layout.fillWidth: true
++
++                from: 50
++                to: 100
++                stepSize: 5
++
++                Kirigami.StyleHints.tickMarkStepSize: stepSize
++                snapMode: QQC2.Slider.SnapAlways
++
++                value: root.settings.quality
++                onMoved: root.settings.quality = value
++
++                KCM.SettingStateBinding {
++                    configObject: root.settings
++                    settingName: "quality"
++                }
++            }
++
++            RowLayout {
++                Layout.maximumWidth: qualitySlider.width
++                Layout.fillWidth: true
++
++                spacing: 0
++
++                QQC2.Label {
++                    Layout.fillWidth: true
++                    text: i18nc("Animation speed", "Responsiveness")
++                    textFormat: Text.PlainText
++                    horizontalAlignment: Text.AlignLeft
++                }
++
++                QQC2.Label {
++                    Layout.fillWidth: true
++                    text: i18nc("Animation speed", "Quality")
++                    textFormat: Text.PlainText
++                    horizontalAlignment: Text.AlignRight
++                }
++            }
++        }
++
++        QQC2.CheckBox {
++            // ksr: kcm_krdpserver/settings-adaptiveQuality (was "Automatically adjust quality for network conditions")
++            text: i18n("Adjust quality automatically for network conditions")
++            checked: root.settings.adaptiveQuality
++            onToggled: root.settings.adaptiveQuality = checked
++
++            KCM.SettingStateBinding {
++                configObject: root.settings
++                settingName: "adaptiveQuality"
++            }
++        }
++    }
++}
+diff --git a/src/kcm/ui/EditUserModal.qml b/src/kcm/ui/EditUserModal.qml
+index 148d705..12f57a1 100644
+--- a/src/kcm/ui/EditUserModal.qml
++++ b/src/kcm/ui/EditUserModal.qml
+@@ -64,6 +64,7 @@ Kirigami.Dialog {
+             id: saveButton
+             icon.name: "document-save"
+             enabled: (editUserModal.usernameChanged || editUserModal.passwordChanged) && (usernameField.text !== "" && passwordField.text !== "") && !editUserModal.usernameAlreadyExistsError
++            // ksr: kcm_krdpserver/Save (unchanged)
+             text: i18nc("@label:button", "Save")
+             QQC2.DialogButtonBox.buttonRole: QQC2.DialogButtonBox.AcceptRole
+         }
+@@ -89,6 +90,8 @@ Kirigami.Dialog {
+             visible: editUserModal.usernameAlreadyExistsError
+         }
+ 
++        // ksr: kcm_krdpserver/x (password, stored in KWallet; unchanged)
++        // ksr: kcm_krdpserver/cfg-General-Users (unchanged: the user list is still the General/Users key)
+         Kirigami.PasswordField {
+             id: passwordField
+             Kirigami.FormData.label: i18nc("@label:textbox", "Password:")
+diff --git a/src/kcm/ui/UserListView.qml b/src/kcm/ui/UserListView.qml
+index 02439bb..57e9c25 100644
+--- a/src/kcm/ui/UserListView.qml
++++ b/src/kcm/ui/UserListView.qml
+@@ -22,6 +22,7 @@ ListView {
+         actions: [
+             Kirigami.Action {
+                 icon.name: "list-add-symbolic"
++                // ksr: kcm_krdpserver/AddUser (unchanged)
+                 text: i18nc("@action:button", "Add New…")
+                 Accessible.name: i18nc("@action:button", "Add New User Account…")
+                 onTriggered: source => {
+@@ -101,6 +102,7 @@ ListView {
+                     actions: [
+                         Kirigami.Action {
+                             icon.name: "edit-entry-symbolic"
++                            // ksr: kcm_krdpserver/ModifyUser (unchanged)
+                             text: i18nc("@action:button", "Modify user…")
+                             onTriggered: {
+                                 itemDelegate.click();
+@@ -109,6 +111,7 @@ ListView {
+                         },
+                         Kirigami.Action {
+                             icon.name: "edit-delete-remove-symbolic"
++                            // ksr: kcm_krdpserver/RemoveUser (unchanged)
+                             text: i18nc("@action:button", "Remove user…")
+                             onTriggered: {
+                                 root.deleteUser(model.userName);
+diff --git a/src/kcm/ui/main.qml b/src/kcm/ui/main.qml
+index 6d98c50..cb6176a 100644
+--- a/src/kcm/ui/main.qml
++++ b/src/kcm/ui/main.qml
+@@ -19,6 +19,9 @@ KCM.ScrollViewKCM {
+     // and last run ended in an error, to avoid confusing users.
+     property bool kcmJustOpened: true
+ 
++    // Set from the asynchronous systemd ActiveState reply (kcm.updateServerStatus()); false until it arrives
++    property bool serverRunning: false
++
+     EditUserModal {
+         id: editUserModal
+         parent: root
+@@ -53,8 +56,8 @@ KCM.ScrollViewKCM {
+             keychainErrorDialog.open();
+         }
+         function onServerStatusChanged() : void {
+-            toggleServerSwitch.checked = kcm.isServerRunning();
+-            addressScrollView.visible = kcm.isServerRunning();
++            root.serverRunning = kcm.isServerRunning();
++            toggleServerSwitch.checked = root.serverRunning;
+         }
+     }
+ 
+@@ -91,6 +94,18 @@ KCM.ScrollViewKCM {
+             displayComponent: QQC2.Switch {
+                 action: toggleServerSwitch
+             }
++        },
++        Kirigami.Action {
++            icon.name: "configure"
++            text: i18nc("@action:button", "Connection Settings…")
++            displayHint: Kirigami.DisplayHint.KeepVisible
++            onTriggered: kcm.push("ConnectionSettings.qml")
++        },
++        Kirigami.Action {
++            icon.name: "application-certificate"
++            text: i18nc("@action:button", "Certificates…")
++            displayHint: Kirigami.DisplayHint.KeepVisible
++            onTriggered: kcm.push("Certificates.qml")
+         }
+     ]
+ 
+@@ -139,17 +154,27 @@ KCM.ScrollViewKCM {
+             spacing: headerLayout.spacings
+             Layout.margins: headerLayout.spacings
+ 
++            // ksr: kcm_krdpserver/EnableServer (state line next to the toolbar switch)
++            QQC2.Label {
++                text: root.serverRunning ? i18nc("@info:status", "Remote desktop is on") : i18nc("@info:status", "Remote desktop is off")
++                font.bold: true
++                Layout.fillWidth: true
++                wrapMode: Text.WordWrap
++                Layout.alignment: Qt.AlignHCenter
++            }
++
+             QQC2.Label {
+                 text: i18n("Users listed below can log into this device remotely using apps that support the “RDP” protocol.")
+                 Layout.fillWidth: true
+                 wrapMode: Text.WordWrap
+                 verticalAlignment: Text.AlignVCenter
+                 Layout.alignment: Qt.AlignHCenter
+-                visible: !toggleServerSwitch.checked
++                visible: !root.serverRunning
+             }
+ 
++            // ksr: kcm_krdpserver/Hostname (addresses are listed only while the server runs)
+             QQC2.Label {
+-                visible: toggleServerSwitch.checked
++                visible: root.serverRunning
+                 text: i18nc("@info:usagetip", "Connect to this device at any of the following addresses:")
+                 Layout.fillWidth: true
+                 wrapMode: Text.WordWrap
+@@ -160,7 +185,7 @@ KCM.ScrollViewKCM {
+             QQC2.ScrollView {
+                 id: addressScrollView
+                 implicitHeight: Math.min(contentHeight, Kirigami.Units.gridUnit * 4)
+-                visible: false
++                visible: root.serverRunning
+                 Layout.fillWidth: true
+                 Layout.leftMargin: Kirigami.Units.gridUnit
+                 Flow {
+@@ -170,7 +195,8 @@ KCM.ScrollViewKCM {
+ 
+                     Repeater {
+                         id: addressesRepeater
+-                        model: kcm.listenAddressList()
++                        // ksr: enumerating the network interfaces now waits until the addresses are shown (server running)
++                        model: root.serverRunning ? kcm.listenAddressList() : []
+ 
+                         RowLayout {
+                             spacing: Kirigami.Units.smallSpacing
+@@ -199,302 +225,25 @@ KCM.ScrollViewKCM {
+                     }
+                 }
+             }
+-        }
+-    }
+-
+-    // The form is in the list's own footer, not KCM.ScrollViewKCM's fixed page footer,
+-    // so it scrolls with the list instead of overflowing past a short window's height.
+-    view: UserListView {
+-        id: userListView
+-
+-        footerPositioning: ListView.InlineFooter
+-        footer: Item {
+-            height: settingsFooter.height
+-        }
+-
+-        // Due to strange behaviour with PullBackFooter, ListView's positioning and originY with the header,
+-        // we have ListView reserve scrolling room for the footer and position it manually with the following
+-        // horribly-derived expression for bottomMargin
+-        QQC2.ToolBar {
+-            id: settingsFooter
+-            anchors.bottom: parent.bottom
+-            anchors.bottomMargin: userListView.contentY - userListView.originY + Math.min(0, userListView.height - userListView.contentHeight)
+-
+-            width: userListView.width
+-
+-            position: QQC2.ToolBar.Footer
+-
+-            contentItem: Kirigami.Form {
+-                id: settingsLayout
+-
+-                readonly property bool showAdvancedCertUI: !autoGenCertSwitch.checked
+-
+-                Kirigami.FormGroup {
+-                    title: i18nc("@title:group", "Server Settings")
+-
+-                    Kirigami.FormEntry {
+-                        title: i18nc("part of a sentence: 'Start server [automatically on login]'", "Start server:")
+-                        visible: kcm.managementAvailable
+-
+-                        contentItem: QQC2.CheckBox {
+-                            text: i18nc("part of a sentence: 'Start server automatically on login'", "Automatically on login")
+-                            checked: settings.autostart
+-                            onToggled: settings.autostart = checked
+-
+-                            KCM.SettingStateBinding {
+-                                configObject: settings
+-                                settingName: "autostart"
+-                            }
+-                        }
+-                    }
+-
+-                    Kirigami.FormEntry {
+-                        title: i18n("Listening port:")
+-
+-                        contentItem: QQC2.SpinBox {
+-                            id: portField
+-
+-                            from: 1024
+-                            to: 65535
+-                            stepSize: 1
+-                            validator: IntValidator {
+-                                bottom: portField.from
+-                                top: portField.to
+-                            }
+-
+-                            value: settings.listenPort
+-                            onValueModified: settings.listenPort = value
+-
+-                            textFromValue: (value, locale) => {
+-                                // Commas should not appear in port numbers
+-                                locale.numberOptions = Locale.OmitGroupSeparator;
+-                                return Number(value).toLocaleString(locale, 'f', 0);
+-                            }
+-
+-                            KCM.SettingStateBinding {
+-                                configObject: settings
+-                                settingName: "listenPort"
+-                            }
+-                        }
+-                    }
+-
+-                    Kirigami.FormSeparator {}
+-
+-                    Kirigami.FormEntry {
+-                        title: i18n("Operating mode:")
+-                        subtitle: i18nc("@info:usagetip", "Displays will be locked, and the remote user will see a virtual screen.")
+-
+-                        contentItem: QQC2.CheckBox {
+-                            text: i18n("Enable exclusive mode")
+-                            checked: settings.exclusiveMode
+-                            onToggled: settings.exclusiveMode = checked
+-
+-                            KCM.SettingStateBinding {
+-                                configObject: settings
+-                                settingName: "exclusiveMode"
+-                            }
+-                        }
+-                    }
+-
+-                    Kirigami.FormSeparator {}
+-
+-                    Kirigami.FormEntry {
+-                        title: i18n("Quality:")
+-
+-                        contentItem: ColumnLayout {
+-                            Kirigami.FormData.buddyFor: qualitySlider
+-
+-                            spacing: Kirigami.Units.smallSpacing
+-
+-                            QQC2.Slider {
+-                                id: qualitySlider
+-                                Layout.fillWidth: true
+-
+-                                from: 50
+-                                to: 100
+-                                stepSize: 5
+-
+-                                Kirigami.StyleHints.tickMarkStepSize: stepSize
+-                                snapMode: QQC2.Slider.SnapAlways
+-
+-                                value: settings.quality
+-                                onMoved: settings.quality = value
+-
+-                                KCM.SettingStateBinding {
+-                                    configObject: settings
+-                                    settingName: "quality"
+-                                }
+-                            }
+-
+-                            RowLayout {
+-                                Layout.maximumWidth: qualitySlider.width
+-                                Layout.fillWidth: true
+-                                Layout.bottomMargin: qualitySlider.Layout.topMargin
+-
+-                                spacing: 0
+-
+-                                QQC2.Label {
+-                                    Layout.fillWidth: true
+-                                    text: i18nc("Animation speed", "Responsiveness")
+-                                    textFormat: Text.PlainText
+-                                    horizontalAlignment: Text.AlignLeft
+-                                }
+-
+-                                QQC2.Label {
+-                                    Layout.fillWidth: true
+-                                    text: i18nc("Animation speed", "Quality")
+-                                    textFormat: Text.PlainText
+-                                    horizontalAlignment: Text.AlignRight
+-                                }
+-                            }
+-                        }
+-                    }
+-
+-                    Kirigami.FormEntry {
+-                        contentItem: QQC2.CheckBox {
+-                            text: i18n("Automatically adjust quality for network conditions")
+-                            checked: settings.adaptiveQuality
+-                            onToggled: settings.adaptiveQuality = checked
+-
+-                            KCM.SettingStateBinding {
+-                                configObject: settings
+-                                settingName: "adaptiveQuality"
+-                            }
+-                        }
+-                    }
+-                }
+-
+-                Kirigami.FormGroup {
+-                    title: i18nc("@title:group", "Security Certificates")
+-
+-                    Kirigami.FormEntry {
+-                        title: i18nc("part of a sentence: 'Generate certificates [automatically]'", "Generate certificates:")
+-
+-                        contentItem: QQC2.CheckBox {
+-                            id: autoGenCertSwitch
+-
+-                            text: i18nc("part of a sentence: '[Generate certificates] automatically'", "Automatically")
+-                            checked: settings.autogenerateCertificates
+-                            onCheckedChanged: {
+-                                settings.autogenerateCertificates = checked;
+-                                if (checked) {
+-                                    kcm.generateCertificate();
+-
+-                                    certPathField.text = kcm.defaultCertificatePath;
+-                                    certKeyPathField.text = kcm.defaultCertificateKeyPath;
+-                                }
+-                            }
+-
+-                            KCM.SettingStateBinding {
+-                                configObject: settings
+-                                settingName: "autogenerateCertificates"
+-                            }
+-                        }
+-                    }
+-
+-                    Kirigami.FormEntry {
+-                        title: i18n("Certificate path:")
+-                        visible: settingsLayout.showAdvancedCertUI
+-
+-                        contentItem: RowLayout {
+-                            Kirigami.FormData.buddyFor: certPathField
+-
+-                            spacing: Kirigami.Units.smallSpacing
+-
+-                            Kirigami.ActionTextField {
+-                                id: certPathField
+-                                placeholderText: i18nc("@info:placeholder", "Enter certificate path…")
+-
+-                                rightActions: Kirigami.Action {
+-                                    icon.name: "edit-clear-symbolic"
+-                                    visible: certPathField.text !== ""
+-                                    onTriggered: {
+-                                        certPathField.text = ""
+-                                    }
+-                                }
+-
+-                                text: settings.certificate
+-                                onAccepted: settings.certificate = text
+-
+-                                KCM.SettingHighlighter {
+-                                    highlight: certPathField.text !== kcm.defaultCertificatePath
+-                                }
+-                            }
+-
+-                            QQC2.Button {
+-                                icon.name: "folder-open-symbolic"
+-                                text: i18nc("@action:button", "Choose certificate file…")
+-                                display: QQC2.AbstractButton.IconOnly
+-
+-                                onClicked: {
+-                                    certLoader.selectKey = false;
+-                                    certLoader.active = true;
+-                                }
+-
+-                                QQC2.ToolTip.visible: hovered || activeFocus
+-                                QQC2.ToolTip.text: text
+-                                QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
+-
+-                                Accessible.description: i18n("Opens a file picker for the certificate file")
+-                                Accessible.onPressAction: onClicked()
+-                            }
+-                        }
+-                    }
+-
+-                    Kirigami.FormEntry {
+-                        title: i18n("Certificate key path:")
+-                        visible: settingsLayout.showAdvancedCertUI
+-
+-                        contentItem: RowLayout {
+-                            Kirigami.FormData.buddyFor: certKeyPathField
+-
+-                            spacing: Kirigami.Units.smallSpacing
+-
+-                            Kirigami.ActionTextField {
+-                                id: certKeyPathField
+-                                placeholderText: i18nc("@info:placeholder", "Enter certificate key path…")
+-
+-                                rightActions: Kirigami.Action {
+-                                    icon.name: "edit-clear-symbolic"
+-                                    visible: certKeyPathField.text !== ""
+-                                    onTriggered: {
+-                                        certKeyPathField.text = ""
+-                                    }
+-                                }
+-
+-                                text: settings.certificateKey
+-                                onAccepted: settings.certificateKey = text
+-
+-                                KCM.SettingHighlighter {
+-                                    highlight: certKeyPathField.text !== kcm.defaultCertificateKeyPath
+-                                }
+-                            }
+-
+-                            QQC2.Button {
+-                                icon.name: "folder-open-symbolic"
+-                                text: i18nc("@action:button", "Choose certificate key file…")
+-                                display: QQC2.AbstractButton.IconOnly
+ 
+-                                onClicked: {
+-                                    certLoader.selectKey = true;
+-                                    certLoader.active = true;
+-                                }
++            QQC2.CheckBox {
++                // ksr: kcm_krdpserver/settings-autostart (was "Start server: Automatically on login")
++                visible: kcm.managementAvailable
++                text: i18nc("@option:check", "Start automatically on login")
++                checked: root.settings.autostart
++                onToggled: root.settings.autostart = checked
+ 
+-                                QQC2.ToolTip.visible: hovered || activeFocus
+-                                QQC2.ToolTip.text: text
+-                                QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
+-
+-                                Accessible.description: i18n("Opens a file picker for the certificate key file")
+-                                Accessible.onPressAction: onClicked()
+-                            }
+-                        }
+-                    }
++                KCM.SettingStateBinding {
++                    configObject: root.settings
++                    settingName: "autostart"
+                 }
+             }
+         }
+     }
+ 
+-    CertLoader {
+-        id: certLoader
++    // ksr: the "Server Settings" and "Security Certificates" forms that used to sit in the list's footer moved to the
++    // sub-pages ConnectionSettings.qml and Certificates.qml (toolbar buttons), so the page opens on state + users.
++    view: UserListView {
++        id: userListView
+     }
+ }
+diff --git a/src/kcm/ui/main_phone.qml b/src/kcm/ui/main_phone.qml
+index 3f32883..2c5e909 100644
+--- a/src/kcm/ui/main_phone.qml
++++ b/src/kcm/ui/main_phone.qml
+@@ -103,6 +103,7 @@ FormCard.FormCardPage {
+             }
+             FormCard.FormSwitchDelegate {
+                 id: enableServer
++                // ksr: kcm_krdpserver/EnableServerPhone (unchanged)
+                 text: i18nc("@option:check", "Enable RDP Server")
+                 checked: settings.autostart
+                 onCheckedChanged: {

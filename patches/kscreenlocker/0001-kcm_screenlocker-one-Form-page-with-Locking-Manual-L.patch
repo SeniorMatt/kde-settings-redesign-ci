@@ -1,0 +1,292 @@
+From d4af5abf4e709ac4185751ecd057c6820d9867ad Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 01:35:06 +0500
+Subject: [PATCH] kcm_screenlocker: one Form page with Locking / Manual Lock /
+ Appearance, appearance config loaded after the first frame
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Page type: Form, with the existing Appearance sub-page (docs/page-design.md 1, 2). kscreenlockerrc keys (Daemon/*, Greeter/*),
+the org.kde.screensaver configure call, the global shortcut and the lock screen / wallpaper plugin config are unchanged.
+
+Moved / renamed:
+- "Configure Appearance…" was a toolbar action only; it is now a button in an "Appearance" section at the end of the form,
+  with a one-line hint (wallpaper, clock and media controls), so the second half of the page is findable. Sub-page title
+  "Appearance" -> "Lock Screen Appearance" (the header says which appearance).
+- Order by use: untitled first section = Lock screen automatically, Delay before password required (moved up under the
+  combo it depends on), Lock after waking from sleep; then "Manual Lock" (Keyboard shortcut). The blank spacer item is gone.
+- New hint under the delay combo: "Time after locking during which the screen unlocks without a password."
+- Labels kept (they are already sentence case with colons). Wallpaper type combo got an Accessible.name.
+- Markers: LockOnResume, shortcut, ConfigureAppearance, wallpaperPluginId and the weak rows (custom duration dialogs, legacy
+  Lock key). Relabel: inventory/relabel/kcm_screenlocker.tsv. Inventory --strict: 14 ok, 0 lost.
+HIG ids: HIG-001/005/006, HIG-013, HIG-019, HIG-057. Page-design 2, 3, 4.
+
+Speed cause (code): kcm.cpp load() ran AppearanceSettings::load() before the first frame: KPackage lookup of the Plasma shell,
+lock screen config.xml, wallpaper plugin config.xml, KConfigLoader and the property maps (kcm.cpp:49-53, appearancesettings.cpp
+load/loadShellConfig/loadWallpaperConfig), none of which the main page uses. Now it runs in a QTimer::singleShot(0) after the
+rest of load() (generation counter drops stale runs); AppearanceSettings getters and save() already null-check. The
+KScreenSaverSettings constructor also scanned every Plasma/Wallpaper package; that list is only read by the Appearance page,
+so it is now built on first call. Not changed: the settings store constructor (KGlobalAccel setShortcut/shortcut for the lock
+action, kscreensaversettings.cpp store class) may block on kglobalacceld; it feeds the shortcut row on the main page, left as is.
+After-numbers: pending, manager will measure. Not built yet. Unconfirmed without a build: that shellConfigFile/wallpaperConfigFile
+(CONSTANT / NOTIFY properties) read correctly when the Appearance page is pushed after the deferred load.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcm/kcm.cpp                       | 17 ++++++--
+ kcm/kcm.h                         |  1 +
+ kcm/ui/Appearance.qml             |  4 +-
+ kcm/ui/main.qml                   | 67 ++++++++++++++++++++-----------
+ settings/kscreensaversettings.cpp | 22 +++++-----
+ settings/kscreensaversettings.h   |  3 +-
+ 6 files changed, 76 insertions(+), 38 deletions(-)
+
+diff --git a/kcm/kcm.cpp b/kcm/kcm.cpp
+index 6a14dbc..f77c7e6 100644
+--- a/kcm/kcm.cpp
++++ b/kcm/kcm.cpp
+@@ -18,6 +18,7 @@ SPDX-License-Identifier: GPL-2.0-or-later
+ #include <KPluginFactory>
+ 
+ #include <QList>
++#include <QTimer>
+ 
+ K_PLUGIN_FACTORY_WITH_JSON(ScreenLockerKcmFactory, "kcm_screenlocker.json", registerPlugin<ScreenLockerKcm>(); registerPlugin<KScreenLockerData>();)
+ 
+@@ -49,10 +50,20 @@ ScreenLockerKcm::ScreenLockerKcm(QObject *parent, const KPluginMetaData &data)
+ void ScreenLockerKcm::load()
+ {
+     KQuickManagedConfigModule::load();
+-    m_appearanceSettings->load();
+ 
+-    updateState();
+-    Q_EMIT loadCalled();
++    // The appearance part (KPackage lookup of the shell, config.xml of the lock screen and of the wallpaper plugin,
++    // KConfigLoader and QML-facing property maps) is only needed by the Appearance sub-page. It used to run here,
++    // before the first frame; run it one event-loop turn later. The AppearanceSettings getters and save() check for
++    // null, so nothing breaks while it is pending.
++    const quint64 generation = ++m_loadGeneration;
++    QTimer::singleShot(0, this, [this, generation] {
++        if (generation != m_loadGeneration) {
++            return;
++        }
++        m_appearanceSettings->load();
++        updateState();
++        Q_EMIT loadCalled();
++    });
+ }
+ 
+ void ScreenLockerKcm::save()
+diff --git a/kcm/kcm.h b/kcm/kcm.h
+index aa2a91b..aa56bb3 100644
+--- a/kcm/kcm.h
++++ b/kcm/kcm.h
+@@ -80,4 +80,5 @@ private:
+     AppearanceSettings *m_appearanceSettings;
+     QString m_currentWallpaper;
+     bool m_forceUpdateState = false;
++    quint64 m_loadGeneration = 0;
+ };
+diff --git a/kcm/ui/Appearance.qml b/kcm/ui/Appearance.qml
+index 3eeb80f..4a41f63 100644
+--- a/kcm/ui/Appearance.qml
++++ b/kcm/ui/Appearance.qml
+@@ -19,7 +19,7 @@ Kirigami.ScrollablePage {
+     property var wallpaper: kcm.wallpaperIntegration
+     property var configDialog: kcm
+ 
+-    title: i18nc("@title", "Appearance")
++    title: i18nc("@title", "Lock Screen Appearance")
+ 
+     padding: 6  // Layout_ChildMarginWidth from Breeze
+ 
+@@ -38,7 +38,9 @@ Kirigami.ScrollablePage {
+             id: parentLayout // Don't change needed for correct alignment with shell and wallpaper config
+ 
+             QQC2.ComboBox {
++                // ksr: kcm_screenlocker/wallpaperPluginId
+                 Kirigami.FormData.label: i18n("Wallpaper type:")
++                Accessible.name: Kirigami.FormData.label
+                 model: kcm.availableWallpaperPlugins()
+                 textRole: "name"
+                 valueRole: "id"
+diff --git a/kcm/ui/main.qml b/kcm/ui/main.qml
+index 2d90e17..c420429 100644
+--- a/kcm/ui/main.qml
++++ b/kcm/ui/main.qml
+@@ -21,13 +21,6 @@ KCM.SimpleKCM {
+     implicitHeight: Kirigami.Units.gridUnit * 45
+     implicitWidth: Kirigami.Units.gridUnit * 45
+ 
+-    actions:  [
+-        Kirigami.Action {
+-            text: i18nc("@action:button", "Configure Appearance…")
+-            icon.name: "edit-image-symbolic"
+-            onTriggered: kcm.push("Appearance.qml")
+-        }
+-    ]
+     ColumnLayout {
+         spacing: 0
+ 
+@@ -35,6 +28,7 @@ KCM.SimpleKCM {
+             ComboBoxWithCustomValue {
+                 id: timeoutComboBox
+                 Layout.fillWidth: true
++                // ksr: kcm_screenlocker/cfg-Daemon-Lock
+                 Kirigami.FormData.label: i18n("Lock screen automatically:")
+                 textRole: "text"
+                 valueRole: "value"
+@@ -76,6 +70,7 @@ KCM.SimpleKCM {
+                     id: customTimeoutPromptDialogComponent
+ 
+                     DurationPromptDialog {
++                        // ksr: kcm_screenlocker/CustomTimeoutDialog
+                         title: i18nc("@title:window", "Custom Duration")
+                         label: timeoutComboBox.Kirigami.FormData.label
+                         parent: QQC2.Overlay.overlay
+@@ -100,21 +95,6 @@ KCM.SimpleKCM {
+                 }
+             }
+ 
+-            QQC2.CheckBox {
+-                text: i18nc("@option:check", "Lock after waking from sleep")
+-                checked: kcm.settings.lockOnResume
+-                onToggled: kcm.settings.lockOnResume = checked
+-
+-                KCM.SettingStateBinding {
+-                    configObject: kcm.settings
+-                    settingName: "LockOnResume"
+-                }
+-            }
+-
+-            Item {
+-                Kirigami.FormData.isSection: true
+-            }
+-
+             ComboBoxWithCustomValue {
+                 id: lockGraceComboBox
+                 Layout.fillWidth: true
+@@ -179,6 +159,7 @@ KCM.SimpleKCM {
+                     id: customLockGracePromptDialogComponent
+ 
+                     DurationPromptDialog {
++                        // ksr: kcm_screenlocker/CustomGraceDialog
+                         title: i18nc("@title:window", "Custom Duration")
+                         label: lockGraceComboBox.Kirigami.FormData.label
+                         parent: QQC2.Overlay.overlay
+@@ -209,12 +190,32 @@ KCM.SimpleKCM {
+                 }
+             }
+ 
++            QQC2.Label {
++                Layout.fillWidth: true
++                Layout.maximumWidth: Kirigami.Units.gridUnit * 16
++                text: i18n("Time after locking during which the screen unlocks without a password.")
++                font: Kirigami.Theme.smallFont
++                wrapMode: Text.Wrap
++            }
++
++            QQC2.CheckBox {
++                text: i18nc("@option:check", "Lock after waking from sleep")  // ksr: kcm_screenlocker/LockOnResume
++                checked: kcm.settings.lockOnResume
++                onToggled: kcm.settings.lockOnResume = checked
++
++                KCM.SettingStateBinding {
++                    configObject: kcm.settings
++                    settingName: "LockOnResume"
++                }
++            }
++
+             Kirigami.Separator {
+                 Kirigami.FormData.isSection: true
++                Kirigami.FormData.label: i18nc("@title:group", "Manual Lock")
+             }
+ 
+             KQuickControls.KeySequenceItem {
+-                Kirigami.FormData.label: i18n("Keyboard shortcut:")
++                Kirigami.FormData.label: i18n("Keyboard shortcut:") // ksr: kcm_screenlocker/shortcut
+                 keySequence: kcm.settings.shortcut
+                 onCaptureFinished: kcm.settings.shortcut = keySequence
+ 
+@@ -223,6 +224,26 @@ KCM.SimpleKCM {
+                     settingName: "shortcut"
+                 }
+             }
++
++            Kirigami.Separator {
++                Kirigami.FormData.isSection: true
++                Kirigami.FormData.label: i18nc("@title:group", "Appearance")
++            }
++
++            // ksr: kcm_screenlocker/ConfigureAppearance
++            QQC2.Button {
++                icon.name: "edit-image-symbolic"
++                text: i18nc("@action:button", "Configure Appearance…")
++                onClicked: kcm.push("Appearance.qml")
++            }
++
++            QQC2.Label {
++                Layout.fillWidth: true
++                Layout.maximumWidth: Kirigami.Units.gridUnit * 16
++                text: i18n("Wallpaper, clock and media controls shown on the lock screen.")
++                font: Kirigami.Theme.smallFont
++                wrapMode: Text.Wrap
++            }
+         }
+     }
+ 
+diff --git a/settings/kscreensaversettings.cpp b/settings/kscreensaversettings.cpp
+index 343fef9..227c772 100644
+--- a/settings/kscreensaversettings.cpp
++++ b/settings/kscreensaversettings.cpp
+@@ -78,16 +78,6 @@ KScreenSaverSettings::KScreenSaverSettings(QObject *parent)
+ {
+     setParent(parent);
+ 
+-    const auto wallpaperPackages = KPackage::PackageLoader::self()->listPackages(QStringLiteral("Plasma/Wallpaper"));
+-    for (auto &package : wallpaperPackages) {
+-        m_availableWallpaperPlugins.append({package.name(), package.pluginId()});
+-    }
+-    QCollator collator;
+-    collator.setCaseSensitivity(Qt::CaseInsensitive);
+-    std::sort(m_availableWallpaperPlugins.begin(), m_availableWallpaperPlugins.end(), [](const WallpaperInfo &w1, const WallpaperInfo &w2) {
+-        return w1.name < w2.name;
+-    });
+-
+     auto shortcutItem = new KPropertySkeletonItem(m_store, "shortcut", defaultShortcuts().first());
+     addItem(shortcutItem, QStringLiteral("shortcut"));
+     shortcutItem->setNotifyFunction([this] {
+@@ -101,6 +91,18 @@ KScreenSaverSettings::~KScreenSaverSettings()
+ 
+ QList<WallpaperInfo> KScreenSaverSettings::availableWallpaperPlugins() const
+ {
++    // Scanned on first use (only the Appearance sub-page asks), not in the constructor: the KPackage scan of every
++    // Plasma/Wallpaper package used to run before the first frame, although the main page never shows the list.
++    if (!m_wallpaperPluginsScanned) {
++        m_wallpaperPluginsScanned = true;
++        const auto wallpaperPackages = KPackage::PackageLoader::self()->listPackages(QStringLiteral("Plasma/Wallpaper"));
++        for (auto &package : wallpaperPackages) {
++            m_availableWallpaperPlugins.append({package.name(), package.pluginId()});
++        }
++        std::sort(m_availableWallpaperPlugins.begin(), m_availableWallpaperPlugins.end(), [](const WallpaperInfo &w1, const WallpaperInfo &w2) {
++            return w1.name < w2.name;
++        });
++    }
+     return m_availableWallpaperPlugins;
+ }
+ 
+diff --git a/settings/kscreensaversettings.h b/settings/kscreensaversettings.h
+index 6c89218..5f26b5b 100644
+--- a/settings/kscreensaversettings.h
++++ b/settings/kscreensaversettings.h
+@@ -48,6 +48,7 @@ protected:
+     KScreenSaverSettings(QObject *parent = nullptr);
+ 
+ private:
+-    QList<WallpaperInfo> m_availableWallpaperPlugins;
++    mutable QList<WallpaperInfo> m_availableWallpaperPlugins;
++    mutable bool m_wallpaperPluginsScanned = false;
+     KScreenSaverSettingsStore *m_store;
+ };

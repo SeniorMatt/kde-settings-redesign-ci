@@ -1,0 +1,55 @@
+From 657d96e44210c88b55ef2b36c3e216889230a6f8 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 08:21:46 +0500
+Subject: [PATCH 23/34] bench: search screenshot (KSR_SEARCH)
+
+---
+ app/SidebarMode.cpp        | 22 ++++++++++++++++++++++
+ app/qml/CategoriesPage.qml |  1 +
+ 2 files changed, 23 insertions(+)
+
+diff --git a/app/SidebarMode.cpp b/app/SidebarMode.cpp
+index e46ccc9..f612722 100644
+--- a/app/SidebarMode.cpp
++++ b/app/SidebarMode.cpp
+@@ -184,6 +184,28 @@ SidebarMode::SidebarMode(QObject *parent,
+     qmlRegisterAnonymousType<QAbstractItemModel>("", 1);
+     initEvent();
+     connect(moduleView(), &ModuleView::moduleChanged, this, &SidebarMode::viewChanged);
++    if (qEnvironmentVariableIsSet("KSR_SEARCH")) {
++        // measurement-only: type a search, optionally open the first result (KSR_SEARCH_OPEN), save a picture
++        QTimer::singleShot(4000, this, [this] {
++            auto *field = d->quickWidget->rootObject()->findChild<QObject *>(QStringLiteral("searchField"));
++            if (field) {
++                field->setProperty("text", qEnvironmentVariable("KSR_SEARCH"));
++            }
++            QTimer::singleShot(1500, this, [this] {
++                const QString dir = qEnvironmentVariable("KSR_SHOT_DIR", QStringLiteral("/tmp"));
++                d->mainWidget->window()->grab().save(dir + QStringLiteral("/search.png"));
++                if (qEnvironmentVariableIsSet("KSR_SEARCH_OPEN")) {
++                    loadModule(d->searchModel->index(0, 0));
++                    QTimer::singleShot(1500, this, [this, dir] {
++                        d->mainWidget->window()->grab().save(dir + QStringLiteral("/search-opened.png"));
++                        QCoreApplication::quit();
++                    });
++                } else {
++                    QCoreApplication::quit();
++                }
++            });
++        });
++    }
+     if (qEnvironmentVariableIsSet("KSR_BENCH")) {
+         QTimer::singleShot(0, this, &SidebarMode::ksrBench);
+     }
+diff --git a/app/qml/CategoriesPage.qml b/app/qml/CategoriesPage.qml
+index 8d07eb9..be8cc85 100644
+--- a/app/qml/CategoriesPage.qml
++++ b/app/qml/CategoriesPage.qml
+@@ -50,6 +50,7 @@ Kirigami.ScrollablePage {
+ 
+             Kirigami.SearchField {
+                 id: searchField
++                objectName: "searchField"
+ 
+                 focus: !Kirigami.InputMethod.willShowOnActive
+                 Layout.fillWidth: true

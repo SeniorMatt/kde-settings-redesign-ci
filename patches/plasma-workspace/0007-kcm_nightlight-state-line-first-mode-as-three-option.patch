@@ -1,0 +1,587 @@
+From a26f505e7094de01d6ec422b5cdef721c0410c6e Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 14:11:06 +0500
+Subject: [PATCH 07/24] kcm_nightlight: state line first, mode as three
+ options, schedule and preview built after the first frame
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Page type: Form (docs/page-design.md). kwinrc keys (Active, Mode, DayTemperature, NightTemperature), the org.kde.KWin.NightLight
+D-Bus calls (preview, stopPreview, activate/deactivate*), KCMLauncher use and the colour-ramp code are unchanged.
+NOT BUILT YET (owner stopped heavy work); checked statically only.
+
+Moved / renamed:
+- New first line (state): "Night Light is off." / "is always on." / "is on until 07:00." / "turns on at 19:30." (bold, centred;
+  night is when the next transition is the morning one; computed from DayNightTimings). The temporary on/off
+  InlineMessage keeps its place under it, then the day/night timeline preview.
+- The "Switching times:" combo box (Always off / Always on / Sunrise and sunset) is now the Form option group
+  "Night Light:" with radio buttons Off / Always on / At sunset, until sunrise (three short exclusive options, section 3).
+  Same writes as before (Mode first, then Active). The old sentence "The blue light filter makes the colors on the screen
+  warmer." is the small help under the options instead of a centred paragraph at the top.
+- The icon-only "Configure…" button (tooltip only) is now the labelled link "Day-Night Cycle…" (openSystemSettings
+  "kcm_nighttime"), still disabled unless the mode is the sunrise/sunset one (ia/duplicates.md: Night Light vs Day-Night).
+- Section "Temperature" (noun) holds the two sliders ("Day light temperature:", "Night light temperature:"), same keys.
+  Page is KCM.SimpleKCM + Kirigami.FormLayout (was Kirigami.Form/FormGroup/FormEntry).
+- Relabel table: inventory/relabel/kcm_nightlight.tsv (outer repo). Inventory --strict: 17 rows ok, 0 lost.
+- HIG ids: HIG-001, HIG-005, HIG-006, HIG-057; page-design sections 2, 3, 7.
+
+Speed (cause found in code, not measured):
+- DayNightView (25 axis labels, three icon delegates, a 50-line colour table) and a DayNightTimings (which makes a
+  KDarkLightScheduleProvider) were created with the page, inside the form. Now both sit in Loaders that become active one
+  event-loop turn after the first frame (the preview Loader is asynchronous); the page height of the preview is reserved.
+- DayNightView's "now" marker Timer had interval 60 (ms), repeating forever: a wake-up every 60 ms for a marker that moves
+  one pixel every few minutes. Now 60000 ms (triggeredOnStart keeps the first position).
+- After numbers: pending, manager will measure.
+
+Not built yet; uncertain: Loader.item of a non-Item sourceComponent (DayNightTimings) used as a QObject; DayNightView
+properties set from a Component under `pragma ComponentBehavior: Bound`; KDarkLightScheduleProvider's own blocking cost (its
+source is outside plasma-workspace, not read).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/nightlight/ui/DayNightView.qml |   2 +-
+ kcms/nightlight/ui/main.qml         | 473 ++++++++++++++++------------
+ 2 files changed, 265 insertions(+), 210 deletions(-)
+
+diff --git a/kcms/nightlight/ui/DayNightView.qml b/kcms/nightlight/ui/DayNightView.qml
+index 74b1796..d8e2ca2 100644
+--- a/kcms/nightlight/ui/DayNightView.qml
++++ b/kcms/nightlight/ui/DayNightView.qml
+@@ -138,7 +138,7 @@ ColumnLayout {
+             Timer {
+                 id: now
+                 property int minutes: 0
+-                interval: 60
++                interval: 60000  // the marker moves one pixel per few minutes; was 60 ms (a 16 Hz wake-up for nothing)
+                 repeat: true
+                 running: true
+                 triggeredOnStart: true
+diff --git a/kcms/nightlight/ui/main.qml b/kcms/nightlight/ui/main.qml
+index 1091f58..5069488 100644
+--- a/kcms/nightlight/ui/main.qml
++++ b/kcms/nightlight/ui/main.qml
+@@ -21,6 +21,46 @@ KCM.SimpleKCM {
+ 
+     property bool defaultRequested: false
+ 
++    // Page first (docs/page-design.md section 7): the schedule provider and the preview are created one event-loop turn
++    // after the first frame.
++    property bool detailsAllowed: false
++    Timer {
++        interval: 0
++        running: true
++        onTriggered: root.detailsAllowed = true
++    }
++
++    Loader {
++        id: timingsLoader
++        active: root.detailsAllowed
++        sourceComponent: Private.DayNightTimings {
++            dateTime: new Date()
++        }
++    }
++    readonly property var timings: timingsLoader.item
++
++    function timeText(date: date): string {
++        return date.toLocaleTimeString(Qt.locale(), Locale.ShortFormat);
++    }
++
++    // What Night Light is doing now. "Night" is when the next transition is the morning one.
++    readonly property string stateText: {
++        if (!kcm.nightLightSettings.active) {
++            return i18nc("@info:status", "Night Light is off.");
++        }
++        if (kcm.nightLightSettings.mode === Private.NightLightMode.Constant) {
++            return i18nc("@info:status", "Night Light is always on.");
++        }
++        const t = root.timings;
++        if (!t || isNaN(t.morningStart.getTime()) || isNaN(t.eveningStart.getTime())) {
++            return "";
++        }
++        if (t.morningStart.getTime() > t.eveningStart.getTime()) {
++            return i18nc("@info:status Placeholder is for time", "Night Light is on until %1.", root.timeText(t.morningStart));
++        }
++        return i18nc("@info:status Placeholder is for time", "Night Light turns on at %1.", root.timeText(t.eveningStart));
++    }
++
+     implicitHeight: Kirigami.Units.gridUnit * 29
+     implicitWidth: Kirigami.Units.gridUnit * 35
+ 
+@@ -95,21 +135,27 @@ KCM.SimpleKCM {
+     }
+ 
+     ColumnLayout {
++        spacing: Kirigami.Units.largeSpacing
++
++        // ksr: kcm_nightlight/cfg-NightLight-State
+         QQC2.Label {
+             Layout.fillWidth: true
+-            Layout.margins: Kirigami.Units.gridUnit
+-            Layout.maximumWidth: form.implicitWidth
+-            Layout.alignment: Qt.AlignCenter
+-
+-            text: i18nc("@info", "The blue light filter makes the colors on the screen warmer.")
++            Layout.maximumWidth: Kirigami.Units.gridUnit * 30
++            Layout.alignment: Qt.AlignHCenter
++            Layout.topMargin: Kirigami.Units.largeSpacing
++            text: root.stateText
+             textFormat: Text.PlainText
+             wrapMode: Text.WordWrap
+             horizontalAlignment: Text.AlignHCenter
++            font.bold: true
++            // Keeps the line's height while the schedule is still being read
++            Layout.minimumHeight: Kirigami.Units.gridUnit
+         }
+ 
+         Kirigami.InlineMessage {
+-            Layout.alignment: Qt.AlignCenter
+-            Layout.preferredWidth: form.implicitWidth
++            Layout.fillWidth: true
++            Layout.maximumWidth: Kirigami.Units.gridUnit * 30
++            Layout.alignment: Qt.AlignHCenter
+             type: Kirigami.MessageType.Information
+             visible: dbusInterface.temporarilyActivated || dbusInterface.temporarilyDeactivated
+             text: {
+@@ -151,229 +197,238 @@ KCM.SimpleKCM {
+             ]
+         }
+ 
+-        Kirigami.Form {
++        // ksr: kcm_nightlight/day-night-view
++        Loader {
++            Layout.fillWidth: true
++            Layout.maximumWidth: Kirigami.Units.gridUnit * 30
++            Layout.alignment: Qt.AlignHCenter
++            Layout.preferredHeight: item ? item.implicitHeight : Kirigami.Units.gridUnit * 4
++            active: root.timings !== null && root.timings !== undefined
++            asynchronous: true
++
++            sourceComponent: DayNightView {
++                enabled: kcm.nightLightSettings.active
++                dayTemperature: kcm.nightLightSettings.dayTemperature
++                nightTemperature: kcm.nightLightSettings.nightTemperature
++                alwaysOn: kcm.nightLightSettings.mode === Private.NightLightMode.Constant
++                dayTransitionOn: minutesForDate(root.timings.morningStart)
++                dayTransitionOff: minutesForDate(root.timings.morningEnd)
++                nightTransitionOn: minutesForDate(root.timings.eveningStart)
++                nightTransitionOff: minutesForDate(root.timings.eveningEnd)
++            }
++        }
++
++        Kirigami.FormLayout {
+             id: form
+             Layout.fillWidth: true
+-            Kirigami.FormGroup {
+-                Kirigami.FormEntry {
+-                    title: i18nc("@label:listbox Night Light modes", "Switching times:")
+-                    contentItem: RowLayout {
+-                        Kirigami.FormData.buddyFor: modeSwitcher
+-                        spacing: Kirigami.Units.smallSpacing
+-
+-                        QQC2.ComboBox {
+-                            id: modeSwitcher
+-                            // Work around https://bugs.kde.org/show_bug.cgi?id=403153
+-                            Layout.minimumWidth: Kirigami.Units.gridUnit * 17
+-                            currentIndex: kcm.nightLightSettings.active ? kcm.nightLightSettings.mode + 1 : 0
+-                            model: [
+-                                i18nc("@item:inlistbox switching times", "Always off"),  // This is not actually a Mode, but represents Night Light being disabled
+-                                i18nc("@item:inlistbox switching times", "Always on"),
+-                                i18nc("@item:inlistbox switching times", "Sunrise and sunset")
+-                            ]
+-                            onCurrentIndexChanged: {
+-                                if (currentIndex !== 0) {
+-                                    kcm.nightLightSettings.mode = currentIndex - 1;
+-                                }
+-                                kcm.nightLightSettings.active = (currentIndex !== 0);
+-                            }
+-
+-                            KCM.SettingStateBinding {
+-                                configObject: kcm.nightLightSettings
+-                                settingName: "Active"
+-                            }
+-                        }
+ 
+-                        QQC2.Button {
+-                            icon.name: "configure"
+-                            text: i18nc("@action:button Configure day-night cycle times", "Configure…")
+-                            display: QQC2.AbstractButton.IconOnly
++            // ksr: kcm_nightlight/Active
++            QQC2.RadioButton {
++                id: offButton
++                Kirigami.FormData.label: i18nc("@label Night Light modes", "Night Light:")
++                QQC2.ButtonGroup.group: modeGroup
++                text: i18nc("@option:radio Night Light is off", "Off")
++                checked: !kcm.nightLightSettings.active
++                onToggled: kcm.nightLightSettings.active = false
++
++                KCM.SettingStateBinding {
++                    configObject: kcm.nightLightSettings
++                    settingName: "Active"
++                }
++            }
+ 
+-                            QQC2.ToolTip.text: text
+-                            QQC2.ToolTip.visible: hovered || visualFocus
+-                            QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
++            QQC2.RadioButton {
++                id: alwaysOnButton
++                QQC2.ButtonGroup.group: modeGroup
++                text: i18nc("@option:radio", "Always on")
++                checked: kcm.nightLightSettings.active && kcm.nightLightSettings.mode === Private.NightLightMode.Constant
++                onToggled: {
++                    kcm.nightLightSettings.mode = Private.NightLightMode.Constant;
++                    kcm.nightLightSettings.active = true;
++                }
+ 
+-                            enabled: kcm.nightLightSettings.active && kcm.nightLightSettings.mode === Private.NightLightMode.DarkLight && KConfig.KAuthorized.authorizeControlModule("kcm_nighttime")
+-                            onClicked: KCM.KCMLauncher.open("kcm_nighttime")
+-                        }
+-                        Item {
+-                            Layout.fillWidth: true
+-                        }
+-                    }
++                KCM.SettingStateBinding {
++                    configObject: kcm.nightLightSettings
++                    settingName: "Active"
+                 }
++            }
+ 
+-                Kirigami.FormSeparator {}
+-
+-                Kirigami.FormEntry {
+-                    fullWidth: true
+-                    contentItem: DayNightView {
+-                        Layout.margins: Kirigami.Units.smallSpacing
+-                        Layout.bottomMargin: Kirigami.Units.gridUnit
+-                        Layout.maximumWidth: Kirigami.Units.gridUnit * 30
+-                        Layout.alignment: Qt.AlignCenter
+-
+-                        enabled: kcm.nightLightSettings.active
+-                        dayTemperature: kcm.nightLightSettings.dayTemperature
+-                        nightTemperature: kcm.nightLightSettings.nightTemperature
+-                        alwaysOn: kcm.nightLightSettings.mode === Private.NightLightMode.Constant
+-                        dayTransitionOn: minutesForDate(dayNightTimings.morningStart)
+-                        dayTransitionOff: minutesForDate(dayNightTimings.morningEnd)
+-                        nightTransitionOn: minutesForDate(dayNightTimings.eveningStart)
+-                        nightTransitionOff: minutesForDate(dayNightTimings.eveningEnd)
+-
+-                        function minutesForFixed(date: date): int {
+-                            return date.getHours() * 60 + date.getMinutes();
+-                        }
++            QQC2.RadioButton {
++                id: darkLightButton
++                QQC2.ButtonGroup.group: modeGroup
++                text: i18nc("@option:radio", "At sunset, until sunrise")
++                checked: kcm.nightLightSettings.active && kcm.nightLightSettings.mode === Private.NightLightMode.DarkLight
++                onToggled: {
++                    kcm.nightLightSettings.mode = Private.NightLightMode.DarkLight;
++                    kcm.nightLightSettings.active = true;
++                }
++
++                KCM.SettingStateBinding {
++                    configObject: kcm.nightLightSettings
++                    settingName: "Active"
++                }
++            }
++
++            QQC2.ButtonGroup { id: modeGroup }
++
++            // ksr: kcm_nightlight/hint
++            QQC2.Label {
++                Layout.fillWidth: true
++                Layout.maximumWidth: Kirigami.Units.gridUnit * 16
++                text: i18nc("@info", "The blue light filter makes the colors on the screen warmer.")
++                textFormat: Text.PlainText
++                wrapMode: Text.WordWrap
++                font: Kirigami.Theme.smallFont
++            }
++
++            // ksr: kcm_nightlight/nightLightSettings-active
++            QQC2.Button {
++                Layout.leftMargin: Kirigami.Units.gridUnit
++                icon.name: "configure"
++                text: i18nc("@action:button opens the Day-Night Cycle page", "Day-Night Cycle…")
++                visible: KConfig.KAuthorized.authorizeControlModule("kcm_nighttime")
++                enabled: kcm.nightLightSettings.active && kcm.nightLightSettings.mode === Private.NightLightMode.DarkLight
++                onClicked: KCM.KCMLauncher.openSystemSettings("kcm_nighttime")
++            }
++
++            Kirigami.Separator {
++                Kirigami.FormData.isSection: true
++                Kirigami.FormData.label: i18nc("@title:group", "Temperature")
++            }
++
++            QQC2.Label {
++                id: sliderValueLabelMetrics
++                visible: false
++                // One digit more than the theoretical maximum, because who knows
++                // which digit is the widest in the current font anyway.
++                text: i18nc("Color temperature in Kelvin", "%1 K", 99999)
++                textFormat: Text.PlainText
++            }
+ 
+-                        Private.DayNightTimings {
+-                            id: dayNightTimings
+-                            dateTime: new Date()
++            GridLayout {
++                Kirigami.FormData.label: i18nc("@label:slider", "Day light temperature:")
++                Kirigami.FormData.buddyFor: tempSliderDay
++                enabled: (kcm.nightLightSettings.active && kcm.nightLightSettings.mode !== Private.NightLightMode.Constant) || dbusInterface.temporarilyDeactivated
++
++                columns: 4
++
++                QQC2.Slider {
++                    id: tempSliderDay
++                    Layout.minimumWidth: Kirigami.Units.gridUnit * 17
++                    Layout.columnSpan: 3
++                    from: kcm.maxDayTemp
++                    to: kcm.minDayTemp
++                    stepSize: -100
++                    live: true
++
++                    value: kcm.nightLightSettings.dayTemperature
++
++                    onMoved: {
++                        kcm.nightLightSettings.dayTemperature = value
++                        kcm.preview(value)
++
++                        // This can fire for scroll events; in this case we need
++                        // to use a timer to make the preview message disappear, since
++                        // we can't make it disappear in the onPressedChanged handler
++                        // since there is no press
++                        if (!pressed) {
++                            previewTimer.restart()
++                        }
++                    }
++                    onPressedChanged: {
++                        if (!pressed) {
++                            kcm.stopPreview()
+                         }
+                     }
+-                }
+ 
++                    KCM.SettingStateBinding {
++                        configObject: kcm.nightLightSettings
++                        settingName: "DayTemperature"
++                        extraEnabledConditions: kcm.nightLightSettings.active || dbusInterface.temporarilyDeactivated
++                    }
++                }
+                 QQC2.Label {
+-                    id: sliderValueLabelMetrics
+-                    visible: false
+-                    // One digit more than the theoretical maximum, because who knows
+-                    // which digit is the widest in the current font anyway.
+-                    text: i18nc("Color temperature in Kelvin", "%1 K", 99999)
++                    text: i18nc("Color temperature in Kelvin", "%1 K", tempSliderDay.value)
+                     textFormat: Text.PlainText
++                    horizontalAlignment: Text.AlignRight
++                    Layout.minimumWidth: sliderValueLabelMetrics.implicitWidth
+                 }
++                //row 2
++                QQC2.Label {
++                    text: i18nc("Night colour blue-ish; no blue light filter activated", "Cool (no filter)")
++                    textFormat: Text.PlainText
++                }
++                Item {
++                    Layout.fillWidth: true
++                }
++                QQC2.Label {
++                    text: i18nc("Night colour red-ish", "Warm")
++                    textFormat: Text.PlainText
++                }
++                Item {}
++            }
+ 
+-                Kirigami.FormSeparator {}
+-
+-                Kirigami.FormEntry {
+-                    title: i18nc("@label:slider", "Day light temperature:")
+-                    contentItem: GridLayout {
+-                        Kirigami.FormData.buddyFor: tempSliderDay
+-                        enabled: (kcm.nightLightSettings.active && kcm.nightLightSettings.mode !== Private.NightLightMode.Constant) || dbusInterface.temporarilyDeactivated
+-
+-                        columns: 4
+-
+-                        QQC2.Slider {
+-                            id: tempSliderDay
+-                            // Match combobox width
+-                            Layout.minimumWidth: modeSwitcher.width
+-                            Layout.columnSpan: 3
+-                            from: kcm.maxDayTemp
+-                            to: kcm.minDayTemp
+-                            stepSize: -100
+-                            live: true
+-
+-                            value: kcm.nightLightSettings.dayTemperature
+-
+-                            onMoved: {
+-                                kcm.nightLightSettings.dayTemperature = value
+-                                kcm.preview(value)
+-
+-                                // This can fire for scroll events; in this case we need
+-                                // to use a timer to make the preview message disappear, since
+-                                // we can't make it disappear in the onPressedChanged handler
+-                                // since there is no press
+-                                if (!pressed) {
+-                                    previewTimer.restart()
+-                                }
+-                            }
+-                            onPressedChanged: {
+-                                if (!pressed) {
+-                                    kcm.stopPreview()
+-                                }
+-                            }
+-
+-                            KCM.SettingStateBinding {
+-                                configObject: kcm.nightLightSettings
+-                                settingName: "DayTemperature"
+-                                extraEnabledConditions: kcm.nightLightSettings.active || dbusInterface.temporarilyDeactivated
+-                            }
+-                        }
+-                        QQC2.Label {
+-                            text: i18nc("Color temperature in Kelvin", "%1 K", tempSliderDay.value)
+-                            textFormat: Text.PlainText
+-                            horizontalAlignment: Text.AlignRight
+-                            Layout.minimumWidth: sliderValueLabelMetrics.implicitWidth
++            GridLayout {
++                Kirigami.FormData.label: i18nc("@label:slider", "Night light temperature:")
++                Kirigami.FormData.buddyFor: tempSliderNight
++                enabled: kcm.nightLightSettings.active || dbusInterface.temporarilyActivated
++
++                columns: 4
++
++                QQC2.Slider {
++                    id: tempSliderNight
++                    Layout.minimumWidth: Kirigami.Units.gridUnit * 17
++                    Layout.columnSpan: 3
++                    from: kcm.maxNightTemp
++                    to: kcm.minNightTemp
++                    stepSize: -100
++                    live: true
++
++                    value: kcm.nightLightSettings.nightTemperature
++
++                    onMoved: {
++                        kcm.nightLightSettings.nightTemperature = value
++                        kcm.preview(value)
++
++                        // This can fire for scroll events; in this case we need
++                        // to use a timer to make the preview disappear, since
++                        // we can't make it disappear in the onPressedChanged handler
++                        // since there is no press
++                        if (!pressed) {
++                            previewTimer.restart()
+                         }
+-                        //row 2
+-                        QQC2.Label {
+-                            text: i18nc("Night colour blue-ish; no blue light filter activated", "Cool (no filter)")
+-                            textFormat: Text.PlainText
+-                        }
+-                        Item {
+-                            Layout.fillWidth: true
+-                        }
+-                        QQC2.Label {
+-                            text: i18nc("Night colour red-ish", "Warm")
+-                            textFormat: Text.PlainText
++                    }
++                    onPressedChanged: {
++                        if (!pressed) {
++                            kcm.stopPreview()
+                         }
+-                        Item {}
+                     }
+-                }
+ 
+-                Kirigami.FormEntry {
+-                    title: i18nc("@label:slider", "Night light temperature:")
+-                    contentItem: GridLayout {
+-                        Kirigami.FormData.buddyFor: tempSliderNight
+-                        enabled: kcm.nightLightSettings.active || dbusInterface.temporarilyActivated
+-
+-                        columns: 4
+-
+-                        QQC2.Slider {
+-                            id: tempSliderNight
+-                            // Match combobox width
+-                            Layout.minimumWidth: modeSwitcher.width
+-                            Layout.columnSpan: 3
+-                            from: kcm.maxNightTemp
+-                            to: kcm.minNightTemp
+-                            stepSize: -100
+-                            live: true
+-
+-                            value: kcm.nightLightSettings.nightTemperature
+-
+-                            onMoved: {
+-                                kcm.nightLightSettings.nightTemperature = value
+-                                kcm.preview(value)
+-
+-                                // This can fire for scroll events; in this case we need
+-                                // to use a timer to make the preview disappear, since
+-                                // we can't make it disappear in the onPressedChanged handler
+-                                // since there is no press
+-                                if (!pressed) {
+-                                    previewTimer.restart()
+-                                }
+-                            }
+-                            onPressedChanged: {
+-                                if (!pressed) {
+-                                    kcm.stopPreview()
+-                                }
+-                            }
+-
+-                            KCM.SettingStateBinding {
+-                                configObject: kcm.nightLightSettings
+-                                settingName: "NightTemperature"
+-                                extraEnabledConditions: kcm.nightLightSettings.active || dbusInterface.temporarilyActivated
+-                            }
+-                        }
+-                        QQC2.Label {
+-                            text: i18nc("Color temperature in Kelvin", "%1 K", tempSliderNight.value)
+-                            textFormat: Text.PlainText
+-                            horizontalAlignment: Text.AlignRight
+-                            Layout.minimumWidth: sliderValueLabelMetrics.implicitWidth
+-                        }
+-                        //row 2
+-                        QQC2.Label {
+-                            text: i18nc("Night colour blue-ish; no blue light filter activated", "Cool (no filter)")
+-                            textFormat: Text.PlainText
+-                        }
+-                        Item {
+-                            Layout.fillWidth: true
+-                        }
+-                        QQC2.Label {
+-                            text: i18nc("Night colour red-ish", "Warm")
+-                            textFormat: Text.PlainText
+-                        }
+-                        Item {}
++                    KCM.SettingStateBinding {
++                        configObject: kcm.nightLightSettings
++                        settingName: "NightTemperature"
++                        extraEnabledConditions: kcm.nightLightSettings.active || dbusInterface.temporarilyActivated
+                     }
+                 }
++                QQC2.Label {
++                    text: i18nc("Color temperature in Kelvin", "%1 K", tempSliderNight.value)
++                    textFormat: Text.PlainText
++                    horizontalAlignment: Text.AlignRight
++                    Layout.minimumWidth: sliderValueLabelMetrics.implicitWidth
++                }
++                //row 2
++                QQC2.Label {
++                    text: i18nc("Night colour blue-ish; no blue light filter activated", "Cool (no filter)")
++                    textFormat: Text.PlainText
++                }
++                Item {
++                    Layout.fillWidth: true
++                }
++                QQC2.Label {
++                    text: i18nc("Night colour red-ish", "Warm")
++                    textFormat: Text.PlainText
++                }
++                Item {}
+             }
+         }
+     }

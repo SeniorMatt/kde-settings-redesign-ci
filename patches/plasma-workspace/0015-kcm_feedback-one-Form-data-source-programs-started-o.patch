@@ -1,0 +1,405 @@
+From c0a6e3f01d3cf2b86cf8d47567b8a4c41450b790 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 14:27:47 +0500
+Subject: [PATCH 15/24] kcm_feedback: one Form, data-source programs started
+ one by one after the first frame, Provider read once
+
+Page type: Form (docs/page-design.md). KUserFeedback settings (Global/FeedbackLevel), audit links and the
+"--feedback" protocol are unchanged. NOT BUILT YET (owner stopped heavy work); checked statically only.
+
+Moved / renamed:
+- The slider is first and labelled "Sharing level:" (was "Plasma:"; alias "Plasma:" in ia/layout.json). The step title
+  is a bold label under it, then the intro text as small help text (the two paragraphs merged into one) and the privacy
+  policy link. Was: two paragraphs, link, separator, then the form (HIG-001/005, "first thing = main control").
+- Noun sections "Information sent" (label "The following will be sent:", or "Nothing is sent." at level 0) and "Sent data"
+  (View sent data links; section only when audits exist). Bullet list now wraps. Disabled-centrally InlineMessage stays.
+- Relabel table inventory/relabel/kcm_feedback.tsv (outer repo). 5 inventory rows kept with ksr markers;
+  inventory_check --kcm kcm_feedback --strict: 0 lost.
+
+Speed (cause found in code, kcms/feedback/feedback.cpp): the constructor started "plasmashell --feedback" and
+"plasma-discover --feedback" together (two heavy binaries competing with the page for CPU) and
+feedbackEnabled() built a KUserFeedback::Provider on every read (3 bindings). Now the programs start from a 250 ms
+single-shot, one after the other (startNextProgram/finishProgram; a program that fails to start does not stall the
+queue), the Provider is read once, and a busy indicator shows in the list after 150 ms (property sourcesLoading).
+After numbers: pending, manager will measure.
+
+Not built yet; uncertain: Kirigami.FormData.labelAlignment on a ColumnLayout; the second program's data arrives
+about one program run later than before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/feedback/feedback.cpp |  61 ++++++++++--
+ kcms/feedback/feedback.h   |   8 ++
+ kcms/feedback/ui/main.qml  | 198 +++++++++++++++++++------------------
+ 3 files changed, 162 insertions(+), 105 deletions(-)
+
+diff --git a/kcms/feedback/feedback.cpp b/kcms/feedback/feedback.cpp
+index e6b5688..35f77ed 100644
+--- a/kcms/feedback/feedback.cpp
++++ b/kcms/feedback/feedback.cpp
+@@ -17,6 +17,7 @@
+ #include <QFileInfo>
+ #include <QList>
+ #include <QProcess>
++#include <QTimer>
+ 
+ #include <KUserFeedback/FeedbackConfigUiController>
+ #include <KUserFeedback/Provider>
+@@ -52,14 +53,49 @@ Feedback::Feedback(QObject *parent, const KPluginMetaData &data)
+ {
+     qmlRegisterAnonymousType<FeedbackSettings>("org.kde.userfeedback.kcm", 1);
+ 
+-    for (const auto &[program, _] : s_programs.asKeyValueRange()) {
+-        auto p = new QProcess(this);
+-        p->setProgram(program);
+-        p->setArguments({QStringLiteral("--feedback")});
+-        p->start();
+-        connect(p, &QProcess::finished, this, &Feedback::programFinished);
+-        // deleted by finished slot
++    // Before: both "plasmashell --feedback" and "plasma-discover --feedback" (two heavy binaries) were started here, in
++    // the constructor, at the same time as the page was created. Now they are started one after the other, shortly
++    // after the page is shown (the list of sent data is below the slider and fills in when they finish).
++    m_pendingPrograms = s_programs.keys();
++    m_pendingPrograms.sort(); // stable order
++    m_sourcesLoading = !m_pendingPrograms.isEmpty();
++    QTimer::singleShot(250, this, &Feedback::startNextProgram);
++}
++
++bool Feedback::sourcesLoading() const
++{
++    return m_sourcesLoading;
++}
++
++void Feedback::startNextProgram()
++{
++    if (m_pendingPrograms.isEmpty()) {
++        return;
+     }
++    const QString program = m_pendingPrograms.takeFirst();
++    auto p = new QProcess(this);
++    p->setProgram(program);
++    p->setArguments({QStringLiteral("--feedback")});
++    connect(p, &QProcess::finished, this, &Feedback::programFinished);
++    // If the binary is not installed the process never starts: go on with the next one
++    connect(p, &QProcess::errorOccurred, this, [this, p](QProcess::ProcessError error) {
++        if (error == QProcess::FailedToStart) {
++            p->deleteLater();
++            finishProgram();
++        }
++    });
++    p->start();
++    // deleted by finished slot
++}
++
++void Feedback::finishProgram()
++{
++    if (!m_pendingPrograms.isEmpty()) {
++        startNextProgram();
++        return;
++    }
++    m_sourcesLoading = false;
++    Q_EMIT sourcesLoadingChanged();
+ }
+ 
+ void Feedback::programFinished(int exitCode)
+@@ -72,6 +108,8 @@ void Feedback::programFinished(int exitCode)
+ 
+     if (exitCode) {
+         qCWarning(KCM_FEEDBACK_DEBUG) << "Could not check" << program;
++        p->deleteLater();
++        finishProgram();
+         return;
+     }
+ 
+@@ -108,12 +146,17 @@ void Feedback::programFinished(int exitCode)
+         return modeL < modeR || (modeL == modeR && objL[u"description"].toString() < objR[u"description"].toString());
+     });
+     Q_EMIT feedbackSourcesChanged();
++    finishProgram();
+ }
+ 
+ bool Feedback::feedbackEnabled() const
+ {
+-    KUserFeedback::Provider p;
+-    return p.isEnabled();
++    // Read once (the Provider reads its settings each time it is created)
++    if (m_feedbackEnabled < 0) {
++        KUserFeedback::Provider p;
++        m_feedbackEnabled = p.isEnabled() ? 1 : 0;
++    }
++    return m_feedbackEnabled == 1;
+ }
+ 
+ FeedbackSettings *Feedback::feedbackSettings() const
+diff --git a/kcms/feedback/feedback.h b/kcms/feedback/feedback.h
+index 5454d1e..121f1d0 100644
+--- a/kcms/feedback/feedback.h
++++ b/kcms/feedback/feedback.h
+@@ -19,6 +19,7 @@ class Feedback : public KQuickManagedConfigModule
+     Q_OBJECT
+ 
+     Q_PROPERTY(QJsonArray feedbackSources MEMBER m_feedbackSources NOTIFY feedbackSourcesChanged)
++    Q_PROPERTY(bool sourcesLoading READ sourcesLoading NOTIFY sourcesLoadingChanged)
+     Q_PROPERTY(QJsonArray audits READ audits CONSTANT)
+     Q_PROPERTY(bool feedbackEnabled READ feedbackEnabled CONSTANT)
+     Q_PROPERTY(FeedbackSettings *feedbackSettings READ feedbackSettings CONSTANT)
+@@ -27,6 +28,7 @@ public:
+     explicit Feedback(QObject *parent, const KPluginMetaData &data);
+ 
+     bool feedbackEnabled() const;
++    bool sourcesLoading() const;
+     FeedbackSettings *feedbackSettings() const;
+ 
+     QJsonArray audits() const;
+@@ -34,8 +36,14 @@ public:
+ 
+ Q_SIGNALS:
+     void feedbackSourcesChanged();
++    void sourcesLoadingChanged();
+ 
+ private:
++    void startNextProgram();
++    void finishProgram();
++    QStringList m_pendingPrograms;
++    bool m_sourcesLoading = false;
++    mutable int m_feedbackEnabled = -1;
+     QHash<int, QHash<QString, QJsonArray>> m_uses;
+     QJsonArray m_feedbackSources;
+     FeedbackData *m_data;
+diff --git a/kcms/feedback/ui/main.qml b/kcms/feedback/ui/main.qml
+index ef21147..bcf6c83 100644
+--- a/kcms/feedback/ui/main.qml
++++ b/kcms/feedback/ui/main.qml
+@@ -29,129 +29,135 @@ SimpleKCM {
+         position: Kirigami.InlineMessage.Position.Header
+         type: Kirigami.MessageType.Information
+         visible: !form.enabled
++        // ksr: kcm_feedback/DisabledCentrally
+         text: i18n("User Feedback has been disabled centrally. Please contact your distributor.")
+     }
+ 
+-    ColumnLayout {
+-        spacing: 0
++    Kirigami.FormLayout {
++        id: form
++        enabled: kcm.feedbackEnabled
++
++        // ksr: kcm_feedback/feedbackLevel
++        QQC2.Slider {
++            id: statisticsModeSlider
++            Kirigami.FormData.label: i18nc("@label:slider", "Sharing level:")
++            readonly property var currentMode: modeOptions[value]
++            Layout.fillWidth: true
++            Layout.maximumWidth: Kirigami.Units.gridUnit * 22
++
++            readonly property var modeOptions: [UserFeedback.Provider.NoTelemetry, UserFeedback.Provider.BasicSystemInformation, UserFeedback.Provider.BasicUsageStatistics,
++                                                UserFeedback.Provider.DetailedSystemInformation, UserFeedback.Provider.DetailedUsageStatistics]
++            from: 0
++            to: modeOptions.length - 1
++            stepSize: 1
++            snapMode: QQC2.Slider.SnapAlways
++
++            Kirigami.StyleHints.tickMarkStepSize: 1
++
++            function findIndex(array, what, defaultValue) {
++                for (var v in array) {
++                    if (array[v] == what)
++                        return v;
++                }
++                return defaultValue;
++            }
++
++            value: findIndex(modeOptions, kcm.feedbackSettings.feedbackLevel, 0)
++
++            onMoved: {
++                kcm.feedbackSettings.feedbackLevel = modeOptions[value]
++            }
++
++            SettingStateBinding {
++                configObject: kcm.feedbackSettings
++                settingName: "feedbackLevel"
++                extraEnabledConditions: kcm.feedbackEnabled
++            }
++        }
++
++        UserFeedback.FeedbackConfigUiController {
++            id: feedbackController
++            applicationName: i18n("Plasma")
++        }
+ 
+         QQC2.Label {
+             Layout.fillWidth: true
+-            Layout.topMargin: Kirigami.Units.gridUnit
+-            Layout.leftMargin: Kirigami.Units.gridUnit
+-            Layout.rightMargin: Kirigami.Units.gridUnit
+-            wrapMode: Text.Wrap
+-            text: xi18nc("@info", "You can help KDE improve Plasma by contributing information on how you use it, so we can focus on things that matter to you.<nl/><nl/>Contributing this information is optional and entirely anonymous. We never collect your personal data, files you use, websites you visit, or information that could identify you.<nl/>")
++            Layout.maximumWidth: Kirigami.Units.gridUnit * 22
++            wrapMode: Text.WordWrap
++            font.bold: true
++            text: feedbackController.telemetryName(statisticsModeSlider.currentMode)
++            textFormat: Text.PlainText
+         }
+ 
++        // ksr: kcm_feedback/Read-more-about-our-privacy-policy
++        QQC2.Label {
++            Layout.fillWidth: true
++            Layout.maximumWidth: Kirigami.Units.gridUnit * 22
++            wrapMode: Text.Wrap
++            font: Kirigami.Theme.smallFont
++            text: xi18nc("@info", "You can help KDE improve Plasma by contributing information on how you use it, so we can focus on things that matter to you. Contributing this information is optional and entirely anonymous. We never collect your personal data, files you use, websites you visit, or information that could identify you.")
++        }
+         Kirigami.UrlButton {
+-            Layout.leftMargin: Kirigami.Units.gridUnit
+-            Layout.rightMargin: Kirigami.Units.gridUnit
+             url: "https://kde.org/privacypolicy-apps.php"
+             text: i18nc("@info", "Read more about our privacy policy")
+         }
+ 
+         Kirigami.Separator {
+-            Layout.fillWidth: true
+-            Layout.margins: Kirigami.Units.gridUnit
++            Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18nc("@title:group", "Information sent")
+         }
+ 
+-        Kirigami.FormLayout {
+-            id: form
+-            enabled: kcm.feedbackEnabled
+-            QQC2.Slider {
+-                id: statisticsModeSlider
+-                Kirigami.FormData.label: i18n("Plasma:")
+-                readonly property var currentMode: modeOptions[value]
+-                Layout.fillWidth: true
+-                Layout.maximumWidth: Kirigami.Units.gridUnit * 22
+-
+-                readonly property var modeOptions: [UserFeedback.Provider.NoTelemetry, UserFeedback.Provider.BasicSystemInformation, UserFeedback.Provider.BasicUsageStatistics,
+-                                                    UserFeedback.Provider.DetailedSystemInformation, UserFeedback.Provider.DetailedUsageStatistics]
+-                from: 0
+-                to: modeOptions.length - 1
+-                stepSize: 1
+-                snapMode: QQC2.Slider.SnapAlways
+-
+-                Kirigami.StyleHints.tickMarkStepSize: 1
+-
+-                function findIndex(array, what, defaultValue) {
+-                    for (var v in array) {
+-                        if (array[v] == what)
+-                            return v;
+-                    }
+-                    return defaultValue;
+-                }
+-
+-                value: findIndex(modeOptions, kcm.feedbackSettings.feedbackLevel, 0)
+-
+-                onMoved: {
+-                    kcm.feedbackSettings.feedbackLevel = modeOptions[value]
+-                }
+-
+-                SettingStateBinding {
+-                    configObject: kcm.feedbackSettings
+-                    settingName: "feedbackLevel"
+-                    extraEnabledConditions: kcm.feedbackEnabled
+-                }
+-            }
+-
+-            UserFeedback.FeedbackConfigUiController {
+-                id: feedbackController
+-                applicationName: i18n("Plasma")
+-            }
++        // ksr: kcm_feedback/SentDataItems
++        ColumnLayout {
++            Kirigami.FormData.label: i18nc("@label", "The following will be sent:")
++            Kirigami.FormData.labelAlignment: Qt.AlignTop
++            Layout.fillWidth: true
++            Layout.maximumWidth: Kirigami.Units.gridUnit * 22
+ 
+-            Kirigami.Heading {
+-                Layout.fillWidth: true
+-                Layout.alignment: Qt.AlignHCenter
+-                Layout.preferredWidth: Kirigami.Units.gridUnit * 22
+-                Layout.maximumWidth: Kirigami.Units.gridUnit * 29
+-                wrapMode: Text.WordWrap
+-                level: 3
+-                text: feedbackController.telemetryName(statisticsModeSlider.currentMode)
+-                textFormat: Text.PlainText
+-            }
+-            Item {
+-                Kirigami.FormData.isSection: true
+-            }
+             QQC2.Label {
+                 Layout.fillWidth: true
+-                Layout.alignment: Qt.AlignHCenter
+-                Layout.maximumWidth: Kirigami.Units.gridUnit * 22
++                visible: statisticsModeSlider.value == 0 // This is "disabled"
+                 wrapMode: Text.WordWrap
+-
+-                text: i18n("The following information will be sent:")
+-                textFormat: Text.PlainText
+-                visible: statisticsModeSlider.value != 0 // This is "disabled"
++                text: i18nc("@info", "Nothing is sent.")
+             }
+-            ColumnLayout {
+-                Layout.maximumWidth: parent.width * 0.5
+-                Repeater {
+-                    model: kcm.feedbackSources
+-                    delegate: QQC2.Label {
+-                        visible: modelData.mode <= statisticsModeSlider.currentMode
+-                        text: "· " + modelData.description
+-                        textFormat: Text.PlainText
+-                        Layout.fillWidth: true
+-                    }
+-                }
++            // The list is read from plasmashell and Discover after the first frame; the spinner shows after 150 ms
++            Timer {
++                id: busyDelay
++                interval: 150
++                running: kcm.sourcesLoading
+             }
+-
+-            Item {
+-                implicitHeight: Kirigami.Units.largeSpacing
+-                Layout.fillWidth: true
++            QQC2.BusyIndicator {
++                running: kcm.sourcesLoading && !busyDelay.running
++                visible: running && statisticsModeSlider.value != 0
+             }
+             Repeater {
+-                model: kcm.audits
+-                delegate: Kirigami.LinkButton {
++                model: kcm.feedbackSources
++                delegate: QQC2.Label {
++                    visible: modelData.mode <= statisticsModeSlider.currentMode
++                    text: "· " + modelData.description
++                    textFormat: Text.PlainText
++                    wrapMode: Text.WordWrap
+                     Layout.fillWidth: true
+-                    horizontalAlignment: Text.AlignLeft
+-                    Kirigami.FormData.label: model.index === 0 ? i18n("View sent data:") : ""
+-                    text: modelData.program
+-                    onClicked: Qt.openUrlExternally("file://" + modelData.audits)
+                 }
+             }
+         }
++
++        // ksr: kcm_feedback/View-sent-data
++        Kirigami.Separator {
++            visible: auditRepeater.count > 0
++            Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18nc("@title:group", "Sent data")
++        }
++        Repeater {
++            id: auditRepeater
++            model: kcm.audits
++            delegate: Kirigami.LinkButton {
++                Layout.fillWidth: true
++                horizontalAlignment: Text.AlignLeft
++                Kirigami.FormData.label: model.index === 0 ? i18n("View sent data:") : ""
++                text: modelData.program
++                onClicked: Qt.openUrlExternally("file://" + modelData.audits)
++            }
++        }
+     }
+ }
+-

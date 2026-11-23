@@ -1,0 +1,131 @@
+From 042a1152cdc6a0e0a4a2bc050e08eaac90349437 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 15:06:00 +0500
+Subject: [PATCH 29/31] kcm_mouse: "No mouse found" placeholder, null-safe
+ backend access, scrolling as its own section
+
+Page type: Device/Form (Kirigami.Form). Same section names and wording as the reworked kcm_touchpad: General, Left and
+right buttons, Pointer speed, Scrolling ("Invert scroll direction (Natural scrolling)").
+- main.qml: backend/device accessed with ?. so a missing backend no longer throws "Cannot read property 'inputDevices'
+  of null" (lines 29/66) or "'buttonMappingCount' of null" (line 40); Kirigami.PlaceholderMessage "No mouse found" shown
+  and the form hidden when there is no device.
+- Device selector hidden unless 2+ mice (HIG-001/005).
+- Scroll speed + scroll options moved to a separate Scrolling form group (was merged with pointer speed).
+- ksr markers: naturalScroll, x, ConfigureExtraButtons, AddBinding, CancelBinding (strict check 0 lost).
+Speed: first-load cost is the synchronous KWin D-Bus read per device in kwin_wl_device.cpp (not changed here; touchpad
+page got the same treatment in 06c56e3). After-numbers: pending, manager will measure. NOT BUILT YET.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/mouse/ui/bindings.qml |  4 ++--
+ kcms/mouse/ui/main.qml     | 33 +++++++++++++++++++++++----------
+ 2 files changed, 25 insertions(+), 12 deletions(-)
+
+diff --git a/kcms/mouse/ui/bindings.qml b/kcms/mouse/ui/bindings.qml
+index f6e4ed0..3f2f908 100644
+--- a/kcms/mouse/ui/bindings.qml
++++ b/kcms/mouse/ui/bindings.qml
+@@ -109,7 +109,7 @@ KCMUtils.SimpleKCM {
+ 
+             actions: Kirigami.Action {
+                 icon.name: "dialog-cancel"
+-                text: i18ndc("kcmmouse", "@action:button", "Cancel")
++                text: i18ndc("kcmmouse", "@action:button", "Cancel")  // ksr: kcm_mouse/CancelBinding
+                 onTriggered: source => {
+                     newKeySequenceItem.visible = false;
+                     newBinding.visible = true
+@@ -124,7 +124,7 @@ KCMUtils.SimpleKCM {
+             twinFormLayouts: buttonLayout
+ 
+             QQC2.Button {
+-                id: newBinding
++                id: newBinding  // ksr: kcm_mouse/AddBinding
+                 checkable: true
+                 text: checked
+                     ? i18ndc("kcmmouse", "@action:button", "Press a mouse button")
+diff --git a/kcms/mouse/ui/main.qml b/kcms/mouse/ui/main.qml
+index d579405..e0897d8 100644
+--- a/kcms/mouse/ui/main.qml
++++ b/kcms/mouse/ui/main.qml
+@@ -26,7 +26,9 @@ KCMUtils.SimpleKCM {
+     // have an API to provide a mapping of initial properties for the root page.
+     readonly property Mouse.InputBackend backend: KCMUtils.ConfigModule.inputBackend
+ 
+-    readonly property Mouse.InputDevice device: backend.inputDevices[KCMUtils.ConfigModule.currentDeviceIndex] ?? null
++    readonly property bool hasDevices: (backend?.inputDevices?.length ?? 0) > 0
++
++    readonly property Mouse.InputDevice device: backend?.inputDevices?.[KCMUtils.ConfigModule.currentDeviceIndex] ?? null
+ 
+     function supportsExtraButtons(device: Mouse.InputDevice): bool {
+         return (device?.supportedButtons ?? 0) & ~(Qt.LeftButton | Qt.RightButton | Qt.MiddleButton);
+@@ -34,11 +36,11 @@ KCMUtils.SimpleKCM {
+ 
+     actions: Kirigami.Action  {
+         icon.name: "input-mouse-click-left-symbolic"
+-        text: i18ndc("kcmmouse", "@action:button", "Configure Extra Buttons…")
++        text: i18ndc("kcmmouse", "@action:button", "Configure Extra Buttons…")  // ksr: kcm_mouse/ConfigureExtraButtons
+ 
+         visible: {
+-            return root.backend.buttonMappingCount > 0
+-                || root.backend.inputDevices.some(root.supportsExtraButtons);
++            return (root.backend?.buttonMappingCount ?? 0) > 0
++                || (root.backend?.inputDevices?.some(root.supportsExtraButtons) ?? false);
+         }
+ 
+         onTriggered: source => {
+@@ -51,19 +53,29 @@ KCMUtils.SimpleKCM {
+         hotplugMessage: root.KCMUtils.ConfigModule.hotplugMessage
+     }
+ 
++    Kirigami.PlaceholderMessage {
++        icon.name: "input-mouse"
++        text: i18ndc("kcmmouse", "@info:status placeholdermessage text", "No mouse found")
++        explanation: i18ndc("kcmmouse", "@info:usagetip placeholdermessage explanation", "Connect a mouse")
++        anchors.centerIn: parent
++        visible: !root.hasDevices
++        width: parent.width - (Kirigami.Units.largeSpacing * 4)
++    }
++
+     Kirigami.Form {
+         id: formLayout
+-        enabled: root.device !== null && root.backend.inputDevices.length > 0
++        visible: root.hasDevices
++        enabled: visible && root.device !== null
+ 
+         Kirigami.FormGroup {
+             // Device
+             Kirigami.FormEntry {
+-                enabled: deviceSelector.count > 1
++                visible: deviceSelector.count > 1 // ksr: kcm_mouse/x (selector only when there is a choice)
+                 contentItem: QQC2.ComboBox {
+                     id: deviceSelector
+                     Kirigami.FormData.label: i18ndc("kcmmouse", "@title:listbox select device", "Device:")
+                     Layout.fillWidth: true
+-                    model: root.backend.inputDevices
++                    model: root.backend?.inputDevices
+                     textRole: "name"
+ 
+                     Component.onCompleted: {
+@@ -237,8 +249,10 @@ KCMUtils.SimpleKCM {
+             }
+ 
+ 
+-            Kirigami.FormSeparator {}
++        }
+ 
++        // ksr: Scrolling is its own section, as on the touchpad page
++        Kirigami.FormGroup {
+             Kirigami.FormEntry {
+                 // Scroll Speed aka scroll Factor
+                 id: scrollProfile
+@@ -344,8 +358,7 @@ KCMUtils.SimpleKCM {
+             Kirigami.FormEntry {
+                 contentItem: QQC2.CheckBox {
+                     id: naturalScroll
+-                    Kirigami.FormData.label: i18ndc("kcmmouse", "@title:group", "Scrolling:")
+-                    text: i18ndc("kcmmouse", "@option:check", "Invert scroll direction")
++                    text: i18ndc("kcmmouse", "@option:check", "Invert scroll direction (Natural scrolling)")  // ksr: kcm_mouse/root-device-naturalScroll
+                     enabled: root.device?.supportsNaturalScroll ?? false
+                     checked: enabled && (root.device?.naturalScroll ?? false)
+ 

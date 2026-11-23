@@ -1,0 +1,37 @@
+From 61407fa92532ead8c521383b31ccfe92d6585aab Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 09:05:44 +0500
+Subject: [PATCH 14/22] SettingsSearchModel: within a rank, settings that match
+ more words themselves come first
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ app/SettingsSearchModel.cpp | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/app/SettingsSearchModel.cpp b/app/SettingsSearchModel.cpp
+index 556e0d0..f2a6b6b 100644
+--- a/app/SettingsSearchModel.cpp
++++ b/app/SettingsSearchModel.cpp
+@@ -342,10 +342,18 @@ void SettingsSearchModel::setQuery(const QString &query)
+             } else if (containsAll(setting.foldedText + u' ' + setting.foldedSection, queryWords)) {
+                 rank = 3;
+             }
+-            settings.append({rank, i, {i, SettingResult}, setting.foldedText});
++            // Within a rank, the settings that say more of the query themselves come first
++            const QString own = setting.foldedText + u' ' + setting.foldedSection;
++            const int ownWords = std::count_if(queryWords.cbegin(), queryWords.cend(), [&own](const QString &word) {
++                return own.contains(word);
++            });
++            settings.append({rank, -ownWords, {i, SettingResult}, setting.foldedText});
+         }
+         std::stable_sort(settings.begin(), settings.end(), [](const Ranked &a, const Ranked &b) {
+-            return a.rank != b.rank ? a.rank < b.rank : a.sortKey.size() < b.sortKey.size();
++            if (a.rank != b.rank) {
++                return a.rank < b.rank;
++            }
++            return a.order != b.order ? a.order < b.order : a.sortKey.size() < b.sortKey.size();
+         });
+         // A control with the same text twice on a page (e.g. in two sections) is one result
+         QSet<QPair<int, QString>> seen;

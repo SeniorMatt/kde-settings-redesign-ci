@@ -1,0 +1,681 @@
+From 47b83830b4f2d84ae8d2d732caf75448b7bd7f5d Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 13:26:40 +0500
+Subject: [PATCH 18/22] Preload pages before the click: hover, keyboard focus,
+ search results, idle common tasks (not built yet)
+
+Built into a separate preload budget of ModuleView, one at a time, cancelled by any input.
+SYSTEMSETTINGS_PRELOAD=0 turns it off.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ app/CMakeLists.txt         |   2 +
+ app/ModuleView.cpp         |  68 ++++++++++++++-
+ app/ModuleView.h           |  25 +++++-
+ app/PagePreloader.cpp      | 173 +++++++++++++++++++++++++++++++++++++
+ app/PagePreloader.h        |  63 ++++++++++++++
+ app/SidebarMode.cpp        |  34 ++++++++
+ app/SidebarMode.h          |   8 ++
+ app/SidebarModel.cpp       |  17 ++++
+ app/SidebarModel.h         |   6 ++
+ app/qml/CategoriesPage.qml |  41 +++++++++
+ app/settingslayout_p.h     |   8 ++
+ 11 files changed, 441 insertions(+), 4 deletions(-)
+ create mode 100644 app/PagePreloader.cpp
+ create mode 100644 app/PagePreloader.h
+
+diff --git a/app/CMakeLists.txt b/app/CMakeLists.txt
+index 95b26f8..fa7159a 100644
+--- a/app/CMakeLists.txt
++++ b/app/CMakeLists.txt
+@@ -30,6 +30,8 @@ target_sources(systemsettings PRIVATE
+     SettingsLayoutTree.h
+     settingslayout_p.h
+     ModuleView.cpp
++    PagePreloader.cpp
++    PagePreloader.h
+     ModuleView.h
+ )
+ 
+diff --git a/app/ModuleView.cpp b/app/ModuleView.cpp
+index 30fff36..0cd1872 100644
+--- a/app/ModuleView.cpp
++++ b/app/ModuleView.cpp
+@@ -132,6 +132,9 @@ public:
+     // Pages that are kept alive, least recently used first
+     QList<KPageWidgetItem *> mPagesLru;
+     int mPageCacheSize = 0;
++    // Pages built ahead of a click and not shown yet, oldest first. Not in mPagesLru: they have their own budget.
++    QList<KPageWidgetItem *> mPreloaded;
++    int mPreloadBudget = 0;
+     KPageWidget *mPageWidget = nullptr;
+     CustomTitle *mCustomHeader = nullptr;
+     QVBoxLayout *mLayout = nullptr;
+@@ -254,7 +257,7 @@ void ModuleView::loadModule(const QModelIndex &menuItem, const QStringList &args
+     }
+ }
+ 
+-void ModuleView::addModule(MenuItem *item, const QStringList &args)
++void ModuleView::addModule(MenuItem *item, const QStringList &args, bool preload)
+ {
+     const KPluginMetaData data = item->metaData();
+     if (!KAuthorized::authorizeControlModule(data.pluginId())) {
+@@ -264,15 +267,23 @@ void ModuleView::addModule(MenuItem *item, const QStringList &args)
+     if (data.isHidden()) {
+         return;
+     }
++    if (preload && item->isExternalAppModule()) {
++        return;
++    }
+ 
+     if (KPageWidgetItem *page = d->mPagesPluginIdMap.key(data.pluginId())) {
+         // A cached page: make it current again at once, then re-read its settings (another page, an applet or an app
+         // may have changed them while it was hidden). It has no unsaved changes: they were resolved when it was left.
++        if (preload) {
++            return;
++        }
++        // A preloaded page was never shown, so nobody edited it: reload it whatever its state is
++        const bool wasPreloaded = d->mPreloaded.removeAll(page) > 0;
+         touchPage(page);
+         activeModuleChanged(page, d->mPageWidget->currentPage());
+         if (QPointer<KCModule> kcm = d->mPages.value(page)) {
+-            QTimer::singleShot(0, kcm, [kcm]() {
+-                if (kcm && !kcm->needsSave()) {
++            QTimer::singleShot(0, kcm, [kcm, wasPreloaded]() {
++                if (kcm && (wasPreloaded || !kcm->needsSave())) {
+                     kcm->load();
+                 }
+             });
+@@ -318,6 +329,13 @@ void ModuleView::addModule(MenuItem *item, const QStringList &args)
+     }
+ 
+     d->mPagesPluginIdMap.insert(page, data.pluginId());
++    if (preload) {
++        // Not shown: no header, icon or button changes now. activeModuleChanged() does that when the user opens it.
++        d->mPageWidget->addPage(page);
++        d->mPreloaded.append(page);
++        trimPreloaded();
++        return;
++    }
+     updatePageIconHeader(page);
+     // Add the new page
+     d->mPageWidget->addPage(page);
+@@ -329,6 +347,46 @@ void ModuleView::addModule(MenuItem *item, const QStringList &args)
+     trimPageCache();
+ }
+ 
++void ModuleView::trimPreloaded()
++{
++    while (d->mPreloaded.size() > d->mPreloadBudget) {
++        KPageWidgetItem *page = d->mPreloaded.takeFirst();
++        if (page == d->mPageWidget->currentPage()) {
++            continue;
++        }
++        d->pageChangeSupressed = true;
++        delete d->mPages.take(page);
++        d->mPagesPluginIdMap.remove(page);
++        d->mPageWidget->removePage(page);
++        d->pageChangeSupressed = false;
++    }
++}
++
++void ModuleView::setPreloadBudget(int size)
++{
++    d->mPreloadBudget = qMax(0, size);
++    trimPreloaded();
++}
++
++int ModuleView::preloadBudget() const
++{
++    return d->mPreloadBudget;
++}
++
++bool ModuleView::hasPage(MenuItem *item) const
++{
++    return item && d->mPagesPluginIdMap.key(item->metaData().pluginId());
++}
++
++bool ModuleView::preloadModule(MenuItem *item)
++{
++    if (!item || d->mPreloadBudget <= 0 || d->mPageCacheSize <= 0 || !d->mPageWidget->currentPage() || !item->isLibrary() || hasPage(item)) {
++        return false;
++    }
++    addModule(item, {}, true);
++    return hasPage(item);
++}
++
+ void ModuleView::touchPage(KPageWidgetItem *page)
+ {
+     d->mPagesLru.removeAll(page);
+@@ -471,6 +529,7 @@ void ModuleView::closeModules()
+     d->mPages.clear();
+     d->mPagesPluginIdMap.clear();
+     d->mPagesLru.clear();
++    d->mPreloaded.clear();
+     d->pageChangeSupressed = false;
+ }
+ 
+@@ -532,6 +591,9 @@ void ModuleView::activeModuleChanged(KPageWidgetItem *current, KPageWidgetItem *
+     if (d->pageChangeSupressed) {
+         return;
+     }
++    if (d->mPreloaded.removeAll(d->mPageWidget->currentPage()) > 0) {
++        touchPage(d->mPageWidget->currentPage());   // shown by another route than addModule: it is a visited page now
++    }
+ 
+     // We need to get the state of the now active module
+     stateChanged();
+diff --git a/app/ModuleView.h b/app/ModuleView.h
+index 9cfe84f..0fb9c30 100644
+--- a/app/ModuleView.h
++++ b/app/ModuleView.h
+@@ -84,6 +84,28 @@ public:
+     void setPageCacheSize(int size);
+     int pageCacheSize() const;
+ 
++    /**
++     * Pages that were built ahead of a click (see preloadModule) and are kept until they are shown or pushed out.
++     * They are on top of the page cache size, so a preload never evicts a page the user visited. 0 turns preloading off.
++     */
++    void setPreloadBudget(int size);
++    int preloadBudget() const;
++
++    /**
++     * Whether the page of this library item exists already (shown, cached or preloaded).
++     */
++    bool hasPage(MenuItem *item) const;
++
++    /**
++     * Builds the page of the item into the cache without showing it. It does not change the current page, the
++     * header, the window caption, the buttons or the focus. When the user opens it later it is re-shown like a
++     * cached page. Blocks the event loop for as long as the plugin needs to load, so call it only when idle.
++     * Does nothing without a current page (the first page becomes the current one by itself), for external
++     * applications, for pages that exist already, or when preloading or the page cache is off.
++     * @returns true if a page was built
++     */
++    bool preloadModule(MenuItem *item);
++
+     void setFaceType(KPageView::FaceType type);
+ 
+     /**
+@@ -181,7 +203,8 @@ public Q_SLOTS:
+ 
+ private:
+     bool resolveChanges(KCModule *currentProxy);
+-    void addModule(MenuItem *item, const QStringList &args);
++    void addModule(MenuItem *item, const QStringList &args, bool preload = false);
++    void trimPreloaded();
+     void moduleSave(KCModule *module);
+     void updatePageIconHeader(KPageWidgetItem *page);
+     void touchPage(KPageWidgetItem *page);
+diff --git a/app/PagePreloader.cpp b/app/PagePreloader.cpp
+new file mode 100644
+index 0000000..1b57a2e
+--- /dev/null
++++ b/app/PagePreloader.cpp
+@@ -0,0 +1,173 @@
++/*
++ * SPDX-FileCopyrightText: 2026 KDE Settings Redesign contributors
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "PagePreloader.h"
++#include "MenuItem.h"
++#include "ModuleView.h"
++#include "settingslayout_p.h"
++
++#include <KPluginMetaData>
++
++#include <QEvent>
++#include <QGuiApplication>
++#include <QLoggingCategory>
++
++#include <cstring>
++
++Q_LOGGING_CATEGORY(PRELOAD, "systemsettings.preload", QtWarningMsg)
++
++// The pointer must rest on a row this long before its page is built (a click follows a hover by ~150-400 ms)
++static constexpr int defaultHoverDelay = 120;
++// Idle preloading: first one this long after the first page, the next ones this far apart, and only after this much calm
++static constexpr int idleStartMs = 2500;
++static constexpr int idleGapMs = 1500;
++static constexpr int calmMs = 700;
++// How many common-task pages are built when idle (they sit in the preload budget until the user hovers something else)
++static constexpr int idleMaxPages = 2;
++
++bool PagePreloader::enabledByEnvironment()
++{
++    bool ok = false;
++    const int v = qEnvironmentVariableIntValue("SYSTEMSETTINGS_PRELOAD", &ok);
++    return !(ok && v == 0);
++}
++
++PagePreloader::PagePreloader(ModuleView *view, MenuItem *root, QObject *parent)
++    : QObject(parent)
++    , m_view(view)
++    , m_root(root)
++{
++    bool ok = false;
++    const int budget = qEnvironmentVariableIntValue("SYSTEMSETTINGS_PRELOAD_BUDGET", &ok);
++    m_view->setPreloadBudget(ok && budget >= 0 ? budget : 3);
++    m_hintTimer.setSingleShot(true);
++    m_idleTimer.setSingleShot(true);
++    connect(&m_hintTimer, &QTimer::timeout, this, &PagePreloader::runHint);
++    connect(&m_idleTimer, &QTimer::timeout, this, &PagePreloader::runIdle);
++    m_lastInput.start();
++    qApp->installEventFilter(this);
++}
++
++int PagePreloader::hoverDelay() const
++{
++    return qEnvironmentVariableIntValue("SYSTEMSETTINGS_PRELOAD_DELAY") > 0 ? qEnvironmentVariableIntValue("SYSTEMSETTINGS_PRELOAD_DELAY") : defaultHoverDelay;
++}
++
++bool PagePreloader::isExcluded(MenuItem *item, bool idle)
++{
++    if (!item || !item->metaData().isValid()) {
++        return true;
++    }
++    const QByteArray id = item->metaData().pluginId().toUtf8();
++    for (const char *never : neverPreload) {
++        if (id == never) {
++            return true;
++        }
++    }
++    if (idle) {
++        for (const char *heavy : neverPreloadWhenIdle) {
++            if (id == heavy) {
++                return true;
++            }
++        }
++    }
++    return false;
++}
++
++bool PagePreloader::userBusy() const
++{
++    return m_lastInput.elapsed() < calmMs;
++}
++
++bool PagePreloader::eventFilter(QObject *watched, QEvent *event)
++{
++    switch (event->type()) {
++    case QEvent::MouseButtonPress:
++    case QEvent::MouseButtonRelease:
++    case QEvent::KeyPress:
++    case QEvent::Wheel:
++    case QEvent::TouchBegin:
++        // The user is acting: whatever waits is probably wrong now
++        m_lastInput.restart();
++        m_hintTimer.stop();
++        m_pending = nullptr;
++        break;
++    default:
++        break;
++    }
++    return QObject::eventFilter(watched, event);
++}
++
++void PagePreloader::hint(MenuItem *item)
++{
++    m_pending = item;
++    if (!item || isExcluded(item, false) || m_view->hasPage(item)) {
++        m_hintTimer.stop();
++        m_pending = nullptr;
++        return;
++    }
++    m_hintTimer.start(hoverDelay());
++}
++
++void PagePreloader::cancelHint()
++{
++    m_hintTimer.stop();
++    m_pending = nullptr;
++}
++
++void PagePreloader::runHint()
++{
++    MenuItem *item = std::exchange(m_pending, nullptr);
++    if (!item) {
++        return;
++    }
++    QElapsedTimer t;
++    t.start();
++    if (m_view->preloadModule(item)) {
++        qCInfo(PRELOAD) << "hover preload" << item->metaData().pluginId() << t.elapsed() << "ms";
++    }
++    // The page that was just built counts as activity: the idle chain waits before it goes on
++    m_lastInput.restart();
++}
++
++void PagePreloader::startIdle()
++{
++    if (m_idleStarted || !qEnvironmentVariableIsEmpty("SYSTEMSETTINGS_PRELOAD_NOIDLE")) {
++        return;
++    }
++    m_idleStarted = true;
++    m_idleTimer.start(idleStartMs);
++}
++
++void PagePreloader::runIdle()
++{
++    if (m_idleDone >= idleMaxPages || m_idleCursor >= int(std::size(commonTasks))) {
++        return;
++    }
++    // Wait for a calm moment: the user is using the app, or it is in the background
++    if (userBusy() || m_hintTimer.isActive() || QGuiApplication::applicationState() != Qt::ApplicationActive) {
++        m_idleTimer.start(idleGapMs);
++        return;
++    }
++    // Next common-task target that exists and may be built
++    while (m_idleCursor < int(std::size(commonTasks))) {
++        MenuItem *item = m_root->descendantForModule(QString::fromLatin1(commonTasks[m_idleCursor++].kcm));
++        if (!item || isExcluded(item, true) || m_view->hasPage(item)) {
++            continue;
++        }
++        QElapsedTimer t;
++        t.start();
++        if (m_view->preloadModule(item)) {
++            ++m_idleDone;
++            qCInfo(PRELOAD) << "idle preload" << item->metaData().pluginId() << t.elapsed() << "ms";
++            m_lastInput.restart();
++        }
++        break;
++    }
++    m_idleTimer.start(idleGapMs);
++}
++
++#include "moc_PagePreloader.cpp"
+diff --git a/app/PagePreloader.h b/app/PagePreloader.h
+new file mode 100644
+index 0000000..1c36899
+--- /dev/null
++++ b/app/PagePreloader.h
+@@ -0,0 +1,63 @@
++/*
++ * SPDX-FileCopyrightText: 2026 KDE Settings Redesign contributors
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#pragma once
++
++#include <QElapsedTimer>
++#include <QObject>
++#include <QTimer>
++
++class MenuItem;
++class ModuleView;
++
++/**
++ * @brief Builds pages before the user clicks them, so that the click only has to show a finished page.
++ *
++ * Signals, cheapest first: the pointer rests on a sidebar row, a row gets the keyboard focus, a search result is
++ * highlighted, and (when the app is idle after start) the targets of the common tasks of the Home page.
++ * One page at a time. A page is built in one go on the event loop (loading the plugin cannot be split), but only
++ * after the hint has been stable for hoverDelay and only while the user is not using the mouse or keyboard; any
++ * click or key press cancels what is waiting. The pages go into ModuleView's separate preload budget, so they never
++ * evict visited pages. SYSTEMSETTINGS_PRELOAD=0 turns everything off.
++ */
++class PagePreloader : public QObject
++{
++    Q_OBJECT
++public:
++    PagePreloader(ModuleView *view, MenuItem *root, QObject *parent);
++
++    static bool enabledByEnvironment();
++
++    /** The user points at (or moved the focus to) the page that a click would open. Replaces an earlier hint. */
++    void hint(MenuItem *item);
++    /** The pointer left the row or the list lost the focus. */
++    void cancelHint();
++    /** Starts the idle preloading of the common tasks, once the first page is shown. */
++    void startIdle();
++
++    int hoverDelay() const;
++
++    /** Pages that must not be built ahead, for any signal (see settingslayout_p.h neverPreload) */
++    static bool isExcluded(MenuItem *item, bool idle);
++
++protected:
++    bool eventFilter(QObject *watched, QEvent *event) override;
++
++private:
++    void runHint();
++    void runIdle();
++    bool userBusy() const;
++
++    ModuleView *const m_view;
++    MenuItem *const m_root;
++    MenuItem *m_pending = nullptr;
++    QTimer m_hintTimer;
++    QTimer m_idleTimer;
++    QElapsedTimer m_lastInput;
++    int m_idleDone = 0;
++    int m_idleCursor = 0;
++    bool m_idleStarted = false;
++};
+diff --git a/app/SidebarMode.cpp b/app/SidebarMode.cpp
+index 951755d..ba6fa87 100644
+--- a/app/SidebarMode.cpp
++++ b/app/SidebarMode.cpp
+@@ -15,6 +15,7 @@
+ #include "ModuleView.h"
+ #include "SettingsLayoutTree.h"
+ #include "SidebarModel.h"
++#include "PagePreloader.h"
+ #include "kcmmetadatahelpers.h"
+ #include "systemsettings-config.h"
+ 
+@@ -135,6 +136,7 @@ public:
+     SettingLocator *locator = nullptr;
+     KDescendantsProxyModel *flatModel = nullptr;
+     ModuleView *moduleView = nullptr;
++    PagePreloader *preloader = nullptr;
+     KActionCollection *collection = nullptr;
+     QPersistentModelIndex activeCategoryIndex;
+     std::shared_ptr<QQmlEngine> engine;
+@@ -264,6 +266,11 @@ void SidebarMode::initEvent()
+         bool ok = false;
+         const int cacheSize = qEnvironmentVariableIntValue("SYSTEMSETTINGS_PAGE_CACHE", &ok);
+         d->moduleView->setPageCacheSize(ok && cacheSize >= 0 ? cacheSize : defaultPageCacheSize);
++        // Build the page under the pointer (and a few likely ones when idle) before the click
++        if (d->moduleView->pageCacheSize() > 0 && PagePreloader::enabledByEnvironment()) {
++            d->preloader = new PagePreloader(d->moduleView, rootItem(), this);
++            connect(d->moduleView, &ModuleView::moduleChanged, d->preloader, &PagePreloader::startIdle, Qt::SingleShotConnection);
++        }
+     }
+     if (d->applicationMode == InfoCenter) {
+         d->moduleView->setSaveStatistics(false);
+@@ -361,6 +368,33 @@ bool SidebarMode::loadModule(const QModelIndex &activeModule, const QStringList
+     return true;
+ }
+ 
++void SidebarMode::preloadHint(int row, bool search)
++{
++    if (!d->preloader) {
++        return;
++    }
++    MenuItem *target = nullptr;
++    if (search && d->settingsSearch) {
++        target = d->settingsSearch->index(row, 0).data(MenuModel::MenuItemRole).value<MenuItem *>();
++        if (target && !target->isLibrary()) {
++            target = nullptr; // a category result: the click opens its first page, which we do not resolve here
++        }
++    } else if (!search && d->sidebarModel) {
++        target = d->sidebarModel->openTarget(row);
++    }
++    if (target && !target->isLibrary()) {
++        target = nullptr;
++    }
++    d->preloader->hint(target);
++}
++
++void SidebarMode::preloadCancel()
++{
++    if (d->preloader) {
++        d->preloader->cancelHint();
++    }
++}
++
+ void SidebarMode::setSearchText(const QString &text)
+ {
+     if (d->settingsSearch) {
+diff --git a/app/SidebarMode.h b/app/SidebarMode.h
+index 62f4725..43a5130 100644
+--- a/app/SidebarMode.h
++++ b/app/SidebarMode.h
+@@ -158,6 +158,14 @@ public:
+      */
+     Q_INVOKABLE bool loadModule(const QModelIndex &activeModule, const QStringList &args = QStringList());
+ 
++    /**
++     * Page preloading (PagePreloader): the pointer rests on a row, or a row got the keyboard focus. Only a hint: the page
++     * is built later, when the hint has been stable for a moment and the user is idle. @p search is for the rows of the
++     * search results.
++     */
++    Q_INVOKABLE void preloadHint(int row, bool search);
++    Q_INVOKABLE void preloadCancel();
++
+     /**
+      * Helper function to move focus to the next/previous QQuickWidget
+      */
+diff --git a/app/SidebarModel.cpp b/app/SidebarModel.cpp
+index 8bff92f..3d8d0b5 100644
+--- a/app/SidebarModel.cpp
++++ b/app/SidebarModel.cpp
+@@ -315,6 +315,23 @@ void SidebarModel::expand(int row)
+     }
+ }
+ 
++MenuItem *SidebarModel::openTarget(int row) const
++{
++    if (row < 0 || row >= m_rows.size()) {
++        return nullptr;
++    }
++    const Row &entry = m_rows.at(row);
++    MenuItem *item = nullptr;
++    if (entry.kind == PageRow) {
++        item = entry.item;
++    } else if (entry.kind == CategoryRow && !isExpanded(entry)) {
++        // Same as openFirstPage(): a click opens the first page of the category
++        const QModelIndex first = m_source->index(0, 0, entry.sourceIndex);
++        item = first.isValid() ? first.data(MenuModel::MenuItemRole).value<MenuItem *>() : nullptr;
++    }
++    return item && item != m_currentItem ? item : nullptr;
++}
++
+ int SidebarModel::collapse(int row)
+ {
+     if (row < 0 || row >= m_rows.size()) {
+diff --git a/app/SidebarModel.h b/app/SidebarModel.h
+index 43c9016..5456d1b 100644
+--- a/app/SidebarModel.h
++++ b/app/SidebarModel.h
+@@ -87,6 +87,12 @@ public:
+      */
+     Q_INVOKABLE void expand(int row);
+ 
++    /**
++     * The page that a click on the row opens (the first page for a category that is not open), or nullptr
++     * (group header, or the page is shown already).
++     */
++    MenuItem *openTarget(int row) const;
++
+     /**
+      * Collapses the category of the row.
+      * @return the row to focus now: the category when called on one of its pages. -1 if nothing changed.
+diff --git a/app/qml/CategoriesPage.qml b/app/qml/CategoriesPage.qml
+index fa26908..8d07eb9 100644
+--- a/app/qml/CategoriesPage.qml
++++ b/app/qml/CategoriesPage.qml
+@@ -55,6 +55,17 @@ Kirigami.ScrollablePage {
+                 Layout.fillWidth: true
+                 onTextChanged: {
+                     systemsettings.setSearchText(text);
++                    topResultTimer.restart();
++                }
++                // Enter opens the first result: build its page once the typing pauses
++                Timer {
++                    id: topResultTimer
++                    interval: 450
++                    onTriggered: {
++                        if (mainColumn.searchMode && mainColumn.accordion && categoryView.count > 0) {
++                            systemsettings.preloadHint(0, true);
++                        }
++                    }
+                 }
+ 
+                 KeyNavigation.right: hamburgerMenuButton
+@@ -235,6 +246,18 @@ Kirigami.ScrollablePage {
+             }
+         }
+ 
++        // The row that has the keyboard focus: its page is built ahead of Enter
++        onCurrentIndexChanged: {
++            if (activeFocus && currentIndex >= 0) {
++                systemsettings.preloadHint(currentIndex, mainColumn.searchMode);
++            }
++        }
++        onActiveFocusChanged: {
++            if (!activeFocus) {
++                systemsettings.preloadCancel();
++            }
++        }
++
+         // The first row that is shown or just got the focus must be visible
+         Connections {
+             target: systemsettings.sidebarModel
+@@ -305,6 +328,14 @@ Kirigami.ScrollablePage {
+                     Accessible.expanded: model.expanded
+                     Accessible.selected: isCurrent
+ 
++                    // Build the page ahead of the click once the pointer has rested here
++                    onHoveredChanged: {
++                        if (hovered) {
++                            systemsettings.preloadHint(index, false);
++                        } else {
++                            systemsettings.preloadCancel();
++                        }
++                    }
+                     onClicked: {
+                         ListView.view.currentIndex = index;
+                         systemsettings.sidebarModel.activate(index);
+@@ -351,6 +382,16 @@ Kirigami.ScrollablePage {
+ 
+                 highlighted: ListView.isCurrentItem
+ 
++                // Search results: the highlighted or hovered page is built ahead of the click
++                onHoveredChanged: {
++                    if (mainColumn.searchMode && mainColumn.accordion && !isCategory) {
++                        if (hovered) {
++                            systemsettings.preloadHint(index, true);
++                        } else {
++                            systemsettings.preloadCancel();
++                        }
++                    }
++                }
+                 onClicked: {
+                     if (!enabled) { return; }
+                     if (mainColumn.searchMode && mainColumn.accordion) {
+diff --git a/app/settingslayout_p.h b/app/settingslayout_p.h
+index 2cba40f..ac60cf7 100644
+--- a/app/settingslayout_p.h
++++ b/app/settingslayout_p.h
+@@ -259,6 +259,14 @@ inline constexpr CommonTask commonTasks[] = {
+     {kli18nc("@action:button common task on the home page", "About this computer"), "kcm_about-distro"},
+ };
+ 
++// Pages that are never built before the user opens them (page preloading, PagePreloader). Their plugins or load()
++// have effects beyond showing settings: start device discovery or scans, ask the network or a system service, or
++// need polkit. Building them on a hover would do that for nothing. Unverified guess per page: revisit with measurements.
++inline constexpr const char *neverPreload[] = {"kcm_bluetooth", "kcm_networkmanagement", "kcm_updates", "kcm_printer_manager", "kcm_users"};
++// Pages that are too heavy to build while the user is not asking for them (long freezes of the event loop on a slow CPU,
++// big memory): only built on a hover, not by the idle preloader. kcm_keys scans every application for shortcuts.
++inline constexpr const char *neverPreloadWhenIdle[] = {"kcm_keys", "kcm_kscreen", "kcm_about-distro"};
++
+ // Renamed plugin ids: a layout page may be installed under either id
+ struct IdAlias {
+     const char *alias;

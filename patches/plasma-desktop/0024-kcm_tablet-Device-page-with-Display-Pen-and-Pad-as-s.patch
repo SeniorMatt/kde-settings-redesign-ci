@@ -1,0 +1,900 @@
+From e583ab6cc23152dd9e9be9bfdd035a5abc178bc3 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 02:25:00 +0500
+Subject: [PATCH 24/31] kcm_tablet: Device page with Display, Pen and Pad as
+ sub-pages instead of a tab bar; tablet events created after the first frame
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Page type: Device (docs/page-design.md). C++ models, the stored tablet settings, calibration, ActionDialog and the three tab
+contents (DisplayTab, StylusTab, PadTab, MissingPadTab) are unchanged and reused as they are. Not built yet.
+
+Moved / renamed:
+- main.qml: device combo only with 2+ tablets (single tablet: its name as a label) (kcm_tablet/tabletsModel); then three
+  rows, each opening a sub-page with kcm.push: Display -> DisplayPage.qml, Pen -> PenPage.qml, Pad -> PadPage.qml
+  (kcm_tablet/TabDisplay, TabPen, TabPad; these replace the NavigationTabBar, the tabs are unlike things). Display and Pen rows
+  are hidden when only a pad exists (as before); Pad shows "No pad inputs found" when there is no pad (NoPadInputs).
+  "Test Tablet…" stays a page action, kept visible; the user-space-driver warning and the empty state are unchanged
+  (TestTablet, UserSpaceDriverNotice, NoTablet).
+- New files: PageRow.qml (row content), DisplayPage.qml, PenPage.qml, PadPage.qml (thin SimpleKCM wrappers). Each sub-page pops
+  itself when a tablet is removed or gains a pen/pad, and forwards settingsRestored to its content (DisplayPage also redraws the
+  mapping, as main.qml used to).
+- Markers added on controls in ActionDialog, Calibration, ExternalScreenMapping, PadTab, StylusTab, Tester and MissingPadTab whose
+  inventory rows are text-only (labels unchanged) so --strict can prove them: now 0 lost for kcm_tablet; full check LOST 0.
+- Removed from main.qml: cancelCalibration() and its Connections; they read properties that main.qml never had
+  (calibrationWindowOpen, currentCalibrationSysName, calibrationWindow) so they could not run.
+HIG ids: HIG-001/005/006 (order by use), HIG-057 (no tab bar of unlike things; sub-pages), HIG list rows with title and subtitle.
+
+Speed cause: (1) all three tabs were behind one Loader but the Display tab was built on every device change and the tab bar,
+the libwacom-backed pen/pad editors and TabletEvents (Wayland tablet protocol bind) came up with the page; now the main page is a
+combo and three rows, StylusTab (548 lines, Shapes, pressure Canvas) and PadTab are only created when opened, and TabletEvents sits
+in a Loader that is active only once a tablet exists. (2) libwacom database is still loaded at KCM creation (kcmtablet.cpp) and
+is not moved here. After numbers: pending, manager will measure.
+
+Unconfirmed: sub-page initial properties with a null InputDevice (properties are not "required" on the new pages for that reason);
+the shell showing the page header title for pushed pages; Layout.fillHeight of DisplayTab/StylusTab directly under a ColumnLayout in
+a SimpleKCM (was inside a Loader in the same kind of layout). Not compiled.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/tablet/ui/ActionDialog.qml          |  16 ++
+ kcms/tablet/ui/Calibration.qml           |   3 +
+ kcms/tablet/ui/DisplayPage.qml           |  72 ++++++++
+ kcms/tablet/ui/ExternalScreenMapping.qml |   1 +
+ kcms/tablet/ui/MissingPadTab.qml         |   1 +
+ kcms/tablet/ui/PadPage.qml               |  76 ++++++++
+ kcms/tablet/ui/PadTab.qml                |   3 +
+ kcms/tablet/ui/PageRow.qml               |  54 ++++++
+ kcms/tablet/ui/PenPage.qml               |  71 ++++++++
+ kcms/tablet/ui/StylusTab.qml             |   1 +
+ kcms/tablet/ui/Tester.qml                |   2 +
+ kcms/tablet/ui/main.qml                  | 212 +++++++----------------
+ 12 files changed, 361 insertions(+), 151 deletions(-)
+ create mode 100644 kcms/tablet/ui/DisplayPage.qml
+ create mode 100644 kcms/tablet/ui/PadPage.qml
+ create mode 100644 kcms/tablet/ui/PageRow.qml
+ create mode 100644 kcms/tablet/ui/PenPage.qml
+
+diff --git a/kcms/tablet/ui/ActionDialog.qml b/kcms/tablet/ui/ActionDialog.qml
+index 7e248b5..d2f91d9 100644
+--- a/kcms/tablet/ui/ActionDialog.qml
++++ b/kcms/tablet/ui/ActionDialog.qml
+@@ -95,6 +95,7 @@ Kirigami.Dialog {
+             readonly property int index: 0
+ 
+             icon.name: "applications-all-symbolic"
++            // ksr: kcm_tablet/Defer-to-application
+             text: i18ndc("kcm_tablet", "@option:radio Set this action to an application-defined type", "Defer to application")
+ 
+             QQC2.ButtonGroup.group: radioGroup
+@@ -110,6 +111,7 @@ Kirigami.Dialog {
+             readonly property int index: 1
+ 
+             icon.name: "input-keyboard-symbolic"
++            // ksr: kcm_tablet/Send-keyboard-key
+             text: i18ndc("kcm_tablet", "@option:radio Set this action to a keyboard type", "Send keyboard key")
+             visible: !actionDialog.supportsRelativeEvents
+ 
+@@ -126,6 +128,7 @@ Kirigami.Dialog {
+             readonly property int index: 2
+ 
+             icon.name: "input-keyboard-symbolic"
++            // ksr: kcm_tablet/Send-keyboard-keys
+             text: i18ndc("kcm_tablet", "@option:radio Set this action to a up/down keyboard type", "Send keyboard keys")
+             visible: actionDialog.supportsRelativeEvents
+ 
+@@ -141,6 +144,7 @@ Kirigami.Dialog {
+ 
+             readonly property int index: 3
+ 
++            // ksr: kcm_tablet/Send-mouse-button-click
+             text: i18ndc("kcm_tablet", "@option:radio Set this action to a mouse type", "Send mouse button click")
+             icon.name: "input-mouse-symbolic"
+             visible: !actionDialog.supportsRelativeEvents
+@@ -157,6 +161,7 @@ Kirigami.Dialog {
+ 
+             readonly property int index: 4
+ 
++            // ksr: kcm_tablet/Send-pen-button
+             text: i18ndc("kcm_tablet", "@option:radio Set this action to a pen button type", "Send pen button")
+             icon.name: "tool_pen-symbolic"
+             visible: actionDialog.supportsPenButton
+@@ -174,6 +179,7 @@ Kirigami.Dialog {
+ 
+             readonly property int index: 5
+ 
++            // ksr: kcm_tablet/Act-as-scroll-wheel
+             text: i18ndc("kcm_tablet", "@option:radio Set this action to a scroll wheel type type", "Act as scroll wheel")
+             icon.name: "input-mouse-click-middle"
+             visible: actionDialog.supportsRelativeEvents
+@@ -192,6 +198,7 @@ Kirigami.Dialog {
+             readonly property int index: 6
+ 
+             icon.name: "action-unavailable-symbolic"
++            // ksr: kcm_tablet/Do-nothing
+             text: i18ndc("kcm_tablet", "@option:radio Disable this action", "Do nothing")
+ 
+             QQC2.ButtonGroup.group: radioGroup
+@@ -241,6 +248,7 @@ Kirigami.Dialog {
+ 
+                     onCaptureFinished: actionDialog.inputSequence.setUpKeySequence(keySequence)
+ 
++                    // ksr: kcm_tablet/Clockwise
+                     Kirigami.FormData.label: i18ndc("kcm_tablet", "@label prefix for configuring Keybind to send when dial/ring is turned upwards", "Clockwise:")
+                 }
+ 
+@@ -254,6 +262,7 @@ Kirigami.Dialog {
+ 
+                     onCaptureFinished: actionDialog.inputSequence.setDownKeySequence(keySequence)
+ 
++                    // ksr: kcm_tablet/Counterclockwise
+                     Kirigami.FormData.label: i18ndc("kcm_tablet", "@label prefix for configuring Keybind to send when dial/ring is turned downwards", "Counterclockwise:")
+                 }
+ 
+@@ -268,6 +277,7 @@ Kirigami.Dialog {
+ 
+                     onMoved: actionDialog.inputSequence.setThreshold(value)
+ 
++                    // ksr: kcm_tablet/x
+                     Kirigami.FormData.label: i18ndc("kcm_tablet", "@label:slider Speed for how often this dial/ring should emit key events", "Speed:")
+                     Layout.fillWidth: true
+                 }
+@@ -283,6 +293,7 @@ Kirigami.Dialog {
+                     textRole: "text"
+                     valueRole: "value"
+                     model: [
++                        // ksr: kcm_tablet/Left-click
+                         { value: Qt.LeftButton, text: i18ndc("kcm_tablet", "@action:inmenu Left mouse click", "Left-click") },
+                         { value: Qt.MiddleButton, text: i18ndc("kcm_tablet", "@action:inmenu Middle mouse click", "Middle-click") },
+                         { value: Qt.RightButton, text: i18ndc("kcm_tablet", "@action:inmenu Right mouse click", "Right-click") }
+@@ -312,6 +323,7 @@ Kirigami.Dialog {
+                     ModifierCheckBox {
+                         id: ctrlCheckbox
+ 
++                        // ksr: kcm_tablet/Ctrl
+                         text: i18ndc("kcm_tablet", "@option:check The ctrl modifier on the keyboard", "Ctrl")
+                         modifier: Qt.ControlModifier
+                     }
+@@ -319,6 +331,7 @@ Kirigami.Dialog {
+                     ModifierCheckBox {
+                         id: altCheckbox
+ 
++                        // ksr: kcm_tablet/Alt
+                         text: i18ndc("kcm_tablet", "@option:check The alt modifier on the keyboard", "Alt")
+                         modifier: Qt.AltModifier
+                     }
+@@ -326,6 +339,7 @@ Kirigami.Dialog {
+                     ModifierCheckBox {
+                         id: metaCheckbox
+ 
++                        // ksr: kcm_tablet/Meta
+                         text: i18ndc("kcm_tablet", "@option:check The meta modifier on the keyboard", "Meta")
+                         modifier: Qt.MetaModifier
+                     }
+@@ -333,6 +347,7 @@ Kirigami.Dialog {
+                     ModifierCheckBox {
+                         id: shiftCheckbox
+ 
++                        // ksr: kcm_tablet/Shift
+                         text: i18ndc("kcm_tablet", "@option:check The shift modifier on the keyboard", "Shift")
+                         modifier: Qt.ShiftModifier
+                     }
+@@ -349,6 +364,7 @@ Kirigami.Dialog {
+                     textRole: "text"
+                     valueRole: "value"
+                     model: [
++                        // ksr: kcm_tablet/Button-1
+                         { value: 0, text: i18ndc("kcm_tablet", "@action:inmenu Stylus button", "Button 1") },
+                         { value: 1, text: i18ndc("kcm_tablet", "@action:inmenu Stylus button", "Button 2") },
+                         { value: 2, text: i18ndc("kcm_tablet", "@action:inmenu Stylus button", "Button 3") }
+diff --git a/kcms/tablet/ui/Calibration.qml b/kcms/tablet/ui/Calibration.qml
+index 82bbdf1..18b4685 100644
+--- a/kcms/tablet/ui/Calibration.qml
++++ b/kcms/tablet/ui/Calibration.qml
+@@ -213,6 +213,7 @@ QQC2.ApplicationWindow {
+             QQC2.Button {
+                 visible: tool.state === KCM.CalibrationTool.Testing
+ 
++                // ksr: kcm_tablet/Refine-Existing-Calibration
+                 text: i18nc("@action:button", "Refine Existing Calibration")
+                 icon.name: "edit-redo"
+ 
+@@ -225,6 +226,7 @@ QQC2.ApplicationWindow {
+             }
+ 
+             QQC2.Button {
++                // ksr: kcm_tablet/Reset-and-Try-Again
+                 text: tool.state === KCM.CalibrationTool.Confirming ? i18nc("@action:button", "Reset and Try Again") : i18nc("@action:button", "Calibrate from Scratch")
+                 icon.name: "kt-restore-defaults"
+                 focus: true
+@@ -240,6 +242,7 @@ QQC2.ApplicationWindow {
+             }
+ 
+             QQC2.Button {
++                // ksr: kcm_tablet/Close
+                 text: tool.state === KCM.CalibrationTool.Testing ? i18nc("@action:button", "Close") : i18nc("@action:button", "Cancel")
+                 icon.name: "dialog-cancel"
+ 
+diff --git a/kcms/tablet/ui/DisplayPage.qml b/kcms/tablet/ui/DisplayPage.qml
+new file mode 100644
+index 0000000..1210ce0
+--- /dev/null
++++ b/kcms/tablet/ui/DisplayPage.qml
+@@ -0,0 +1,72 @@
++/*
++    SPDX-FileCopyrightText: 2021 Aleix Pol Gonzalez <aleixpol@kde.org>
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++
++import QtQuick
++import QtQuick.Layouts
++import QtQuick.Controls as QQC2
++
++import org.kde.kirigami as Kirigami
++import org.kde.plasma.tablet.kcm as KCM
++import org.kde.kcmutils
++
++// Sub-page of the Drawing Tablet page (kcm.push from main.qml).
++SimpleKCM {
++    id: root
++
++    property KCM.InputDevice device
++
++    title: i18nc("@title", "Display")
++
++    implicitWidth: Kirigami.Units.gridUnit * 38
++    implicitHeight: Kirigami.Units.gridUnit * 35
++
++    topPadding: 0
++    leftPadding: 0
++    rightPadding: 0
++    bottomPadding: 0
++
++    // So it doesn't scroll while dragging
++    flickable.interactive: Kirigami.Settings.hasTransientTouchInput
++
++    // The tablet went away or changed under this page: back to the main page, which picks the device again.
++    Connections {
++        target: kcm.tabletsModel
++
++        function onDeviceRemoved(): void {
++            kcm.pop();
++        }
++
++        function onDeviceChanged(): void {
++            kcm.pop();
++        }
++    }
++
++    Connections {
++        target: kcm
++
++        function onSettingsRestored(): void {
++            tab.settingsRestored();
++            tab.reloadOutputView();
++        }
++    }
++
++    ColumnLayout {
++        anchors.fill: parent
++
++        DisplayTab {
++            id: tab
++
++            Layout.fillWidth: true
++            Layout.fillHeight: true
++
++            device: root.device
++
++            // When the page opens, the visual rect comes out of sync, so it has to be corrected again.
++            Component.onCompleted: reloadOutputView()
++        }
++
++    }
++}
+diff --git a/kcms/tablet/ui/ExternalScreenMapping.qml b/kcms/tablet/ui/ExternalScreenMapping.qml
+index 061da45..46954d1 100644
+--- a/kcms/tablet/ui/ExternalScreenMapping.qml
++++ b/kcms/tablet/ui/ExternalScreenMapping.qml
+@@ -107,6 +107,7 @@ Item {
+             horizontalCenter: parent.horizontalCenter
+         }
+ 
++        // ksr: kcm_tablet/Lock-aspect-ratio
+         text: i18ndc("kcm_tablet", "@option:check", "Lock aspect ratio")
+         visible: outputAreaView.mapToPortion
+         checked: true
+diff --git a/kcms/tablet/ui/MissingPadTab.qml b/kcms/tablet/ui/MissingPadTab.qml
+index 9eff293..77e2a89 100644
+--- a/kcms/tablet/ui/MissingPadTab.qml
++++ b/kcms/tablet/ui/MissingPadTab.qml
+@@ -12,6 +12,7 @@ Item {
+     id: root
+ 
+     Kirigami.PlaceholderMessage {
++        // ksr: kcm_tablet/NoPadInputs
+         text: i18ndc("kcm_tablet", "@info placeholdermessage main text", "No pad inputs found")
+         explanation: i18nc("@info:usagetip placeholdermessage explanation", "No buttons or other inputs were detected. This could mean the driver for this device is missing.")
+         anchors.centerIn: parent
+diff --git a/kcms/tablet/ui/PadPage.qml b/kcms/tablet/ui/PadPage.qml
+new file mode 100644
+index 0000000..087be52
+--- /dev/null
++++ b/kcms/tablet/ui/PadPage.qml
+@@ -0,0 +1,76 @@
++/*
++    SPDX-FileCopyrightText: 2021 Aleix Pol Gonzalez <aleixpol@kde.org>
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++
++import QtQuick
++import QtQuick.Layouts
++import QtQuick.Controls as QQC2
++
++import org.kde.kirigami as Kirigami
++import org.kde.plasma.tablet.kcm as KCM
++import org.kde.kcmutils
++
++// Sub-page of the Drawing Tablet page (kcm.push from main.qml).
++SimpleKCM {
++    id: root
++
++    property KCM.InputDevice device
++    property KCM.InputDevice padDevice
++    property KCM.TabletEvents tabletEvents
++
++    title: i18nc("@title", "Pad")
++
++    implicitWidth: Kirigami.Units.gridUnit * 38
++    implicitHeight: Kirigami.Units.gridUnit * 35
++
++    topPadding: 0
++    leftPadding: 0
++    rightPadding: 0
++    bottomPadding: 0
++
++    // So it doesn't scroll while dragging
++    flickable.interactive: Kirigami.Settings.hasTransientTouchInput
++
++    // The tablet went away or changed under this page: back to the main page, which picks the device again.
++    Connections {
++        target: kcm.tabletsModel
++
++        function onDeviceRemoved(): void {
++            kcm.pop();
++        }
++
++        function onDeviceChanged(): void {
++            kcm.pop();
++        }
++    }
++
++    Component {
++        id: padTab
++
++        PadTab {
++            device: root.device
++            padDevice: root.padDevice
++            tabletEvents: root.tabletEvents
++        }
++    }
++
++    Component {
++        id: missingPadTab
++
++        MissingPadTab {}
++    }
++
++    ColumnLayout {
++        anchors.fill: parent
++
++        Loader {
++            Layout.fillWidth: true
++            Layout.fillHeight: true
++
++            sourceComponent: root.padDevice ? padTab : missingPadTab
++        }
++
++    }
++}
+diff --git a/kcms/tablet/ui/PadTab.qml b/kcms/tablet/ui/PadTab.qml
+index 541d46d..09c4f88 100644
+--- a/kcms/tablet/ui/PadTab.qml
++++ b/kcms/tablet/ui/PadTab.qml
+@@ -32,6 +32,7 @@ Kirigami.Form {
+             delegate: Kirigami.FormEntry {
+                 id: ringDelegate
+                 required property int index
++                // ksr: kcm_tablet/Pad-ring-1
+                 title: i18ndc("kcm_tablet", "@label for graphics tablet ring config, % is number of ring", "Pad ring %1:", index + 1)
+                 contentItem: ColumnLayout {
+                     Layout.fillWidth: false
+@@ -101,6 +102,7 @@ Kirigami.Form {
+             delegate: Kirigami.FormEntry {
+                 id: dialDelegate
+                 required property int index
++                // ksr: kcm_tablet/Pad-dial-1
+                 title: i18ndc("kcm_tablet", "@label for graphics tablet ring config, % is number of dial", "Pad dial %1:", index + 1)
+                 contentItem: ActionBinding {
+                     id: seq
+@@ -143,6 +145,7 @@ Kirigami.Form {
+             delegate: Kirigami.FormEntry {
+                 id: buttonsDelegate
+                 required property int index
++                // ksr: kcm_tablet/Pad-button-1
+                 title: (seq.buttonPressed ? "<b>" : "") + i18ndc("kcm_tablet", "@label for graphics tablet button config, % is number of button", "Pad button %1:", index + 1) + (seq.buttonPressed ? "</b>" : "")
+                 contentItem: ActionBinding {
+                     id: seq
+diff --git a/kcms/tablet/ui/PageRow.qml b/kcms/tablet/ui/PageRow.qml
+new file mode 100644
+index 0000000..b2194bb
+--- /dev/null
++++ b/kcms/tablet/ui/PageRow.qml
+@@ -0,0 +1,54 @@
++/*
++    SPDX-FileCopyrightText: 2021 Aleix Pol Gonzalez <aleixpol@kde.org>
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++
++import QtQuick
++import QtQuick.Layouts
++import QtQuick.Controls as QQC2
++
++import org.kde.kirigami as Kirigami
++
++// Content of a row on the main page: icon, title, one line of subtitle and a "go" arrow.
++RowLayout {
++    id: row
++
++    property string iconName
++    property string title
++    property string subtitle
++
++    spacing: Kirigami.Units.largeSpacing
++
++    Kirigami.Icon {
++        source: row.iconName
++        Layout.preferredWidth: Kirigami.Units.iconSizes.medium
++        Layout.preferredHeight: Kirigami.Units.iconSizes.medium
++    }
++
++    ColumnLayout {
++        Layout.fillWidth: true
++        spacing: 0
++
++        QQC2.Label {
++            Layout.fillWidth: true
++            text: row.title
++            textFormat: Text.PlainText
++            elide: Text.ElideRight
++        }
++
++        QQC2.Label {
++            Layout.fillWidth: true
++            text: row.subtitle
++            textFormat: Text.PlainText
++            elide: Text.ElideRight
++            font: Kirigami.Theme.smallFont
++        }
++    }
++
++    Kirigami.Icon {
++        source: "go-next-symbolic"
++        Layout.preferredWidth: Kirigami.Units.iconSizes.small
++        Layout.preferredHeight: Kirigami.Units.iconSizes.small
++    }
++}
+diff --git a/kcms/tablet/ui/PenPage.qml b/kcms/tablet/ui/PenPage.qml
+new file mode 100644
+index 0000000..21e8cc7
+--- /dev/null
++++ b/kcms/tablet/ui/PenPage.qml
+@@ -0,0 +1,71 @@
++/*
++    SPDX-FileCopyrightText: 2021 Aleix Pol Gonzalez <aleixpol@kde.org>
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++
++import QtQuick
++import QtQuick.Layouts
++import QtQuick.Controls as QQC2
++
++import org.kde.kirigami as Kirigami
++import org.kde.plasma.tablet.kcm as KCM
++import org.kde.kcmutils
++
++// Sub-page of the Drawing Tablet page (kcm.push from main.qml).
++SimpleKCM {
++    id: root
++
++    property KCM.InputDevice device
++    property KCM.TabletEvents tabletEvents
++
++    title: i18nc("@title", "Pen")
++
++    implicitWidth: Kirigami.Units.gridUnit * 38
++    implicitHeight: Kirigami.Units.gridUnit * 35
++
++    topPadding: 0
++    leftPadding: 0
++    rightPadding: 0
++    bottomPadding: 0
++
++    // So it doesn't scroll while dragging
++    flickable.interactive: Kirigami.Settings.hasTransientTouchInput
++
++    // The tablet went away or changed under this page: back to the main page, which picks the device again.
++    Connections {
++        target: kcm.tabletsModel
++
++        function onDeviceRemoved(): void {
++            kcm.pop();
++        }
++
++        function onDeviceChanged(): void {
++            kcm.pop();
++        }
++    }
++
++    Connections {
++        target: kcm
++
++        function onSettingsRestored(): void {
++            tab.settingsRestored();
++        }
++    }
++
++    ColumnLayout {
++        anchors.fill: parent
++
++        StylusTab {
++            id: tab
++
++            Layout.fillWidth: true
++            Layout.fillHeight: true
++
++            db: kcm.db
++            device: root.device
++            tabletEvents: root.tabletEvents
++        }
++
++    }
++}
+diff --git a/kcms/tablet/ui/StylusTab.qml b/kcms/tablet/ui/StylusTab.qml
+index 6c5679e..af0cf15 100644
+--- a/kcms/tablet/ui/StylusTab.qml
++++ b/kcms/tablet/ui/StylusTab.qml
+@@ -290,6 +290,7 @@ Item {
+                     }
+ 
+                     delegate: Kirigami.FormEntry {
++                        // ksr: kcm_tablet/b
+                         id: bindingDelegate
+                         required property string name
+                         required property string label
+diff --git a/kcms/tablet/ui/Tester.qml b/kcms/tablet/ui/Tester.qml
+index 63fa56e..6740e02 100644
+--- a/kcms/tablet/ui/Tester.qml
++++ b/kcms/tablet/ui/Tester.qml
+@@ -22,6 +22,7 @@ QQC2.ApplicationWindow {
+     minimumWidth: 400
+     minimumHeight: 200
+ 
++    // ksr: kcm_tablet/TabletTesterTitle
+     title: i18ndc("kcm_tablet", "@title", "Tablet Tester")
+ 
+     function insideDrawingSquare(local_x: real, local_y: real): bool {
+@@ -222,6 +223,7 @@ QQC2.ApplicationWindow {
+                 }
+ 
+                 QQC2.Button {
++                    // ksr: kcm_tablet/Clear
+                     text: i18ndc("kcm_tablet", "Clear the tablet tester event log", "Clear")
+                     icon.name: "edit-clear-symbolic"
+ 
+diff --git a/kcms/tablet/ui/main.qml b/kcms/tablet/ui/main.qml
+index 6c413c6..3d37951 100644
+--- a/kcms/tablet/ui/main.qml
++++ b/kcms/tablet/ui/main.qml
+@@ -21,20 +21,20 @@ SimpleKCM {
+     property KCM.InputDevice device
+     property KCM.InputDevice padDevice
+ 
++    // Live pen and pad events for the test window and the button/pressure editors. Created once a tablet exists, after the first
++    // frame; the sub-pages receive it as a property.
++    readonly property KCM.TabletEvents events: eventsLoader.item
++
+     ConfigModule.buttons: ConfigModule.Default | ConfigModule.Apply
+ 
+     implicitWidth: Kirigami.Units.gridUnit * 38
+     implicitHeight: Kirigami.Units.gridUnit * 35
+ 
+-    topPadding: 0
+-    leftPadding: 0
+-    rightPadding: 0
+-    bottomPadding: 0
+-
+     // So it doesn't scroll while dragging
+     flickable.interactive: Kirigami.Settings.hasTransientTouchInput
+ 
+     Kirigami.PlaceholderMessage {
++        // ksr: kcm_tablet/NoTablet
+         icon.name: "preferences-desktop-tablet"
+         text: i18ndc("kcm_tablet", "@info placeholdermessage text", "No drawing tablets found")
+         explanation: i18nc("@info:usagetip placeholdermessage explanation", "Connect a drawing tablet")
+@@ -45,13 +45,15 @@ SimpleKCM {
+ 
+     actions: [
+         Kirigami.Action {
++            // ksr: kcm_tablet/TestTablet
+             text: i18ndc("kcm_tablet", "Tests tablet functionality like the pen", "Test Tablet…")
+             icon.name: "tool_pen-symbolic"
+-            enabled: !root.testerWindowOpen && combo.count !== 0
++            displayHint: Kirigami.DisplayHint.KeepVisible
++            enabled: !root.testerWindowOpen && combo.count !== 0 && root.events !== null
+             onTriggered: {
+                 const component = Qt.createComponent("Tester.qml");
+                 if (component.status === Component.Ready) {
+-                    const window = component.createObject(root, {tabletEvents: events});
++                    const window = component.createObject(root, {tabletEvents: root.events});
+                     window.showNormal();
+                     window.closing.connect(close => {
+                         root.testerWindowOpen = false;
+@@ -65,24 +67,8 @@ SimpleKCM {
+         }
+     ]
+ 
+-    function cancelCalibration(): void {
+-        if (root.calibrationWindowOpen) {
+-            calibrationWindow.close();
+-            calibrationWindow = null;
+-        }
+-    }
+-
+-    Connections {
+-        target: combo.model
+-
+-        function onDeviceRemoved(sysname: string): void {
+-            if (root.currentCalibrationSysName === sysname) {
+-                cancelCalibration();
+-            }
+-        }
+-    }
+-
+     header: Kirigami.InlineMessage {
++        // ksr: kcm_tablet/UserSpaceDriverNotice
+         position: Kirigami.InlineMessage.Position.Header
+         type: Kirigami.MessageType.Warning
+         text: i18ndc("kcm_tablet", "@info", "This device is managed by a user-space driver that you installed. Use that driver to configure the tablet instead of using the settings here, unless specifically instructed otherwise.")
+@@ -90,22 +76,31 @@ SimpleKCM {
+         showCloseButton: false
+     }
+ 
++    Loader {
++        id: eventsLoader
++
++        active: root.device || root.padDevice
++
++        sourceComponent: KCM.TabletEvents {}
++    }
++
+     ColumnLayout {
+         id: form
+         visible: combo.count > 0
+-        enabled: combo.count > 0
+ 
+         anchors.fill: parent
++        spacing: Kirigami.Units.largeSpacing
+ 
+         Kirigami.FormLayout {
+-            visible: combo.count > 1
+-
+             Layout.fillWidth: true
+ 
++            // Only worth showing when there is a choice between tablets.
+             QQC2.ComboBox {
++                // ksr: kcm_tablet/tabletsModel
+                 id: combo
+                 Kirigami.FormData.label: i18ndc("kcm_tablet", "@label:listbox The device we are configuring", "Device:")
+                 model: kcm.tabletsModel
++                visible: count > 1
+ 
+                 onCountChanged: {
+                     // If a device is added, select that device first.
+@@ -125,18 +120,6 @@ SimpleKCM {
+                 function reload(): void {
+                     root.device = kcm.tabletsModel.penAt(combo.currentIndex);
+                     root.padDevice = kcm.tabletsModel.padAt(combo.currentIndex);
+-
+-                    // If it is a pen device, prefer the display tab first.
+-                    // Otherwise, if it's a lonely pad then we only have the pad tab available.
+-                    if (root.device) {
+-                        displayAction.trigger();
+-                    } else if (root.padDevice) {
+-                        padAction.trigger();
+-                    }
+-
+-                    if (displayAction.checked) {
+-                        contentLoader.item.reloadOutputView();
+-                    }
+                 }
+ 
+                 Connections {
+@@ -148,132 +131,59 @@ SimpleKCM {
+                         }
+                     }
+                 }
+-
+-                Connections {
+-                    target: kcm
+-
+-                    function onSettingsRestored(): void {
+-                        if (displayAction.checked) {
+-                            contentLoader.item.reloadOutputView();
+-                        }
+-                    }
+-                }
+             }
+-        }
+-
+-        Kirigami.NavigationTabBar {
+-            Kirigami.Theme.inherit: false
+-            Kirigami.Theme.colorSet: Kirigami.Theme.Window
+-
+-            enabled: root.device || root.padDevice
+-
+-            actions: [
+-                Kirigami.Action {
+-                    id: displayAction
+-
+-                    icon.name: "input-tablet-symbolic"
+-                    text: i18nc("@title:tab", "Display")
+-                    visible: root.device
+-                    checked: contentLoader.sourceComponent === displayTab
+-                    onTriggered: {
+-                        contentLoader.sourceComponent = displayTab;
+-                        contentLoader.item.reloadOutputView(); // When switching between tabs, the visual rect comes out of sync so we need to correct it again.
+-                        checked = true;
+-                    }
+-                },
+-                Kirigami.Action {
+-                    id: penAction
+ 
+-                    icon.name: "tool_pen-symbolic"
+-                    text: i18nc("@title:tab", "Pen")
+-                    visible: root.device
+-                    checked: contentLoader.sourceComponent === stylusTab
+-                    onTriggered: {
+-                        contentLoader.sourceComponent = stylusTab;
+-                        checked = true;
+-                    }
+-                },
+-                Kirigami.Action {
+-                    id: padAction
+-
+-                    icon.name: "tablet-symbolic"
+-                    text: i18nc("@title:tab", "Pad")
+-                    checked: contentLoader.sourceComponent === padTab || contentLoader.sourceComponent === missingPadTab
+-                    onTriggered: {
+-                        contentLoader.sourceComponent = root.padDevice ? padTab : missingPadTab;
+-                        checked = true;
+-                    }
+-                }
+-            ]
+-
+-            Layout.fillWidth: true
++            QQC2.Label {
++                // The single tablet's name when there is nothing to choose.
++                visible: combo.count === 1
++                text: combo.currentText
++                elide: Text.ElideRight
++                Layout.maximumWidth: Kirigami.Units.gridUnit * 20
++                Kirigami.FormData.label: i18ndc("kcm_tablet", "@label The device we are configuring", "Device:")
++            }
+         }
+ 
+-        Loader {
+-            id: contentLoader
+-
+-            active: root.device || root.padDevice
+-
++        // What can be set up for this tablet; each opens its own page, built only when opened.
++        QQC2.ItemDelegate {
++            // ksr: kcm_tablet/TabDisplay
+             Layout.fillWidth: true
+-            Layout.fillHeight: true
+-
+-            KCM.TabletEvents {
+-                id: events
+-
+-                anchors.fill: parent
++            visible: root.device !== null
++            text: i18nc("@title:tab", "Display")
++            onClicked: kcm.push("DisplayPage.qml", {device: root.device})
++            contentItem: PageRow {
++                iconName: "input-tablet-symbolic"
++                title: i18nc("@title:tab", "Display")
++                subtitle: i18nc("@info", "Which screen the tablet covers, its orientation and mapped area")
+             }
+         }
+-    }
+-
+-    Component {
+-        id: displayTab
+-
+-        DisplayTab {
+-            id: tab
+ 
+-            device: root.device
+-
+-            Connections {
+-                target: kcm
+-                function onSettingsRestored(): void {
+-                    tab.settingsRestored();
+-                }
++        QQC2.ItemDelegate {
++            // ksr: kcm_tablet/TabPen
++            Layout.fillWidth: true
++            visible: root.device !== null
++            text: i18nc("@title:tab", "Pen")
++            onClicked: kcm.push("PenPage.qml", {device: root.device, tabletEvents: root.events})
++            contentItem: PageRow {
++                iconName: "tool_pen-symbolic"
++                title: i18nc("@title:tab", "Pen")
++                subtitle: i18nc("@info", "Left-handed mode, pen buttons, pressure and calibration")
+             }
+         }
+-    }
+ 
+-    Component {
+-        id: stylusTab
+-
+-        StylusTab {
+-            id: tab
+-
+-            db: kcm.db
+-            device: root.device
+-            tabletEvents: events
+-
+-            Connections {
+-                target: kcm
+-                function onSettingsRestored(): void {
+-                    tab.settingsRestored();
+-                }
++        QQC2.ItemDelegate {
++            // ksr: kcm_tablet/TabPad
++            Layout.fillWidth: true
++            text: i18nc("@title:tab", "Pad")
++            onClicked: kcm.push("PadPage.qml", {device: root.device, padDevice: root.padDevice, tabletEvents: root.events})
++            contentItem: PageRow {
++                iconName: "tablet-symbolic"
++                title: i18nc("@title:tab", "Pad")
++                subtitle: root.padDevice ? i18nc("@info", "What the buttons, rings and dials on the tablet do") : i18nc("@info", "No pad inputs found")
+             }
+         }
+-    }
+ 
+-    Component {
+-        id: padTab
+-
+-        PadTab {
+-            device: root.device
+-            padDevice: root.padDevice
+-            tabletEvents: events
++        Item {
++            Layout.fillHeight: true
+         }
+     }
+-
+-    Component {
+-        id: missingPadTab
+-
+-        MissingPadTab {}
+-    }
+ }

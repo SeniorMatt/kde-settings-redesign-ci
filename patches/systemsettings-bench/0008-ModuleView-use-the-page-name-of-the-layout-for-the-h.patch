@@ -1,0 +1,47 @@
+From d099ab1f03282c82278e329a20cdce9fe5487872 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 08:56:34 +0500
+Subject: [PATCH 08/34] ModuleView: use the page name of the layout for the
+ header and window caption
+
+The sidebar shows the name the layout gives a page (e.g. Displays), so the
+page header and the window caption must show the same name, not the KCM's own.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ app/ModuleView.cpp | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/app/ModuleView.cpp b/app/ModuleView.cpp
+index 7cfb69a..cf17f6e 100644
+--- a/app/ModuleView.cpp
++++ b/app/ModuleView.cpp
+@@ -289,7 +289,8 @@ void ModuleView::addModule(MenuItem *item, const QStringList &args)
+     moduleScroll->horizontalScrollBar()->installEventFilter(this);
+     moduleScroll->verticalScrollBar()->installEventFilter(this);
+     // Create the page
+-    auto page = new KPageWidgetItem(moduleScroll, data.name());
++    // The layout may have renamed the page: the header and the window caption use the name the sidebar shows
++    auto page = new KPageWidgetItem(moduleScroll, item->name());
+     // Provide information to the users
+ 
+     // set accessible name, or screen reader users will have a cryptic "LayeredPane" tabstop
+@@ -298,7 +299,7 @@ void ModuleView::addModule(MenuItem *item, const QStringList &args)
+     if (item->isExternalAppModule()) {
+         auto externalWidget = new ExternalAppModule(KService::Ptr(new KService(item->metaData().fileName())));
+         moduleScroll->setWidget(externalWidget);
+-        d->mCustomHeader->setText(item->metaData().name()); // We have to set this manually, BUG: 448672
++        d->mCustomHeader->setText(item->name()); // We have to set this manually, BUG: 448672
+         page->setName(QString());
+     } else { // It must be a normal module then
+         auto kcm = KCModuleLoader::loadModule(data, moduleScroll, QVariantList(args.begin(), args.end()), d->engine);
+@@ -396,7 +397,7 @@ void ModuleView::updatePageIconHeader(KPageWidgetItem *page)
+         return;
+     }
+ 
+-    const QString &moduleName = kcm->metaData().name();
++    const QString moduleName = page->name().isEmpty() ? kcm->metaData().name() : page->name();
+     page->setHeader(moduleName);
+     page->setIcon(QIcon::fromTheme(kcm->metaData().iconName()));
+ 

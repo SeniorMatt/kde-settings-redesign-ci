@@ -1,0 +1,341 @@
+From 1f6db6453b359574a1436ce8e988460e143e7262 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 01:29:52 +0500
+Subject: [PATCH 12/31] kcm_desktoppaths: Form page ordered by use, plain
+ FormLayout rows instead of Kirigami.Form
+
+Page type: Form (docs/page-design.md). Settings keys, user-dirs.dirs handling, defaults unchanged. Not built yet.
+
+Moved / renamed:
+- Order: Downloads, Documents, Desktop, Pictures, Music, Videos first (untitled section); Public, Templates, Projects in a
+  second section "Sharing and Development" (kcm_desktoppaths/Public, Templates, Projects). Labels unchanged.
+- UrlRequester is now a RowLayout (read-only path field + folder button) used as a FormLayout row instead of a
+  Kirigami.FormEntry in Form/FormGroup with a SizeGroup; the default-differs highlight targets the text field.
+- Path field and button get Accessible.name/description (kcm_desktoppaths/Choose-new-location).
+- Shell name is "Personal Folders" (ia/layout.json), "Locations" stays an alias there.
+HIG ids: HIG-001/005 (order by use), HIG-057 (section title is a noun).
+
+Speed cause: nothing blocking in the page; the cost was nine FormEntry items (each builds title, subtitle, trailing items and a
+layout) plus a Kirigami.SizeGroup over their content items. Plain rows remove that. user-dirs.dirs is read in the
+settings constructor (small file, kept). After numbers: pending, manager will measure.
+
+Unconfirmed: KCM.SettingHighlighter `target` set to the TextField (property exists in kcmutils settinghighlighterprivate.h).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/desktoppaths/ui/UrlRequester.qml |  51 ++++---
+ kcms/desktoppaths/ui/main.qml         | 203 +++++++++++---------------
+ 2 files changed, 117 insertions(+), 137 deletions(-)
+
+diff --git a/kcms/desktoppaths/ui/UrlRequester.qml b/kcms/desktoppaths/ui/UrlRequester.qml
+index 118aeef..8bab88f 100644
+--- a/kcms/desktoppaths/ui/UrlRequester.qml
++++ b/kcms/desktoppaths/ui/UrlRequester.qml
+@@ -14,17 +14,21 @@ import org.kde.kcmutils as KCM
+ 
+ pragma ComponentBehavior: Bound
+ 
+-Kirigami.FormEntry {
++// A folder row for a FormLayout: read-only path field plus a "Choose..." button (docs/page-design.md §3, file or folder).
++RowLayout {
+     id: urlRequester
+ 
+     required property url location
+     required property url defaultLocation
++    property string description
+ 
+     /**
+      * Emitted when the user selects a new folder
+      */
+     signal newLocationSelected(url newLocation)
+ 
++    spacing: Kirigami.Units.smallSpacing
++
+     Component {
+         id: fileDialogComponent
+ 
+@@ -41,36 +45,39 @@ Kirigami.FormEntry {
+         }
+     }
+ 
+-    KCM.SettingHighlighter {
+-        highlight: urlRequester.location !== urlRequester.defaultLocation
+-    }
+-
+-    contentItem: QQC2.TextField {
++    QQC2.TextField {
+         id: textField
+-        Layout.preferredHeight: Math.max(fileDialogButton.implicitHeight, textField.implicitHeight)
++        Layout.fillWidth: true
++        Layout.preferredWidth: Kirigami.Units.gridUnit * 18
+         text: urlRequester.location.toString().substr(7)
+         readOnly: true
+ 
+-        Accessible.description: urlRequester.Accessible.description
+-        QQC2.ToolTip.text: urlRequester.Accessible.description
++        Accessible.name: urlRequester.Kirigami.FormData.label
++        Accessible.description: urlRequester.description
++        QQC2.ToolTip.text: urlRequester.description
+         QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
+         QQC2.ToolTip.visible: textField.hovered
++
++        KCM.SettingHighlighter {
++            target: textField
++            highlight: urlRequester.location !== urlRequester.defaultLocation
++        }
+     }
+ 
+-    trailingItems: [
+-        QQC2.Button {
+-            id: fileDialogButton
++    QQC2.Button {
++        id: fileDialogButton
+ 
+-            display: QQC2.AbstractButton.IconOnly
+-            icon.name: "document-open"
+-            text: i18nc("@action:button", "Choose new location")
++        display: QQC2.AbstractButton.IconOnly
++        icon.name: "document-open"
++        // ksr: kcm_desktoppaths/Choose-new-location
++        text: i18nc("@action:button", "Choose new location")
+ 
+-            Accessible.description: text
+-            QQC2.ToolTip.text: text
+-            QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
+-            QQC2.ToolTip.visible: fileDialogButton.hovered
++        Accessible.name: text
++        Accessible.description: urlRequester.description
++        QQC2.ToolTip.text: text
++        QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
++        QQC2.ToolTip.visible: fileDialogButton.hovered
+ 
+-            onClicked: fileDialogComponent.incubateObject(urlRequester)
+-        }
+-    ]
++        onClicked: fileDialogComponent.incubateObject(urlRequester)
++    }
+ }
+diff --git a/kcms/desktoppaths/ui/main.qml b/kcms/desktoppaths/ui/main.qml
+index a2553c3..9f7f0ae 100644
+--- a/kcms/desktoppaths/ui/main.qml
++++ b/kcms/desktoppaths/ui/main.qml
+@@ -15,130 +15,103 @@ KCM.SimpleKCM {
+ 
+     KCM.ConfigModule.buttons: KCM.ConfigModule.Default | KCM.ConfigModule.Apply
+ 
+-    Kirigami.SizeGroup {
+-        mode: Kirigami.SizeGroup.Width
+-        items: [
+-            desktop.contentItem,
+-            documents.contentItem,
+-            downloads.contentItem,
+-            videos.contentItem,
+-            pictures.contentItem,
+-            music.contentItem,
+-            publicPath.contentItem,
+-            templates.contentItem,
+-            projects.contentItem
+-        ]
+-    }
+-
+-    Kirigami.Form {
+-        Kirigami.FormGroup {
+-            UrlRequester {
+-                id: desktop
+-
+-                title: i18nc("@label:textbox", "Desktop folder:")
+-
+-                location: kcm.settings.desktopLocation
+-                defaultLocation: kcm.settings.defaultDesktopLocation
+-                Accessible.description: i18nc("@info:tooltip and accessible description", "This folder contains all the files you see on your desktop.")
+-
+-                onNewLocationSelected: (newLocation) => kcm.settings.desktopLocation = newLocation
+-            }
+-
+-            UrlRequester {
+-                id: documents
+-
+-                title: i18nc("@label:textbox", "Documents folder:")
+-
+-                location: kcm.settings.documentsLocation
+-                defaultLocation: kcm.settings.defaultDocumentsLocation
+-                Accessible.description: i18nc("@info:tooltip and accessible description", "This folder will be used by default to open or save documents.")
+-
+-                onNewLocationSelected: (newLocation) => kcm.settings.documentsLocation = newLocation
+-            }
+-
+-            UrlRequester {
+-                id: downloads
+-
+-                title: i18nc("@label:textbox", "Downloads folder:")
+-
+-                location: kcm.settings.downloadsLocation
+-                defaultLocation: kcm.settings.defaultDownloadsLocation
+-                Accessible.description: i18nc("@info:tooltip and accessible description", "This folder will be used by default to save your downloaded items.")
+-
+-                onNewLocationSelected: (newLocation) => kcm.settings.downloadsLocation = newLocation
+-            }
+-
+-            UrlRequester {
+-                id: videos
+-
+-                title: i18nc("@label:textbox", "Videos folder:")
+-
+-                location: kcm.settings.videosLocation
+-                defaultLocation: kcm.settings.defaultVideosLocation
+-                Accessible.description: i18nc("@info:tooltip and accessible description", "This folder will be used by default to open or save video files.")
+-
+-                onNewLocationSelected: (newLocation) => kcm.settings.videosLocation = newLocation
+-            }
+-
+-            UrlRequester {
+-                id: pictures
+-
+-                title: i18nc("@label:textbox", "Pictures folder:")
+-
+-                location: kcm.settings.picturesLocation
+-                defaultLocation: kcm.settings.defaultPicturesLocation
+-                Accessible.description: i18nc("@info:tooltip and accessible description", "This folder will be used by default to open or save image files.")
+-
+-                onNewLocationSelected: (newLocation) => kcm.settings.picturesLocation = newLocation
+-            }
+-
+-            UrlRequester {
+-                id: music
+-
+-                title: i18nc("@label:textbox", "Music folder:")
+-
+-                location: kcm.settings.musicLocation
+-                defaultLocation: kcm.settings.defaultMusicLocation
+-                Accessible.description: i18nc("@info:tooltip and accessible description", "This folder will be used by default to open or save music files.")
+-
+-                onNewLocationSelected: (newLocation) => kcm.settings.musicLocation = newLocation
+-            }
+-
+-            UrlRequester {
+-                id: publicPath
+-
+-                title: i18nc("@label:textbox", "Public folder:")
+-
+-                location: kcm.settings.publicLocation
+-                defaultLocation: kcm.settings.defaultPublicLocation
+-                Accessible.description: i18nc("@info:tooltip and accessible description", "This folder will be used by default for publicly-shared files when network sharing is enabled.")
++    // Form page (docs/page-design.md): the folders people change most come first, the rarely used ones in a second
++    // section. Plain FormLayout rows (no Kirigami.Form/FormGroup/FormEntry, which build a heavier item tree per row).
++    Kirigami.FormLayout {
++
++        UrlRequester {
++            // ksr: kcm_desktoppaths/Downloads
++            id: downloads
++            Kirigami.FormData.label: i18nc("@label:textbox", "Downloads folder:")
++            location: kcm.settings.downloadsLocation
++            defaultLocation: kcm.settings.defaultDownloadsLocation
++            description: i18nc("@info:tooltip and accessible description", "This folder will be used by default to save your downloaded items.")
++            onNewLocationSelected: (newLocation) => kcm.settings.downloadsLocation = newLocation
++        }
+ 
+-                onNewLocationSelected: (newLocation) => kcm.settings.publicLocation = newLocation
+-            }
++        UrlRequester {
++            // ksr: kcm_desktoppaths/Documents
++            id: documents
++            Kirigami.FormData.label: i18nc("@label:textbox", "Documents folder:")
++            location: kcm.settings.documentsLocation
++            defaultLocation: kcm.settings.defaultDocumentsLocation
++            description: i18nc("@info:tooltip and accessible description", "This folder will be used by default to open or save documents.")
++            onNewLocationSelected: (newLocation) => kcm.settings.documentsLocation = newLocation
++        }
+ 
+-            UrlRequester {
+-                id: templates
++        UrlRequester {
++            // ksr: kcm_desktoppaths/Desktop
++            id: desktop
++            Kirigami.FormData.label: i18nc("@label:textbox", "Desktop folder:")
++            location: kcm.settings.desktopLocation
++            defaultLocation: kcm.settings.defaultDesktopLocation
++            description: i18nc("@info:tooltip and accessible description", "This folder contains all the files you see on your desktop.")
++            onNewLocationSelected: (newLocation) => kcm.settings.desktopLocation = newLocation
++        }
+ 
+-                title: i18nc("@label:textbox", "Templates folder:")
++        UrlRequester {
++            // ksr: kcm_desktoppaths/Pictures
++            id: pictures
++            Kirigami.FormData.label: i18nc("@label:textbox", "Pictures folder:")
++            location: kcm.settings.picturesLocation
++            defaultLocation: kcm.settings.defaultPicturesLocation
++            description: i18nc("@info:tooltip and accessible description", "This folder will be used by default to open or save image files.")
++            onNewLocationSelected: (newLocation) => kcm.settings.picturesLocation = newLocation
++        }
+ 
+-                location: kcm.settings.templatesLocation
+-                defaultLocation: kcm.settings.defaultTemplatesLocation
+-                Accessible.description: i18nc("@info:tooltip and accessible description", "This folder will be used by default to open or save file templates.")
++        UrlRequester {
++            // ksr: kcm_desktoppaths/Music
++            id: music
++            Kirigami.FormData.label: i18nc("@label:textbox", "Music folder:")
++            location: kcm.settings.musicLocation
++            defaultLocation: kcm.settings.defaultMusicLocation
++            description: i18nc("@info:tooltip and accessible description", "This folder will be used by default to open or save music files.")
++            onNewLocationSelected: (newLocation) => kcm.settings.musicLocation = newLocation
++        }
+ 
+-                onNewLocationSelected: (newLocation) => kcm.settings.templatesLocation = newLocation
+-            }
++        UrlRequester {
++            // ksr: kcm_desktoppaths/Videos
++            id: videos
++            Kirigami.FormData.label: i18nc("@label:textbox", "Videos folder:")
++            location: kcm.settings.videosLocation
++            defaultLocation: kcm.settings.defaultVideosLocation
++            description: i18nc("@info:tooltip and accessible description", "This folder will be used by default to open or save video files.")
++            onNewLocationSelected: (newLocation) => kcm.settings.videosLocation = newLocation
++        }
+ 
+-            UrlRequester {
+-                id: projects
++        Kirigami.Separator {
++            Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18nc("@title:group", "Sharing and Development")
++        }
+ 
+-                title: i18nc("@label:textbox", "Projects folder:")
++        UrlRequester {
++            // ksr: kcm_desktoppaths/Public
++            id: publicPath
++            Kirigami.FormData.label: i18nc("@label:textbox", "Public folder:")
++            location: kcm.settings.publicLocation
++            defaultLocation: kcm.settings.defaultPublicLocation
++            description: i18nc("@info:tooltip and accessible description", "This folder will be used by default for publicly-shared files when network sharing is enabled.")
++            onNewLocationSelected: (newLocation) => kcm.settings.publicLocation = newLocation
++        }
+ 
+-                location: kcm.settings.projectsLocation
+-                defaultLocation: kcm.settings.defaultProjectsLocation
+-                Accessible.description: i18nc("@info:tooltip and accessible description", "This folder will be used by default to open or save projects.")
++        UrlRequester {
++            // ksr: kcm_desktoppaths/Templates
++            id: templates
++            Kirigami.FormData.label: i18nc("@label:textbox", "Templates folder:")
++            location: kcm.settings.templatesLocation
++            defaultLocation: kcm.settings.defaultTemplatesLocation
++            description: i18nc("@info:tooltip and accessible description", "This folder will be used by default to open or save file templates.")
++            onNewLocationSelected: (newLocation) => kcm.settings.templatesLocation = newLocation
++        }
+ 
+-                onNewLocationSelected: (newLocation) => kcm.settings.projectsLocation = newLocation
+-            }
++        UrlRequester {
++            // ksr: kcm_desktoppaths/Projects
++            id: projects
++            Kirigami.FormData.label: i18nc("@label:textbox", "Projects folder:")
++            location: kcm.settings.projectsLocation
++            defaultLocation: kcm.settings.defaultProjectsLocation
++            description: i18nc("@info:tooltip and accessible description", "This folder will be used by default to open or save projects.")
++            onNewLocationSelected: (newLocation) => kcm.settings.projectsLocation = newLocation
+         }
+     }
+ }

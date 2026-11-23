@@ -1,0 +1,27 @@
+bluedevil	kcm_bluetooth
+discover	kcm_updates
+flatpak-kcm	kcm_app-permissions
+kaccounts-integration	kcm_kaccounts
+kde-cli-tools	kcm_filetypes
+kinfocenter	kcm_about-distro kcm_cpu kcm_memory kcm_energyinfo kcm_block_devices kcm_audio_information kcm_edid kcm_egl kcm_glx kcm_vulkan kcm_opencl kcm_vaapi kcm_wayland kcm_xserver kcm_kwinsupportinfo kcm_pci kcm_usb kcm_network kcm_interrupts kcm_samba kcm_sensors kcm_firmware_security
+kio-extras	kcm_proxy kcm_trash kcm_webshortcuts
+konlineaccounts	kcm_konlineaccounts
+krdp	kcm_krdpserver
+kscreen	kcm_kscreen
+kscreenlocker	kcm_screenlocker
+kup	kcm_kup
+kwalletmanager	kcm_kwallet
+kwin	kcm_kwin_scripts kcm_animations kcm_kwinoptions kcm_kwindecoration kcm_kwin_taskswitching kcm_kwinxwayland kcm_kwin_virtualdesktops kcm_kwin_effects kcm_kwinrules kcm_kwinscreenedges kcm_kwintouchscreen kcm_virtualkeyboard
+plasma-desktop	kcm_clock kcm_workspace kcm_plasmasearch kcm_keys kcm_access kcm_keyboard kcm_touchpad kcm_splashscreen kcm_smserver kcm_desktoppaths kcm_baloofile kcm_recentFiles kcm_spellchecking kcm_activities kcm_gamecontroller kcm_tablet kcm_touchscreen kcm_device_automounter kcm_mouse kcm_kded kcm_krunnersettings
+plasma-disks	kcm_disks
+plasma-firewall	kcm_firewall
+plasma-keyboard	kcm_plasmakeyboard
+plasma-login-manager	kcm_plasmalogin
+plasma-nm	kcm_networkmanagement kcm_networkmanagement_qml
+plasma-pa	kcm_pulseaudio
+plasma-thunderbolt	kcm_bolt
+plasma-workspace	kcm_fonts kcm_componentchooser kcm_style kcm_lookandfeel kcm_nighttime kcm_nightlight kcm_cursortheme kcm_colors kcm_icons kcm_desktoptheme kcm_notifications kcm_wallpaper kcm_users kcm_feedback kcm_soundtheme kcm_autostart kcm_regionandlang
+plymouth-kcm	kcm_plymouth
+powerdevil	kcm_powerdevilprofilesconfig
+print-manager	kcm_printer_manager
+sddm-kcm	kcm_sddm

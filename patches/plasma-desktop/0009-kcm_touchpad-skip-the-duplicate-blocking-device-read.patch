@@ -1,0 +1,78 @@
+From 06c56e352c99924ca6132a8aac9766b8aa0873ea Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 14:24:31 +0500
+Subject: [PATCH 09/31] kcm_touchpad: skip the duplicate blocking device read
+ on the first load; page layout kept
+
+Page type: Form (one Kirigami.Form per device, Device selector shown only with 2+ touchpads, rows hidden for hardware the
+touchpad does not have). On master this page is already the target look (Kirigami.Form groups, no tabs, placeholder when no
+touchpad, Accessible texts), so QML and wording are unchanged and no inventory marker is needed. NOT BUILT YET.
+
+Speed cause (code evidence): KWinWaylandBackend's constructor (findTouchpads, kwinwaylandbackend.cpp) calls
+KWinWaylandTouchpad::load() per touchpad, a blocking QDBusConnection::sessionBus().call(GetAll) to KWin
+(kwinwaylandtouchpad.cpp:28-37); KCMTouchpad::load() then called backend->load() right after construction and repeated
+the same blocking round trip for every touchpad. Now the first load() within 2 s of construction returns without
+re-reading (m_justLoaded + QElapsedTimer); later loads (after save, after reopen of the KCM, since the backend is a
+per-thread singleton) read as before. The remaining constructor read is still synchronous: making it async needs the
+device list to appear incrementally and changes the load()/save() contracts, not attempted without a build.
+After-numbers: pending, manager will measure. Not built yet. Unconfirmed: 2 s guard is long enough for the
+construct-then-load sequence of KQuickConfigModule on a loaded machine (if load() comes later, it just reads again).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/touchpad/kwinwaylandbackend.cpp | 12 ++++++++++++
+ kcms/touchpad/kwinwaylandbackend.h   |  3 +++
+ 2 files changed, 15 insertions(+)
+
+diff --git a/kcms/touchpad/kwinwaylandbackend.cpp b/kcms/touchpad/kwinwaylandbackend.cpp
+index 5d76317..e76d240 100644
+--- a/kcms/touchpad/kwinwaylandbackend.cpp
++++ b/kcms/touchpad/kwinwaylandbackend.cpp
+@@ -27,6 +27,9 @@ KWinWaylandBackend::KWinWaylandBackend(QObject *parent)
+     connect(m_devicesModel, &QAbstractItemModel::rowsAboutToBeRemoved, this, &KWinWaylandBackend::onDeviceRowsAboutToBeRemoved);
+ 
+     findTouchpads();
++    // The values were just read in findTouchpads(): the first load() right after construction must not read them again.
++    m_age.start();
++    m_justLoaded = m_errorString.isNull();
+ }
+ 
+ KWinWaylandBackend::~KWinWaylandBackend()
+@@ -63,6 +66,15 @@ bool KWinWaylandBackend::save()
+ 
+ bool KWinWaylandBackend::load()
+ {
++    // KCMTouchpad::load() runs right after the constructor, which already did one blocking GetAll D-Bus call per
++    // touchpad. Skip that duplicate round trip, but only when it really follows the construction (the backend is a
++    // per-thread singleton that survives the KCM being closed and reopened).
++    if (m_justLoaded) {
++        m_justLoaded = false;
++        if (m_age.isValid() && m_age.elapsed() < 2000) {
++            return true;
++        }
++    }
+     return std::all_of(m_devices.constBegin(), m_devices.constEnd(), [](KWinWaylandTouchpad *t) {
+         return t->load();
+     });
+diff --git a/kcms/touchpad/kwinwaylandbackend.h b/kcms/touchpad/kwinwaylandbackend.h
+index 8671768..a5e22e4 100644
+--- a/kcms/touchpad/kwinwaylandbackend.h
++++ b/kcms/touchpad/kwinwaylandbackend.h
+@@ -8,6 +8,7 @@
+ 
+ #include "kwinwaylandtouchpad.h"
+ 
++#include <QElapsedTimer>
+ #include <QList>
+ 
+ namespace KWinDevices
+@@ -65,6 +66,8 @@ private:
+     void onDeviceRowsAboutToBeRemoved(const QModelIndex &parent, int first, int last);
+ 
+     KWinDevices::DevicesModel *m_devicesModel;
++    QElapsedTimer m_age;
++    bool m_justLoaded = false;
+     QList<KWinWaylandTouchpad *> m_devices;
+ 
+     QString m_errorString = QString();

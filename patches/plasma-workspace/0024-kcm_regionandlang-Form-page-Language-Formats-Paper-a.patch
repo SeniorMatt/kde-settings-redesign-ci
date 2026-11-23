@@ -1,0 +1,808 @@
+From 4babbe40d79633ce2d44a9dc6159805184ba7b41 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 01:33:25 +0500
+Subject: [PATCH 24/24] kcm_regionandlang: Form page (Language, Formats, Paper
+ and Contacts), pickers as pushed sub-pages
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Page type: Form (docs/page-design.md section 1). It was a list of ten rows that each had a "Modify…" button; the rows
+are now one Kirigami.FormLayout with label, current example and a "Change…" button. Settings (Formats/LC_*, LANG,
+Translations/LANGUAGE, BinaryUnitDialect), locale generation, AccountsService call and reboot call are unchanged.
+
+Moved / renamed:
+- Main page: KCM.ScrollViewKCM + ListView -> KCM.SimpleKCM + FormLayout. Sections: untitled first (Language, the
+  most common question), "Formats" (Numbers, Time, Currency, Measurements, Data and Storage Sizes), "Paper and
+  Contacts" (Paper Size, Address, Name Style, Phone Numbers). Still driven by kcm.optionsModel, so hidden LC_ADDRESS
+  rows stay hidden. Rows kcm_regionandlang/model-name, cfg-Formats-LANG.
+- "Modify…" -> "Change…" ("Change Language…" for the language row; accessible name "Change <area>…")
+  (kcm_regionandlang/depth). "Add More…" -> "Add Languages…" (Add-More). "Restart now" -> "Restart Now" (RestartNow).
+- The three Loaders that held the sub-pages are gone: the language page, the locale picker (now LocalePickerPage.qml)
+  and Data and Storage Sizes (BinaryDialectPage.qml) are pushed with kcm.push(file) when a button is clicked, so
+  none of them exists before then. Page bodies moved verbatim (picker keeps its kcm.settings.* writes, search field,
+  Default entry/kcm.unset, kcm.takeLast()). Defaults/Load/Save still pop every sub-page.
+- Not done: Keyboard layouts and time zone stay on kcm_keyboard / kcm_clock (ia/duplicates.md).
+- Relabel table: inventory/relabel/kcm_regionandlang.tsv (outer repo). Inventory --strict: 20 rows ok, 0 lost; full
+  check LOST 0.
+
+Speed: first frame waited on (a) OptionsModel constructor calling load() (a QLocale and formatted example per
+area, optionsmodel.cpp load) and then KCMRegionAndLang::load() calling it again with the same config values; the
+second call is skipped now (m_firstLoad); (b) previously the Loaders were created lazily already, so the big
+LocaleListModel (QLocale::matchingLocales over all locales, localelistmodel.cpp ctor) still runs when a picker is
+opened, not at start. GlibcLocaleConstructor (directory listing, availableDomainTranslations) is still built
+in the KCM constructor; making it lazy was judged too invasive without a build. After-numbers: pending, manager
+will measure.
+
+HIG: HIG-001/005/006 (current state first), HIG-057, section titles as nouns. Not built yet. Unconfirmed API:
+required property var model in an inline component used as a Repeater delegate (Qt 6 supports it); SimpleKCM
+supports header/headerPaddingEnabled like ScrollViewKCM; kcm.push(file, props) with relative file names (same as
+kcm_autostart); kcmutils_add_qml_kcm globs ui/* so the two new files are picked up.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/region_language/kcmregionandlang.cpp     |   8 +-
+ kcms/region_language/kcmregionandlang.h       |   1 +
+ .../ui/AdvancedLanguageSelectPage.qml         |   8 +-
+ kcms/region_language/ui/BinaryDialectPage.qml |  69 ++++
+ kcms/region_language/ui/LocalePickerPage.qml  | 177 +++++++++
+ kcms/region_language/ui/main.qml              | 375 ++++--------------
+ 6 files changed, 347 insertions(+), 291 deletions(-)
+ create mode 100644 kcms/region_language/ui/BinaryDialectPage.qml
+ create mode 100644 kcms/region_language/ui/LocalePickerPage.qml
+
+diff --git a/kcms/region_language/kcmregionandlang.cpp b/kcms/region_language/kcmregionandlang.cpp
+index 426197d..cfc484f 100644
+--- a/kcms/region_language/kcmregionandlang.cpp
++++ b/kcms/region_language/kcmregionandlang.cpp
+@@ -192,7 +192,13 @@ void KCMRegionAndLang::load()
+     engine()->addImageProvider(u"flags"_s, new FlagImageProvider);
+ 
+     m_settings->load();
+-    m_optionsModel->load();
++    // ksr: the OptionsModel constructor has just built every example (one QLocale and formatted sample per area); the
++    // first load() would repeat that work before the first frame with identical config values, so skip it once.
++    if (m_firstLoad) {
++        m_firstLoad = false;
++    } else {
++        m_optionsModel->load();
++    }
+ 
+     Q_EMIT loadClicked();
+ }
+diff --git a/kcms/region_language/kcmregionandlang.h b/kcms/region_language/kcmregionandlang.h
+index ca23c68..c8cb652 100644
+--- a/kcms/region_language/kcmregionandlang.h
++++ b/kcms/region_language/kcmregionandlang.h
+@@ -65,4 +65,5 @@ private:
+     OptionsModel *m_optionsModel;
+     LocaleGeneratorBase *m_generator = nullptr;
+     int m_loadedBinaryDialect;
++    bool m_firstLoad = true;
+ };
+diff --git a/kcms/region_language/ui/AdvancedLanguageSelectPage.qml b/kcms/region_language/ui/AdvancedLanguageSelectPage.qml
+index 4710312..1042282 100644
+--- a/kcms/region_language/ui/AdvancedLanguageSelectPage.qml
++++ b/kcms/region_language/ui/AdvancedLanguageSelectPage.qml
+@@ -116,7 +116,8 @@ KCM.ScrollViewKCM {
+ 
+                     QQC2.Button {
+                         visible: languageListView.count <= 1
+-                        text: i18nc("@info:tooltip", "Change Language")
++                        // ksr: kcm_regionandlang/Change-Language
++                        text: i18nc("@info:tooltip", "Change Language…")
+                         icon.name: "configure"
+                         onClicked: {
+                             replaceLangIndex = listItemRoot.index;
+@@ -129,6 +130,7 @@ KCM.ScrollViewKCM {
+                         visible: languageListView.count > 1
+                         display: QQC2.AbstractButton.IconOnly
+                         icon.name: "go-top"
++                        // ksr: kcm_regionandlang/LangMoveTop
+                         QQC2.ToolTip.text: i18nc("@info:tooltip", "Move to top")
+                         QQC2.ToolTip.visible: hovered || visualFocus
+                         QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
+@@ -138,6 +140,7 @@ KCM.ScrollViewKCM {
+                         visible: languageListView.count > 1
+                         display: QQC2.AbstractButton.IconOnly
+                         icon.name: "edit-delete-remove"
++                        // ksr: kcm_regionandlang/LangRemove
+                         QQC2.ToolTip.text: i18nc("@info:tooltip", "Remove")
+                         QQC2.ToolTip.visible: hovered || visualFocus
+                         QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
+@@ -262,7 +265,8 @@ KCM.ScrollViewKCM {
+             Layout.alignment: Qt.AlignRight
+             enabled: availableLanguagesList.count
+ 
+-            text: i18nc("@action:button", "Add More…")
++            // ksr: kcm_regionandlang/Add-More (was "Add More…")
++            text: i18nc("@action:button", "Add Languages…")
+ 
+             onClicked: {
+                 addLanguagesSheet.open();
+diff --git a/kcms/region_language/ui/BinaryDialectPage.qml b/kcms/region_language/ui/BinaryDialectPage.qml
+new file mode 100644
+index 0000000..6217703
+--- /dev/null
++++ b/kcms/region_language/ui/BinaryDialectPage.qml
+@@ -0,0 +1,69 @@
++/*
++  SPDX-FileCopyrightLabel: 2021 Han Young <hanyoung@protonmail.com>
++
++  SPDX-License-Identifier: LGPL-3.0-or-later
++*/
++import QtQuick
++import QtQuick.Controls as QQC2
++import QtQuick.Layouts
++
++import org.kde.kirigami as Kirigami
++import org.kde.kcmutils as KCM
++import org.kde.kitemmodels
++import kcmregionandlang
++
++KCM.ScrollViewKCM {
++    title: i18nc("@title:window", "Data and Storage Sizes")
++
++    BinaryDialectModel {
++        id: binaryDialectModel
++    }
++    
++    QQC2.ButtonGroup {
++        id: buttonGroup
++    }
++
++    view: ListView {
++        id: binaryDialectListView
++        clip: true
++        model: binaryDialectModel
++        
++        delegate: QQC2.RadioDelegate {
++            id: binaryDialectDelegate
++            
++            width: ListView.view.width
++            Kirigami.Theme.useAlternateBackgroundColor: true
++            hoverEnabled: false
++
++            text: model.name
++            
++            checked: model.index === kcm.optionsModel.binaryDialect
++            highlighted: checked || pressed
++            QQC2.ButtonGroup.group: buttonGroup
++            
++            contentItem:RowLayout {
++                spacing: Kirigami.Units.smallSpacing
++                Kirigami.Theme.useAlternateBackgroundColor: true
++
++                Kirigami.TitleSubtitle {
++                    id: titleSubtitle
++                    Layout.fillWidth: true
++                    title: binaryDialectDelegate.text
++                    subtitle: model.example ? model.example : ""
++                    selected: binaryDialectDelegate.highlighted
++                }
++
++                QQC2.Label {
++                    text: model.description
++                    color: titleSubtitle.color
++                    textFormat: Text.PlainText
++                }
++            }
++
++            onClicked: {
++                kcm.optionsModel.binaryDialect = model.index;
++                kcm.takeLast();
++            }
++        }
++    }
++}
+diff --git a/kcms/region_language/ui/LocalePickerPage.qml b/kcms/region_language/ui/LocalePickerPage.qml
+new file mode 100644
+index 0000000..3141cae
+--- /dev/null
++++ b/kcms/region_language/ui/LocalePickerPage.qml
+@@ -0,0 +1,177 @@
++/*
++  SPDX-FileCopyrightLabel: 2021 Han Young <hanyoung@protonmail.com>
++
++  SPDX-License-Identifier: LGPL-3.0-or-later
++*/
++import QtQuick
++import QtQuick.Controls as QQC2
++import QtQuick.Layouts
++
++import org.kde.kirigami as Kirigami
++import org.kde.kcmutils as KCM
++import org.kde.kitemmodels
++import kcmregionandlang
++
++KCM.ScrollViewKCM {
++    property int setting: SettingType.Lang
++    property alias filterText: searchField.text
++    title: {
++        localeListView.currentIndex = -1;
++        localeListModel.selectedConfig = setting;
++        switch (setting) {
++        case SettingType.Numeric:
++            return i18n("Numbers");
++        case SettingType.Time:
++            return i18n("Time");
++        case SettingType.Currency:
++            return i18n("Currency");
++        case SettingType.Measurement:
++            return i18n("Measurements");
++        case SettingType.PaperSize:
++            return i18n("Paper Size");
++        case SettingType.Address:
++            return i18nc("Postal Address", "Address");
++        case SettingType.NameStyle:
++            return i18nc("Name Style", "Name");
++        case SettingType.PhoneNumbers:
++            return i18nc("Phone Numbers","Phone number");
++        }
++        console.warn("Invalid setting passed: ", setting);
++        return "Invalid"; // guard
++    }
++
++    LocaleListModel {
++        id: localeListModel
++        Component.onCompleted: {
++            localeListModel.setLang(kcm.settings.lang);
++        }
++    }
++
++    KSortFilterProxyModel {
++        id: filterModel
++        sourceModel: localeListModel
++        filterRoleName: "filter"
++    }
++
++    Connections {
++        target: kcm.settings
++        function onLangChanged() {
++            localeListModel.setLang(kcm.settings.lang);
++        }
++    }
++
++    header: Kirigami.SearchField {
++        id: searchField
++        onTextChanged: filterModel.filterString = text.toLowerCase()
++    }
++
++    // ksr: kcm_regionandlang/settings-lang
++    view: ListView {
++        id: localeListView
++        clip: true
++        model: filterModel
++        delegate: Kirigami.SubtitleDelegate {
++            id: localeDelegate
++
++            required property var model
++
++            width: ListView.view.width
++
++            icon.name: model.flag
++            text: model.display
++            subtitle: model.example ? model.example : ""
++
++            Kirigami.Theme.useAlternateBackgroundColor: true
++            highlighted: {
++                if (pressed) {
++                    return true;
++                }
++                switch (setting) {
++                case SettingType.Lang:
++                    return kcm.settings.lang === model.localeName;
++                case SettingType.Numeric:
++                    return kcm.settings.numeric === model.localeName;
++                case SettingType.Time:
++                    return kcm.settings.time === model.localeName;
++                case SettingType.Currency:
++                    return kcm.settings.monetary === model.localeName;
++                case SettingType.Measurement:
++                    return kcm.settings.measurement === model.localeName;
++                case SettingType.PaperSize:
++                    return kcm.settings.paperSize === model.localeName;
++                case SettingType.Address:
++                    return kcm.settings.address === model.localeName;
++                case SettingType.NameStyle:
++                    return kcm.settings.nameStyle === model.localeName;
++                case SettingType.PhoneNumbers:
++                    return kcm.settings.phoneNumbers === model.localeName;
++                }
++                return false;
++            }
++
++            contentItem: RowLayout {
++                Kirigami.IconTitleSubtitle {
++                    id: icontTitle
++                    Layout.fillWidth: true
++                    icon: icon.fromControlsIcon(localeDelegate.icon)
++                    title: localeDelegate.text
++                    subtitle: localeDelegate.subtitle
++                    selected: localeDelegate.highlighted
++                }
++
++                QQC2.Label {
++                    color: !localeDelegate.highlighted ? Kirigami.Theme.disabledTextColor: icontTitle.color
++                    text: model.localeName
++                    textFormat: Text.PlainText
++                }
++            }
++
++            onClicked: {
++                if (model.localeName !== i18n("Default")) {
++                    switch (setting) {
++                    case SettingType.Lang:
++                        kcm.settings.lang = model.localeName;
++                        break;
++                    case SettingType.Numeric:
++                        kcm.settings.numeric = model.localeName;
++                        break;
++                    case SettingType.Time:
++                        kcm.settings.time = model.localeName;
++                        break;
++                    case SettingType.Currency:
++                        kcm.settings.monetary = model.localeName;
++                        break;
++                    case SettingType.Measurement:
++                        kcm.settings.measurement = model.localeName;
++                        break;
++                    case SettingType.PaperSize:
++                        kcm.settings.paperSize = model.localeName;
++                        break;
++                    case SettingType.Address:
++                        kcm.settings.address = model.localeName;
++                        break;
++                    case SettingType.NameStyle:
++                        kcm.settings.nameStyle = model.localeName;
++                        break;
++                    case SettingType.PhoneNumbers:
++                        kcm.settings.phoneNumbers = model.localeName;
++                        break;
++                    }
++                } else {
++                    kcm.unset(setting);
++                }
++
++                kcm.takeLast();
++            }
++        }
++
++        Kirigami.PlaceholderMessage {
++            anchors.centerIn: parent
++            width: parent.width - (Kirigami.Units.largeSpacing * 4)
++            visible: localeListView.count === 0
++            icon.name: "languages-symbolic"
++            text: i18nc("@info:placeholder", "This system does not include settings for “%1”", searchField.text)
++            explanation: i18nc("@info:usagetip", "Try searching for a nearby region.")
++        }
++    }
++}
+diff --git a/kcms/region_language/ui/main.qml b/kcms/region_language/ui/main.qml
+index f10d85a..685d154 100644
+--- a/kcms/region_language/ui/main.qml
++++ b/kcms/region_language/ui/main.qml
+@@ -12,10 +12,10 @@ import org.kde.kcmutils as KCM
+ import org.kde.kitemmodels
+ import kcmregionandlang
+ 
+-KCM.ScrollViewKCM {
++KCM.SimpleKCM {
+     id: root
+-    implicitHeight: Kirigami.Units.gridUnit * 40
+-    implicitWidth: Kirigami.Units.gridUnit * 20
++    implicitHeight: Kirigami.Units.gridUnit * 30
++    implicitWidth: Kirigami.Units.gridUnit * 30
+     enabled: kcm.enabled
+ 
+     headerPaddingEnabled: false // Let the InlineMessages touch the edges
+@@ -37,7 +37,8 @@ KCM.ScrollViewKCM {
+                 Kirigami.Action {
+                     icon.name: "system-reboot"
+                     visible: takeEffectNextTimeMsg.visible && !dontShutdownMsg.visible
+-                    text: i18n("Restart now")
++                    // ksr: kcm_regionandlang/RestartNow (was "Restart now"; title case for a button)
++                    text: i18n("Restart Now")
+                     onTriggered: {
+                         kcm.reboot()
+                     }
+@@ -118,17 +119,11 @@ KCM.ScrollViewKCM {
+             while (kcm.depth > 1) {
+                 kcm.takeLast();
+             }
+-            if (languageSelectPage.active) {
+-                languageSelectPage.active = false;
+-            }
+         }
+         function onLoadClicked() {
+             while (kcm.depth > 1) {
+                 kcm.takeLast();
+             }
+-            if (languageSelectPage.active) {
+-                languageSelectPage.active = false;
+-            }
+         }
+         function onTakeEffectNextTime() {
+             takeEffectNextTimeMsg.visible = true;
+@@ -139,298 +134,102 @@ KCM.ScrollViewKCM {
+         }
+     }
+ 
+-    view: ListView {
+-        model: kcm.optionsModel
+-        delegate: Kirigami.SubtitleDelegate {
+-            id: optionsDelegate
+-
+-            required property int index
+-            required property var model
+-
+-            width: ListView.view.width
+-
+-            text: model.name
+-            subtitle: {
+-                if (model.page === SettingType.Lang) {
+-                    return model.localeName;
+-                }
+-                return model.example;
+-            }
+-
+-            Kirigami.Theme.useAlternateBackgroundColor: true
+-
+-            // No hover effects wanted here
+-            hoverEnabled: false
+-            highlighted: false
+-            down: false
+-
+-            contentItem: RowLayout {
+-                spacing: Kirigami.Units.smallSpacing
+-
+-                Kirigami.TitleSubtitle {
+-                    Layout.fillWidth: true
+-                    title: optionsDelegate.text
+-                    subtitle: optionsDelegate.subtitle
+-                    reserveSpaceForSubtitle: true
+-                }
+-
+-                QQC2.Button {
+-                    id: changeButton
+-                    text: i18nc("@action:button for change the locale used", "Modify…")
+-                    icon.name: "edit-entry"
+-                    onClicked: {
+-                        // remove the excess pages before pushing new page
+-                        while (kcm.depth > 1) {
+-                            kcm.takeLast();
+-                        }
+-
+-                        if (model.page === SettingType.Lang) {
+-                            languageSelectPage.active = true;
+-                            kcm.push(languageSelectPage.item);
+-                        } else if (model.page === SettingType.BinaryDialect) {
+-                            binaryDialectSelectPage.active = true;
+-                            kcm.push(binaryDialectSelectPage.item);
+-                        } else {
+-                            localeListPage.active = true;
+-                            localeListPage.item.setting = optionsDelegate.model.page;
+-                            localeListPage.item.filterText = '';
+-                            kcm.push(localeListPage.item);
+-                        }
+-                    }
+-                }
+-            }
+-        }
++    // Page type: Form (docs/page-design.md). Each area shows its current example and opens a sub-page with kcm.push();
++    // nothing of a sub-page is created before its button is clicked.
++    function groupOf(page) {
++        switch (page) {
++        case SettingType.Lang:
++            return 0;
++        case SettingType.Numeric:
++        case SettingType.Time:
++        case SettingType.Currency:
++        case SettingType.Measurement:
++        case SettingType.BinaryDialect:
++            return 1;
++        }
++        return 2;
+     }
+ 
+-    Loader {
+-        id: languageSelectPage
+-        active: false
+-        source: "AdvancedLanguageSelectPage.qml"
++    function openArea(page) {
++        // remove the excess pages before pushing a new page
++        while (kcm.depth > 1) {
++            kcm.takeLast();
++        }
++        if (page === SettingType.Lang) {
++            kcm.push("AdvancedLanguageSelectPage.qml");
++        } else if (page === SettingType.BinaryDialect) {
++            kcm.push("BinaryDialectPage.qml");
++        } else {
++            kcm.push("LocalePickerPage.qml", {
++                "setting": page
++            });
++        }
+     }
+ 
+-    Loader {
+-        id: binaryDialectSelectPage
+-        active: false
+-        sourceComponent: KCM.ScrollViewKCM {
+-            title: i18nc("@title:window", "Data and Storage Sizes")
+-
+-            BinaryDialectModel {
+-                id: binaryDialectModel
+-            }
+-            
+-            QQC2.ButtonGroup {
+-                id: buttonGroup
+-            }
+-
+-            view: ListView {
+-                id: binaryDialectListView
+-                clip: true
+-                model: binaryDialectModel
+-                
+-                delegate: QQC2.RadioDelegate {
+-                    id: binaryDialectDelegate
+-                    
+-                    width: ListView.view.width
+-                    Kirigami.Theme.useAlternateBackgroundColor: true
+-                    hoverEnabled: false
++    component AreaRow: RowLayout {
++        id: areaRow
+ 
+-                    text: model.name
+-                    
+-                    checked: model.index === kcm.optionsModel.binaryDialect
+-                    highlighted: checked || pressed
+-                    QQC2.ButtonGroup.group: buttonGroup
+-                    
+-                    contentItem:RowLayout {
+-                        spacing: Kirigami.Units.smallSpacing
+-                        Kirigami.Theme.useAlternateBackgroundColor: true
++        // Which section of the form this row belongs to; the other two Repeaters hide it
++        property int group: 0
++        required property var model
+ 
+-                        Kirigami.TitleSubtitle {
+-                            id: titleSubtitle
+-                            Layout.fillWidth: true
+-                            title: binaryDialectDelegate.text
+-                            subtitle: model.example ? model.example : ""
+-                            selected: binaryDialectDelegate.highlighted
+-                        }
+-
+-                        QQC2.Label {
+-                            text: model.description
+-                            color: titleSubtitle.color
+-                            textFormat: Text.PlainText
+-                        }
+-                    }
++        // ksr: kcm_regionandlang/cfg-Formats-LANG (the Language row writes Formats/LANG)
++        // ksr: kcm_regionandlang/model-name (one row per format area, was a list row with its own button)
++        Kirigami.FormData.label: model.page === SettingType.Lang
++            ? i18nc("@label:chooser", "Language:")
++            : i18nc("@label %1 is the name of a format area, e.g. Numbers", "%1:", model.name)
++        visible: root.groupOf(model.page) === group
++        spacing: Kirigami.Units.smallSpacing
+ 
+-                    onClicked: {
+-                        kcm.optionsModel.binaryDialect = model.index;
+-                        kcm.takeLast();
+-                    }
+-                }
+-            }
++        QQC2.Label {
++            Layout.fillWidth: true
++            Layout.maximumWidth: Kirigami.Units.gridUnit * 16
++            text: areaRow.model.page === SettingType.Lang ? areaRow.model.localeName : areaRow.model.example
++            textFormat: Text.PlainText
++            wrapMode: Text.Wrap
++        }
++
++        QQC2.Button {
++            // ksr: kcm_regionandlang/depth (was "Modify…")
++            text: areaRow.model.page === SettingType.Lang
++                ? i18nc("@action:button opens the list of preferred languages", "Change Language…")
++                : i18nc("@action:button opens a list of regions to take the format from", "Change…")
++            icon.name: "edit-entry"
++            Accessible.name: areaRow.model.page === SettingType.Lang
++                ? text
++                : i18nc("@action:button %1 is the name of a format area, e.g. Numbers", "Change %1…", areaRow.model.name)
++            onClicked: root.openArea(areaRow.model.page)
+         }
+     }
+ 
+-    Loader {
+-        id: localeListPage
+-        active: false
+-        sourceComponent: KCM.ScrollViewKCM {
+-            property int setting: SettingType.Lang
+-            property alias filterText: searchField.text
+-            title: {
+-                localeListView.currentIndex = -1;
+-                localeListModel.selectedConfig = setting;
+-                switch (setting) {
+-                case SettingType.Numeric:
+-                    return i18n("Numbers");
+-                case SettingType.Time:
+-                    return i18n("Time");
+-                case SettingType.Currency:
+-                    return i18n("Currency");
+-                case SettingType.Measurement:
+-                    return i18n("Measurements");
+-                case SettingType.PaperSize:
+-                    return i18n("Paper Size");
+-                case SettingType.Address:
+-                    return i18nc("Postal Address", "Address");
+-                case SettingType.NameStyle:
+-                    return i18nc("Name Style", "Name");
+-                case SettingType.PhoneNumbers:
+-                    return i18nc("Phone Numbers","Phone number");
+-                }
+-                console.warn("Invalid setting passed: ", setting);
+-                return "Invalid"; // guard
+-            }
+-
+-            LocaleListModel {
+-                id: localeListModel
+-                Component.onCompleted: {
+-                    localeListModel.setLang(kcm.settings.lang);
+-                }
+-            }
+-
+-            KSortFilterProxyModel {
+-                id: filterModel
+-                sourceModel: localeListModel
+-                filterRoleName: "filter"
+-            }
+-
+-            Connections {
+-                target: kcm.settings
+-                function onLangChanged() {
+-                    localeListModel.setLang(kcm.settings.lang);
+-                }
++    Kirigami.FormLayout {
++        // First section: no title, the most common question is "which language do I use"
++        Repeater {
++            model: kcm.optionsModel
++            delegate: AreaRow {
++                group: 0
+             }
++        }
+ 
+-            header: Kirigami.SearchField {
+-                id: searchField
+-                onTextChanged: filterModel.filterString = text.toLowerCase()
++        Kirigami.Separator {
++            Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18nc("@title:group", "Formats")
++        }
++        Repeater {
++            model: kcm.optionsModel
++            delegate: AreaRow {
++                group: 1
+             }
++        }
+ 
+-            view: ListView {
+-                id: localeListView
+-                clip: true
+-                model: filterModel
+-                delegate: Kirigami.SubtitleDelegate {
+-                    id: localeDelegate
+-
+-                    required property var model
+-
+-                    width: ListView.view.width
+-
+-                    icon.name: model.flag
+-                    text: model.display
+-                    subtitle: model.example ? model.example : ""
+-
+-                    Kirigami.Theme.useAlternateBackgroundColor: true
+-                    highlighted: {
+-                        if (pressed) {
+-                            return true;
+-                        }
+-                        switch (setting) {
+-                        case SettingType.Lang:
+-                            return kcm.settings.lang === model.localeName;
+-                        case SettingType.Numeric:
+-                            return kcm.settings.numeric === model.localeName;
+-                        case SettingType.Time:
+-                            return kcm.settings.time === model.localeName;
+-                        case SettingType.Currency:
+-                            return kcm.settings.monetary === model.localeName;
+-                        case SettingType.Measurement:
+-                            return kcm.settings.measurement === model.localeName;
+-                        case SettingType.PaperSize:
+-                            return kcm.settings.paperSize === model.localeName;
+-                        case SettingType.Address:
+-                            return kcm.settings.address === model.localeName;
+-                        case SettingType.NameStyle:
+-                            return kcm.settings.nameStyle === model.localeName;
+-                        case SettingType.PhoneNumbers:
+-                            return kcm.settings.phoneNumbers === model.localeName;
+-                        }
+-                        return false;
+-                    }
+-
+-                    contentItem: RowLayout {
+-                        Kirigami.IconTitleSubtitle {
+-                            id: icontTitle
+-                            Layout.fillWidth: true
+-                            icon: icon.fromControlsIcon(localeDelegate.icon)
+-                            title: localeDelegate.text
+-                            subtitle: localeDelegate.subtitle
+-                            selected: localeDelegate.highlighted
+-                        }
+-
+-                        QQC2.Label {
+-                            color: !localeDelegate.highlighted ? Kirigami.Theme.disabledTextColor: icontTitle.color
+-                            text: model.localeName
+-                            textFormat: Text.PlainText
+-                        }
+-                    }
+-
+-                    onClicked: {
+-                        if (model.localeName !== i18n("Default")) {
+-                            switch (setting) {
+-                            case SettingType.Lang:
+-                                kcm.settings.lang = model.localeName;
+-                                break;
+-                            case SettingType.Numeric:
+-                                kcm.settings.numeric = model.localeName;
+-                                break;
+-                            case SettingType.Time:
+-                                kcm.settings.time = model.localeName;
+-                                break;
+-                            case SettingType.Currency:
+-                                kcm.settings.monetary = model.localeName;
+-                                break;
+-                            case SettingType.Measurement:
+-                                kcm.settings.measurement = model.localeName;
+-                                break;
+-                            case SettingType.PaperSize:
+-                                kcm.settings.paperSize = model.localeName;
+-                                break;
+-                            case SettingType.Address:
+-                                kcm.settings.address = model.localeName;
+-                                break;
+-                            case SettingType.NameStyle:
+-                                kcm.settings.nameStyle = model.localeName;
+-                                break;
+-                            case SettingType.PhoneNumbers:
+-                                kcm.settings.phoneNumbers = model.localeName;
+-                                break;
+-                            }
+-                        } else {
+-                            kcm.unset(setting);
+-                        }
+-
+-                        kcm.takeLast();
+-                    }
+-                }
+-
+-                Kirigami.PlaceholderMessage {
+-                    anchors.centerIn: parent
+-                    width: parent.width - (Kirigami.Units.largeSpacing * 4)
+-                    visible: localeListView.count === 0
+-                    icon.name: "languages-symbolic"
+-                    text: i18nc("@info:placeholder", "This system does not include settings for “%1”", searchField.text)
+-                    explanation: i18nc("@info:usagetip", "Try searching for a nearby region.")
+-                }
++        Kirigami.Separator {
++            Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18nc("@title:group", "Paper and Contacts")
++        }
++        Repeater {
++            model: kcm.optionsModel
++            delegate: AreaRow {
++                group: 2
+             }
+         }
+     }

@@ -1,0 +1,72 @@
+From 35b6a58a138c489e7b632987ec930bbb2f324a55 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 23:48:16 +0500
+Subject: [PATCH 20/24] fix(kcm_users): async account list never finished
+ without a system bus (page stuck on the busy indicator)
+
+With no system D-Bus (headless CI, containers) ListCachedUsers()/GetAll() return an already-failed pending call whose watcher
+never emits finished(), so UserModel::loaded stayed false and the page showed only the busy indicator; stock shows the
+(empty) page because its blocking call returns the error. Now a watcher whose call is already finished gets finished()
+from the event loop (guarded so the handler runs once). Reproduced and checked locally in ksr-kdelinux (Xvfb): the page
+now looks like stock's.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/users/src/user.cpp      |  7 +++++++
+ kcms/users/src/usermodel.cpp | 10 ++++++++++
+ 2 files changed, 17 insertions(+)
+
+diff --git a/kcms/users/src/user.cpp b/kcms/users/src/user.cpp
+index f1fe7cb..a98ff8b 100644
+--- a/kcms/users/src/user.cpp
++++ b/kcms/users/src/user.cpp
+@@ -197,6 +197,10 @@ void User::setPathAsync(const QDBusObjectPath &path)
+     auto *properties = new OrgFreedesktopDBusPropertiesInterface(QStringLiteral("org.freedesktop.Accounts"), path.path(), QDBusConnection::systemBus(), this);
+     auto *watcher = new QDBusPendingCallWatcher(properties->GetAll(QStringLiteral("org.freedesktop.Accounts.User")), this);
+     connect(watcher, &QDBusPendingCallWatcher::finished, this, [this, path, properties](QDBusPendingCallWatcher *self) {
++        if (self->property("ksrHandled").toBool()) {
++            return;
++        }
++        self->setProperty("ksrHandled", true);
+         self->deleteLater();
+         properties->deleteLater();
+         QDBusPendingReply<QVariantMap> reply = *self;
+@@ -223,6 +227,9 @@ void User::setPathAsync(const QDBusObjectPath &path)
+         }
+         Q_EMIT ready();
+     });
++    if (watcher->isFinished()) {
++        QMetaObject::invokeMethod(watcher, [watcher] { Q_EMIT watcher->finished(watcher); }, Qt::QueuedConnection);
++    }
+ }
+ 
+ bool User::isSystemAccount() const
+diff --git a/kcms/users/src/usermodel.cpp b/kcms/users/src/usermodel.cpp
+index 1882fd6..2e726b2 100644
+--- a/kcms/users/src/usermodel.cpp
++++ b/kcms/users/src/usermodel.cpp
+@@ -56,6 +56,10 @@ UserModel::UserModel(QObject *parent)
+     // filled in one reset when the last user is ready (loaded becomes true). Users added in the meantime (UserAdded) stay.
+     auto *watcher = new QDBusPendingCallWatcher(m_dbusInterface->ListCachedUsers(), this);
+     connect(watcher, &QDBusPendingCallWatcher::finished, this, [this](QDBusPendingCallWatcher *self) {
++        if (self->property("ksrHandled").toBool()) {
++            return;
++        }
++        self->setProperty("ksrHandled", true);
+         self->deleteLater();
+         QDBusPendingReply<QList<QDBusObjectPath>> reply = *self;
+         if (reply.isError()) {
+@@ -83,6 +87,12 @@ UserModel::UserModel(QObject *parent)
+             user->setPathAsync(path);
+         }
+     });
++
++    // A call that failed before it was sent (e.g. no system bus) is already finished and its watcher never emits finished():
++    // run the handler from the event loop in that case; the property keeps it from running twice if the signal does come.
++    if (watcher->isFinished()) {
++        QMetaObject::invokeMethod(watcher, [watcher] { Q_EMIT watcher->finished(watcher); }, Qt::QueuedConnection);
++    }
+ }
+ 
+ void UserModel::connectUser(User *user)

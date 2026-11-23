@@ -1,0 +1,29 @@
+From cc13a8dd7607ff2c2cd902700e37013d2e97ee6f Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 02:53:27 +0500
+Subject: [PATCH 25/31] kcm_device_automounter: top margin so the first
+ checkbox is not cut by the page edge
+
+CI smoke shot showed the option checkbox touching the header. Stock enable logic (needs automount on login or on plugin) unchanged;
+the stock page looks disabled in the same headless env too. Not built.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ solid-device-automounter/kcm/DeviceAutomounterKCM.ui | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/solid-device-automounter/kcm/DeviceAutomounterKCM.ui b/solid-device-automounter/kcm/DeviceAutomounterKCM.ui
+index 7342b4d..53068d7 100644
+--- a/solid-device-automounter/kcm/DeviceAutomounterKCM.ui
++++ b/solid-device-automounter/kcm/DeviceAutomounterKCM.ui
+@@ -11,6 +11,9 @@
+    </rect>
+   </property>
+   <layout class="QVBoxLayout" name="verticalLayout">
++   <property name="topMargin">
++    <number>12</number>
++   </property>
+    <!-- ksr: kcm_device_automounter/AutomountUnknownDevices -->
+    <item>
+     <widget class="QCheckBox" name="kcfg_AutomountUnknownDevices">

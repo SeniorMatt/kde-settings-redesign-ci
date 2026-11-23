@@ -1,0 +1,25 @@
+From 09481f6bac00520a9797e6655bd68e03b0e1e083 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 03:14:28 +0500
+Subject: [PATCH 2/2] kcm_sddm: no image source until the background path is
+ known (QML warning 'Protocol "" is unknown')
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ src/ui/main.qml | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/ui/main.qml b/src/ui/main.qml
+index da7d7af..68e8ae2 100644
+--- a/src/ui/main.qml
++++ b/src/ui/main.qml
+@@ -241,7 +241,7 @@ KCM.GridViewKCM {
+                     margins: Kirigami.Units.smallSpacing + card.background.borderWidth
+                 }
+ 
+-                source: !card.isVideo ? "file:" + backgroundSheet.imagePath : ""
++                source: !card.isVideo && backgroundSheet.imagePath ? "file:" + backgroundSheet.imagePath : ""
+ 
+                 fillMode: Image.PreserveAspectFit
+                 smooth: true

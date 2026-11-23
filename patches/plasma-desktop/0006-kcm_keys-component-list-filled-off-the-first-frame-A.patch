@@ -1,0 +1,607 @@
+From a71cb3a92c59525b864eef0271c3a9a488bc8fb6 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 13:35:28 +0500
+Subject: [PATCH 06/31] kcm_keys: component list filled off the first frame,
+ Add first in the toolbar
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Page type: List with a detail pane (docs/page-design.md section 1; the two panes stay because the user compares and
+edits many components in a row, and one search field above the list is the fastest route). KGlobalAccel actions,
+key sequences, scheme files (.kksrc), command .desktop files and all D-Bus calls are unchanged.
+
+Moved / renamed (kcm_keys/AddNew, Import, Export):
+- Toolbar order by use: "Add New" -> "Add…" (Application…, Command or Script…) first, then "Import Scheme…" and
+  "Export Scheme…" (were "Import…", "Export…").
+- Search field says "Search shortcuts…"; the empty states carry an icon; busy indicator after 150 ms.
+- Section titles (Applications, Commands, System Services, Common Actions) already are nouns: kept.
+- Per ia/duplicates.md: this page stays the full editor. Zoom/Magnifier, Activity and Keyboard Layout shortcuts are
+  owned by their context pages (kcm_access, kcm_activities, kcm_keyboard) and still show here.
+- Relabel table: inventory/relabel/kcm_keys.tsv (outer repo). Inventory --strict: 25 rows ok, 0 lost (markers
+  "ksr: kcm_keys/..." added next to every text-only control).
+
+Speed (cause from code, not measured):
+- KCMKeys::load() ran StandardShortcutsModel::load() synchronously (about 80 KStandardShortcut lookups plus
+  QCollator sorts of every category and action list) before the first frame; it now runs one event-loop turn later.
+- GlobalAccelModel::loadComponent() ran per KGlobalAccel component inside the D-Bus reply handlers: KService lookup,
+  and for every component without a desktop file (kwin, plasmashell, kded modules, ...) a full
+  KApplicationTrader::query() over all installed applications, plus a new QCollator per component. Now the replies
+  only collect the infos; components are built one per event-loop turn, the application list is queried once per
+  load into a name hash (same "first match" result), one collator is shared, and the model is still reset once at
+  the end (the krunner keys runner relies on that). A generation counter drops stale loads; an empty component list
+  now also ends loading (it never reset the model before).
+- Numbers: before (build/bench/clean/before-slow.tsv) among the slowest pages. After: pending, manager will measure.
+
+HIG: HIG-001, HIG-005, HIG-006, HIG-019, HIG-047, HIG-058.
+
+Not built yet (freeze).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/keys/globalaccelmodel.cpp          | 122 ++++++++++++++++++------
+ kcms/keys/globalaccelmodel.h            |   6 +-
+ kcms/keys/kcm_keys.cpp                  |  29 +++++-
+ kcms/keys/kcm_keys.h                    |   7 ++
+ kcms/keys/ui/ShortcutActionDelegate.qml |   4 +
+ kcms/keys/ui/main.qml                   |  82 +++++++++++-----
+ 6 files changed, 191 insertions(+), 59 deletions(-)
+
+diff --git a/kcms/keys/globalaccelmodel.cpp b/kcms/keys/globalaccelmodel.cpp
+index 4de5da1..3d97f15 100644
+--- a/kcms/keys/globalaccelmodel.cpp
++++ b/kcms/keys/globalaccelmodel.cpp
+@@ -6,7 +6,11 @@
+ 
+ #include "globalaccelmodel.h"
+ 
++#include <QCollator>
+ #include <QDBusPendingCallWatcher>
++#include <QHash>
++#include <QSharedPointer>
++#include <utility>
+ #include <QFile>
+ 
+ #include <KApplicationTrader>
+@@ -58,16 +62,37 @@ QVariant GlobalAccelModel::data(const QModelIndex &index, int role) const
+     return BaseModel::data(index, role);
+ }
+ 
++// State shared by the D-Bus replies of one load(). The replies only collect the shortcut infos; the expensive part
++// (KService lookups, sorting) runs afterwards, one component per event-loop turn, so the page can paint in between.
++struct GlobalAccelModel::LoadState {
++    quint64 generation = 0;
++    int pendingCalls = 0;
++    QList<QList<KGlobalShortcutInfo>> infos;
++    QCollator collator;
++    // First application service per name, built once per load (was: one KApplicationTrader::query() per component)
++    bool servicesBuilt = false;
++    QHash<QString, std::pair<int, KService::Ptr>> servicesByName;
++};
++
+ void GlobalAccelModel::load()
+ {
+     if (!m_globalAccelInterface->isValid()) {
+         return;
+     }
+ 
++    auto state = QSharedPointer<LoadState>::create();
++    state->generation = ++m_loadGeneration;
++    state->collator.setCaseSensitivity(Qt::CaseInsensitive);
++    state->collator.setNumericMode(true);
++    m_pendingComponents.clear();
++
+     auto componentsWatcher = new QDBusPendingCallWatcher(m_globalAccelInterface->allComponents());
+-    connect(componentsWatcher, &QDBusPendingCallWatcher::finished, this, [this](QDBusPendingCallWatcher *componentsWatcher) {
++    connect(componentsWatcher, &QDBusPendingCallWatcher::finished, this, [this, state](QDBusPendingCallWatcher *componentsWatcher) {
+         QDBusPendingReply<QList<QDBusObjectPath>> componentsReply = *componentsWatcher;
+         componentsWatcher->deleteLater();
++        if (state->generation != m_loadGeneration) {
++            return; // a newer load() started
++        }
+         if (componentsReply.isError()) {
+             genericErrorOccured(QStringLiteral("Error while calling allComponents()"), componentsReply.error());
+ 
+@@ -79,38 +104,59 @@ void GlobalAccelModel::load()
+             return;
+         }
+         const QList<QDBusObjectPath> componentPaths = componentsReply.value();
+-        int *pendingCalls = new int;
+-        *pendingCalls = componentPaths.size();
++        state->pendingCalls = componentPaths.size();
++        if (componentPaths.isEmpty()) {
++            buildComponents(state);
++            return;
++        }
+         for (const auto &componentPath : componentPaths) {
+             const QString path = componentPath.path();
+             KGlobalAccelComponentInterface component(m_globalAccelInterface->service(), path, m_globalAccelInterface->connection());
+             auto watcher = new QDBusPendingCallWatcher(component.allShortcutInfos());
+-            connect(watcher, &QDBusPendingCallWatcher::finished, this, [path, pendingCalls, this](QDBusPendingCallWatcher *watcher) {
++            connect(watcher, &QDBusPendingCallWatcher::finished, this, [path, state, this](QDBusPendingCallWatcher *watcher) {
+                 QDBusPendingReply<QList<KGlobalShortcutInfo>> reply = *watcher;
++                watcher->deleteLater();
++                if (state->generation != m_loadGeneration) {
++                    return;
++                }
+                 if (reply.isError()) {
+                     genericErrorOccured(QStringLiteral("Error while calling allShortCutInfos of") + path, reply.error());
+                 } else if (!reply.value().isEmpty()) {
+-                    m_pendingComponents.push_back(loadComponent(reply.value()));
++                    state->infos.push_back(reply.value());
+                 }
+-                watcher->deleteLater();
+-                if (--*pendingCalls == 0) {
+-                    beginResetModel();
+-                    QCollator collator;
+-                    collator.setCaseSensitivity(Qt::CaseInsensitive);
+-                    collator.setNumericMode(true);
+-                    m_components = m_pendingComponents;
+-                    m_pendingComponents.clear();
+-                    std::sort(m_components.begin(), m_components.end(), [&](const Component &c1, const Component &c2) {
+-                        return c1.type != c2.type ? c1.type < c2.type : collator.compare(c1.displayName, c2.displayName) < 0;
+-                    });
+-                    endResetModel();
+-                    delete pendingCalls;
++                if (--state->pendingCalls == 0) {
++                    buildComponents(state);
+                 }
+             });
+         }
+     });
+ }
+ 
++void GlobalAccelModel::buildComponents(const QSharedPointer<LoadState> &state)
++{
++    if (state->generation != m_loadGeneration) {
++        return;
++    }
++    if (!state->infos.isEmpty()) {
++        // one component per event-loop turn, so painting and input are not blocked by the whole list
++        m_pendingComponents.push_back(loadComponent(state->infos.takeFirst(), state.data()));
++        QMetaObject::invokeMethod(
++            this,
++            [this, state] {
++                buildComponents(state);
++            },
++            Qt::QueuedConnection);
++        return;
++    }
++    beginResetModel();
++    m_components = m_pendingComponents;
++    m_pendingComponents.clear();
++    std::sort(m_components.begin(), m_components.end(), [&](const Component &c1, const Component &c2) {
++        return c1.type != c2.type ? c1.type < c2.type : state->collator.compare(c1.displayName, c2.displayName) < 0;
++    });
++    endResetModel();
++}
++
+ ComponentType classify(const KService::Ptr service)
+ {
+     if (!service || !service->isApplication()) {
+@@ -136,8 +182,15 @@ ComponentType classify(const KService::Ptr service)
+     return ComponentType::Application;
+ };
+ 
+-Component GlobalAccelModel::loadComponent(const QList<KGlobalShortcutInfo> &info)
++Component GlobalAccelModel::loadComponent(const QList<KGlobalShortcutInfo> &info, LoadState *loadState)
+ {
++    LoadState localState; // addApplication() has no shared state
++    if (!loadState) {
++        localState.collator.setCaseSensitivity(Qt::CaseInsensitive);
++        localState.collator.setNumericMode(true);
++        loadState = &localState;
++    }
++
+     const QString &componentUnique = info[0].componentUniqueName();
+     const QString &componentFriendly = info[0].componentFriendlyName();
+ 
+@@ -156,13 +209,25 @@ Component GlobalAccelModel::loadComponent(const QList<KGlobalShortcutInfo> &info
+     }
+ 
+     if (!service) {
+-        // Do we have a service with that name?
+-        auto filter = [componentUnique, componentFriendly](const KService::Ptr service) {
+-            return service->name() == componentUnique || service->name() == componentFriendly;
+-        };
+-
+-        const KService::List services = KApplicationTrader::query(filter);
+-        service = services.value(0, KService::Ptr());
++        // Do we have a service with that name? The first one in KApplicationTrader order wins, as before.
++        if (!loadState->servicesBuilt) {
++            loadState->servicesBuilt = true;
++            const KService::List all = KApplicationTrader::query([](const KService::Ptr &) {
++                return true;
++            });
++            // iterate backwards: QHash::insert replaces, so the lowest index is the one that stays
++            for (int i = all.size() - 1; i >= 0; --i) {
++                loadState->servicesByName.insert(all.at(i)->name(), {i, all.at(i)});
++            }
++        }
++        const auto byUnique = loadState->servicesByName.constFind(componentUnique);
++        const auto byFriendly = loadState->servicesByName.constFind(componentFriendly);
++        const auto end = loadState->servicesByName.constEnd();
++        if (byUnique != end && (byFriendly == end || byUnique->first <= byFriendly->first)) {
++            service = byUnique->second;
++        } else if (byFriendly != end) {
++            service = byFriendly->second;
++        }
+     }
+ 
+     auto type = classify(service);
+@@ -208,11 +273,8 @@ Component GlobalAccelModel::loadComponent(const QList<KGlobalShortcutInfo> &info
+         action.initialShortcuts = action.activeShortcuts;
+         c.actions.push_back(action);
+     }
+-    QCollator collator;
+-    collator.setCaseSensitivity(Qt::CaseInsensitive);
+-    collator.setNumericMode(true);
+     std::sort(c.actions.begin(), c.actions.end(), [&](const Action &s1, const Action &s2) {
+-        return collator.compare(s1.displayName, s2.displayName) < 0;
++        return loadState->collator.compare(s1.displayName, s2.displayName) < 0;
+     });
+     return c;
+ }
+diff --git a/kcms/keys/globalaccelmodel.h b/kcms/keys/globalaccelmodel.h
+index 183a827..e5a5835 100644
+--- a/kcms/keys/globalaccelmodel.h
++++ b/kcms/keys/globalaccelmodel.h
+@@ -7,6 +7,7 @@
+ #pragma once
+ 
+ #include <QList>
++#include <QSharedPointer>
+ 
+ #include "basemodel.h"
+ #include "kglobalaccelmodel_export.h"
+@@ -43,11 +44,14 @@ Q_SIGNALS:
+     void applicationAdded(const Component &);
+ 
+ private:
+-    Component loadComponent(const QList<KGlobalShortcutInfo> &info);
++    struct LoadState;
++    Component loadComponent(const QList<KGlobalShortcutInfo> &info, LoadState *loadState = nullptr);
++    void buildComponents(const QSharedPointer<LoadState> &state);
+     void removeComponent(const Component &component);
+     void genericErrorOccured(const QString &description, const QDBusError &error);
+     bool saveAction(const Component &component, const Action &action, const QSet<QKeySequence> &shortcutsToSave);
+ 
+     QList<Component> m_pendingComponents;
++    quint64 m_loadGeneration = 0;
+     KGlobalAccelInterface *m_globalAccelInterface;
+ };
+diff --git a/kcms/keys/kcm_keys.cpp b/kcms/keys/kcm_keys.cpp
+index 224437d..ac5d415 100644
+--- a/kcms/keys/kcm_keys.cpp
++++ b/kcms/keys/kcm_keys.cpp
+@@ -9,6 +9,7 @@
+ #include <QDBusMetaType>
+ #include <QFile>
+ #include <QPushButton>
++#include <QTimer>
+ #include <QQuickItem>
+ #include <QQuickRenderControl>
+ #include <QWindow>
+@@ -72,6 +73,7 @@ KCMKeys::KCMKeys(QObject *parent, const KPluginMetaData &metaData, const QVarian
+         setRepresentsDefaults(m_globalAccelModel->isDefault() && m_standardShortcutsModel->isDefault());
+     });
+     connect(m_globalAccelModel, &QAbstractItemModel::modelReset, this, [this] {
++        setLoading(false);
+         if (!m_argument.isEmpty()) {
+             for (int i = 0, c = m_filteredModel->rowCount(); i < c; ++i) {
+                 if (m_filteredModel->data(m_filteredModel->index(i, 0), BaseModel::ComponentRole) == m_argument) {
+@@ -88,8 +90,31 @@ KCMKeys::KCMKeys(QObject *parent, const KPluginMetaData &metaData, const QVarian
+ 
+ void KCMKeys::load()
+ {
+-    m_globalAccelModel->load();
+-    m_standardShortcutsModel->load();
++    // Nothing here may block the first frame: the standard shortcuts (about 80 KStandardShortcut lookups plus
++    // collator sorts) and the D-Bus requests for the KGlobalAccel components start one event-loop turn later.
++    // The standard model goes first so its model reset cannot clear a component selected by the global one.
++    const quint64 serial = ++m_loadSerial;
++    setLoading(m_globalAccelModel->isValid());
++    QTimer::singleShot(0, this, [this, serial] {
++        if (serial != m_loadSerial) {
++            return;
++        }
++        m_standardShortcutsModel->load();
++        m_globalAccelModel->load();
++    });
++}
++
++bool KCMKeys::isLoading() const
++{
++    return m_loading;
++}
++
++void KCMKeys::setLoading(bool loading)
++{
++    if (m_loading != loading) {
++        m_loading = loading;
++        Q_EMIT loadingChanged();
++    }
+ }
+ 
+ void KCMKeys::save()
+diff --git a/kcms/keys/kcm_keys.h b/kcms/keys/kcm_keys.h
+index 55b38c2..3e4787c 100644
+--- a/kcms/keys/kcm_keys.h
++++ b/kcms/keys/kcm_keys.h
+@@ -24,6 +24,8 @@ class KCMKeys : public KQuickConfigModule
+     Q_PROPERTY(FilteredShortcutsModel *filteredModel READ filteredModel CONSTANT)
+     Q_PROPERTY(ShortcutsModel *shortcutsModel READ shortcutsModel CONSTANT)
+     Q_PROPERTY(QString lastError READ lastError NOTIFY errorOccured)
++    // true from load() until the component list has been filled (the page shows a busy indicator after 150 ms)
++    Q_PROPERTY(bool loading READ isLoading NOTIFY loadingChanged)
+ 
+ public:
+     KCMKeys(QObject *parent, const KPluginMetaData &metaData, const QVariantList &args);
+@@ -51,14 +53,17 @@ public:
+     FilteredShortcutsModel *filteredModel() const;
+     ShortcutsModel *shortcutsModel() const;
+     QString lastError() const;
++    bool isLoading() const;
+ 
+ Q_SIGNALS:
++    void loadingChanged();
+     void showComponent(int row);
+     void errorOccured();
+     void shortcutChangeRejected();
+ 
+ private:
+     void setError(const QString &errorMessage);
++    void setLoading(bool loading);
+     QList<QPersistentModelIndex> conflictingIndices(const QKeySequence &keySequence) const;
+ 
+     QString m_lastError;
+@@ -67,4 +72,6 @@ private:
+     ShortcutsModel *m_shortcutsModel;
+     StandardShortcutsModel *m_standardShortcutsModel;
+     QString m_argument;
++    bool m_loading = false;
++    quint64 m_loadSerial = 0;
+ };
+diff --git a/kcms/keys/ui/ShortcutActionDelegate.qml b/kcms/keys/ui/ShortcutActionDelegate.qml
+index 7ac35d5..be88d11 100644
+--- a/kcms/keys/ui/ShortcutActionDelegate.qml
++++ b/kcms/keys/ui/ShortcutActionDelegate.qml
+@@ -169,6 +169,7 @@ QQC2.ItemDelegate {
+                             model: defaultShortcuts
+                             QQC2.CheckBox {
+                                 Layout.fillWidth: true
++                                // ksr: kcm_keys/requestKeySequence
+                                 Accessible.name: checked ? i18nc("@info:whatsthis accessible name", "Default shortcut %1 is enabled.", modelData) : i18nc("@info:whatsthis accessible name", "Default shortcut %1 is disabled.", modelData)
+                                 checked: activeShortcuts.indexOf(modelData) !== -1
+                                 text: modelData
+@@ -202,6 +203,7 @@ QQC2.ItemDelegate {
+                                     showClearButton: false
+                                     patterns: ShortcutPattern.ModifierAndKey | ShortcutPattern.Modifier
+                                     multiKeyShortcutsAllowed: supportsMultipleKeys
++                                    // ksr: kcm_keys/requestKeySequence-3
+                                     checkForConflictsAgainst: ShortcutType.None
+                                     onCaptureFinished: {
+                                         kcm.requestKeySequence(this, originalIndex, keySequence, modelData)
+@@ -220,6 +222,7 @@ QQC2.ItemDelegate {
+                                 }
+                                 QQC2.Button {
+                                     icon.name: "edit-delete"
++                                    // ksr: kcm_keys/Delete-shortcut
+                                     text: i18nc("@action:button accessible", "Delete shortcut")
+                                     display: QQC2.AbstractButton.IconOnly
+                                     onClicked: originalIndex.model.disableShortcut(originalIndex, modelData)
+@@ -268,6 +271,7 @@ QQC2.ItemDelegate {
+                                 }
+                                 QQC2.Button {
+                                     icon.name: "dialog-cancel"
++                                    // ksr: kcm_keys/Cancel-capturing-shortcut
+                                     text: i18nc("@action:button accessible", "Cancel capturing shortcut")
+                                     display: QQC2.AbstractButton.IconOnly
+                                     onClicked: parent.finished()
+diff --git a/kcms/keys/ui/main.qml b/kcms/keys/ui/main.qml
+index 888b9af..4047db9 100644
+--- a/kcms/keys/ui/main.qml
++++ b/kcms/keys/ui/main.qml
+@@ -37,33 +37,9 @@ KCM.AbstractKCM {
+     }
+ 
+     actions: [
++        // ksr: kcm_keys/AddNew (was "Add New", last in the toolbar; adding is the most common job here)
+         Kirigami.Action {
+-            enabled: !exportActive
+-            icon.name: "document-import-symbolic"
+-            text: i18nc("@action:button Import shortcut scheme", "Import…")
+-            Accessible.name: i18nc("@action:button accessible", "Import shortcut scheme")
+-            onTriggered: importSheet.open()
+-        }, Kirigami.Action {
+-            icon.name: exportActive ? "dialog-cancel-symbolic" : "document-export-symbolic"
+-            text: exportActive
+-                  ? i18nc("@action:button", "Cancel Export")
+-                  : i18nc("@action:button Export shortcut scheme", "Export…")
+-            Accessible.name: exportActive
+-                 ? text
+-                 : i18nc("@action:button accessible", "Export shortcut scheme")
+-            onTriggered: {
+-                if (exportActive) {
+-                    exportActive = false
+-                } else if (kcm.needsSave) {
+-                    exportWarning.visible = true
+-                } else {
+-                    search.text = ""
+-                    exportActive = true
+-                }
+-            }
+-        },
+-        Kirigami.Action {
+-            text: i18nc("@action:button Add new shortcut", "Add New")
++            text: i18nc("@action:button Add new shortcut", "Add…")
+             icon.name: "list-add-symbolic"
+             displayHint: Kirigami.DisplayHint.KeepVisible
+ 
+@@ -71,6 +47,7 @@ KCM.AbstractKCM {
+ 
+             Kirigami.Action {
+                 icon.name: "applications-all-symbolic"
++                // ksr: kcm_keys/AddApplication
+                 text: i18nc("@action:menu End of the sentence 'Add New Application…'", "Application…")
+                 Accessible.name: i18nc("@action:menu accessible", "Add new application")
+                 Accessible.role: Accessible.MenuItem
+@@ -79,6 +56,7 @@ KCM.AbstractKCM {
+ 
+             Kirigami.Action {
+                 icon.name: "scriptnew-symbolic"
++                // ksr: kcm_keys/AddCommand
+                 text: i18nc("@action:menu End of the sentence 'Add New Command or Script…'", "Command or Script…")
+                 Accessible.name: i18nc("@action:menu accessible", "Add new command or script")
+                 Accessible.role: Accessible.MenuItem
+@@ -87,6 +65,31 @@ KCM.AbstractKCM {
+                     addCommandDialog.open()
+                 }
+             }
++        },
++        Kirigami.Action {
++            enabled: !exportActive
++            icon.name: "document-import-symbolic"
++            text: i18nc("@action:button Import shortcut scheme", "Import Scheme…") // ksr: kcm_keys/Import
++            Accessible.name: i18nc("@action:button accessible", "Import shortcut scheme")
++            onTriggered: importSheet.open()
++        }, Kirigami.Action {
++            icon.name: exportActive ? "dialog-cancel-symbolic" : "document-export-symbolic"
++            text: exportActive
++                  ? i18nc("@action:button", "Cancel Export")
++                  : i18nc("@action:button Export shortcut scheme", "Export Scheme…") // ksr: kcm_keys/Export
++            Accessible.name: exportActive
++                 ? text
++                 : i18nc("@action:button accessible", "Export shortcut scheme")
++            onTriggered: {
++                if (exportActive) {
++                    exportActive = false
++                } else if (kcm.needsSave) {
++                    exportWarning.visible = true
++                } else {
++                    search.text = ""
++                    exportActive = true
++                }
++            }
+         }
+     ]
+ 
+@@ -124,6 +127,7 @@ KCM.AbstractKCM {
+             actions: [
+                 Kirigami.Action {
+                     icon.name: "document-export-symbolic"
++                    // ksr: kcm_keys/ExportConfirm
+                     text: i18nc("@action:button Export shortcut scheme", "Export")
+                     Accessible.name: i18nc("@action:button accessible", "Export shortcut scheme")
+ 
+@@ -137,6 +141,7 @@ KCM.AbstractKCM {
+         }
+         Kirigami.SearchField  {
+             id: search
++            placeholderText: i18nc("@info:placeholder", "Search shortcuts…") // ksr: kcm_keys/model-display
+             enabled: !errorOccured && !exportActive
+             Layout.fillWidth: true
+             // Equal to the margins removed by disabling header padding
+@@ -159,6 +164,21 @@ KCM.AbstractKCM {
+         Kirigami.Theme.colorSet: Kirigami.Theme.View
+         color: Kirigami.Theme.backgroundColor
+ 
++        // The component list is filled after the first frame (KCMKeys::load()): busy indicator only if that takes
++        // longer than 150 ms.
++        Timer {
++            id: busyDelay
++            interval: 150
++            running: kcm.loading
++        }
++        QQC2.BusyIndicator {
++            z: 1
++            x: Math.round((categoryList.width - width) / 2)
++            y: Math.round((parent.height - height) / 2)
++            running: kcm.loading && !busyDelay.running
++            visible: running
++        }
++
+         RowLayout  {
+             anchors.fill: parent
+             enabled: !errorOccured
+@@ -236,6 +256,7 @@ KCM.AbstractKCM {
+                                 implicitWidth: implicitHeight
+ 
+                                 icon.name: "edit-rename"
++                                // ksr: kcm_keys/filteredModel-index
+                                 text: i18nc("@action:button %1 is the name of a custom command", "Edit command for %1", model.display)
+                                 display: QQC2.AbstractButton.IconOnly
+ 
+@@ -265,6 +286,7 @@ KCM.AbstractKCM {
+                                 implicitWidth: implicitHeight
+ 
+                                 icon.name: "edit-delete"
++                                // ksr: kcm_keys/model-display-2
+                                 text: i18nc("@action:button %1 is the name of a shortcut category", "Remove all shortcuts for %1", model.display)
+                                 display: QQC2.AbstractButton.IconOnly
+ 
+@@ -287,6 +309,7 @@ KCM.AbstractKCM {
+                                 implicitWidth: implicitHeight
+ 
+                                 icon.name: "edit-undo"
++                                // ksr: kcm_keys/Undo-deletion
+                                 text: i18nc("@action:button", "Undo deletion")
+                                 display: QQC2.AbstractButton.IconOnly
+ 
+@@ -354,6 +377,7 @@ KCM.AbstractKCM {
+                         anchors.centerIn: parent
+                         width: parent.width - (Kirigami.Units.largeSpacing * 4)
+                         visible: components.count === 0 && search.text.length > 0
++                        icon.name: "edit-find"
+                         text: i18nc("@info:status placeholdermessage", "No items matched the search terms")
+                     }
+                 }
+@@ -375,6 +399,7 @@ KCM.AbstractKCM {
+                     actions: [
+                         Kirigami.Action {
+                             icon.name: "edit-undo-symbolic"
++                            // ksr: kcm_keys/UndoDeleteAll
+                             text: i18nc("@action:button", "Undo")
+                             Accessible.name: i18nc("@action:button", "Undo deleting shortcuts")
+                             onTriggered: components.currentItem.undoDeletion();
+@@ -419,6 +444,7 @@ KCM.AbstractKCM {
+                             anchors.centerIn: parent
+                             width: parent.width - (Kirigami.Units.largeSpacing * 4)
+                             visible: components.currentIndex == -1
++                            icon.name: "input-keyboard"
+                             text: i18nc("@info:usagetip placeholdermessage","Select an item from the list to view its shortcuts here")
+                         }
+                     }
+@@ -512,6 +538,7 @@ KCM.AbstractKCM {
+ 
+                 RowLayout {
+                     Layout.fillWidth: true
++                    // ksr: kcm_keys/x
+                     Kirigami.FormData.label: i18nc("@label:textbox A shell command", "Command:")
+                     spacing: Kirigami.Units.smallSpacing
+ 
+@@ -525,6 +552,7 @@ KCM.AbstractKCM {
+                     }
+                     QQC2.Button {
+                         icon.name: "document-open"
++                        // ksr: kcm_keys/Choose
+                         text: i18nc("@action:button", "Choose…")
+                         Accessible.name: i18nc("@action:button accessible", "Choose script file")
+                         onClicked: {
+@@ -534,6 +562,7 @@ KCM.AbstractKCM {
+                 }
+                 QQC2.TextField {
+                     id: nameField
++                    // ksr: kcm_keys/x-2
+                     Kirigami.FormData.label: i18nc("@label:textfield Human-readable name given to a shell command", "Name:")
+                     placeholderText: i18nc("@info:placeholder", "Enter name here")
+ 
+@@ -599,6 +628,7 @@ KCM.AbstractKCM {
+ 
+          customFooterActions: [
+              Kirigami.Action {
++                // ksr: kcm_keys/ImportConfirm
+                 text: schemeBox.customSchemeSelected ? i18nc("@action:button", "Select File…") : i18nc("@action:button import shortcut scheme", "Import")
+                 Accessible.name: schemeBox.customSchemeSelected
+                                  ? i18nc("@action:button accessible", "Select shortcut scheme file")

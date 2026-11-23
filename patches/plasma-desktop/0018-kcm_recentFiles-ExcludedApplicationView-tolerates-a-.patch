@@ -1,0 +1,40 @@
+From 61fbe26849b1b2c09549e70a574b2600fc676395 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 02:14:51 +0500
+Subject: [PATCH 18/31] kcm_recentFiles: ExcludedApplicationView tolerates a
+ missing applicationModel
+
+'Cannot read property enabled of null' was logged when the view was created or destroyed without the context property
+(deferred setSource, teardown order). The list stays shown and greyed out unless 'Only for specific applications' is chosen,
+exactly like the stock page (stock never hides it either; it is empty in the headless run only because there is no activity
+database there).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/recentFiles/qml/recentFiles/ExcludedApplicationView.qml | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/kcms/recentFiles/qml/recentFiles/ExcludedApplicationView.qml b/kcms/recentFiles/qml/recentFiles/ExcludedApplicationView.qml
+index f07078c..fb9f5a3 100644
+--- a/kcms/recentFiles/qml/recentFiles/ExcludedApplicationView.qml
++++ b/kcms/recentFiles/qml/recentFiles/ExcludedApplicationView.qml
+@@ -17,7 +17,8 @@ QQC2.ScrollView {
+ 
+     readonly property bool narrowMode: width < Kirigami.Units.gridUnit * 30
+ 
+-    enabled: applicationModel.enabled
++    // applicationModel can be null while the page is being torn down
++    enabled: applicationModel ? applicationModel.enabled : false
+ 
+     Kirigami.StyleHints.showFramedBackground: true
+ 
+@@ -38,7 +39,7 @@ QQC2.ScrollView {
+                 Layout.preferredWidth: Math.round(scrollview.availableWidth/ grid.columns) - 1
+                 Layout.preferredHeight: scrollview.narrowMode ? -1 : Kirigami.Units.gridUnit * 5
+ 
+-                hoverEnabled: applicationModel.enabled
++                hoverEnabled: applicationModel && applicationModel.enabled
+ 
+                 display: scrollview.narrowMode ? QQC2.AbstractButton.TextBesideIcon : QQC2.ItemDelegate.TextUnderIcon
+                 icon.name: model.icon

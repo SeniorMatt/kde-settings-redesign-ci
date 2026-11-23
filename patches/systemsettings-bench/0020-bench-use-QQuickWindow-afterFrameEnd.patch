@@ -1,0 +1,30 @@
+From c23fb399d3a19c6d586f4eb43703d7ed2fbacc6d Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 07:58:47 +0500
+Subject: [PATCH 20/34] bench: use QQuickWindow::afterFrameEnd
+
+---
+ app/SidebarMode.cpp | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/app/SidebarMode.cpp b/app/SidebarMode.cpp
+index 4952098..5f9bbef 100644
+--- a/app/SidebarMode.cpp
++++ b/app/SidebarMode.cpp
+@@ -43,6 +43,7 @@
+ #include <QQmlEngine>
+ #include <QQuickItem>
+ #include <QQuickWidget>
++#include <QQuickWindow>
+ #include <QStandardPaths>
+ 
+ // Pages (including the current one) that System Settings keeps alive
+@@ -978,7 +979,7 @@ void SidebarMode::ksrBench()
+         auto tFrame = std::make_shared<qint64>(-1);
+         if (qw) {
+             auto conn = std::make_shared<QMetaObject::Connection>();
+-            *conn = connect(qw, &QQuickWidget::frameSwapped, this, [timer, tFrame, conn] {
++            *conn = connect(qw->quickWindow(), &QQuickWindow::afterFrameEnd, this, [timer, tFrame, conn] {
+                 *tFrame = timer->elapsed();
+                 QObject::disconnect(*conn);
+             });

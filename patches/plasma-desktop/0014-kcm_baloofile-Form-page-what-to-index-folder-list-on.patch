@@ -1,0 +1,719 @@
+From 6a4a558e218563167f70a34a7884cf04f82112e4 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 01:31:47 +0500
+Subject: [PATCH 14/31] kcm_baloofile: Form page (what to index), folder list
+ on a Locations sub-page, indexer state loaded after the first frame
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Page type: Form (docs/page-design.md). Baloo settings, kcfg keys, filtered folder model, save() behaviour unchanged. Not built yet.
+
+Moved / renamed:
+- Main page is one FormLayout: "Data to index" radios (nothing / file names only / names and contents) first, "Also index
+  hidden files and folders" indented under them and disabled (not hidden) with indexing off (kcm_baloofile/indexingEnabled,
+  OnlyBasicIndexing, indexHiddenFolders). The intro paragraph above the form became a ContextualHelpButton.
+- The Locations list (was an overlay-header list under the form) is a sub-page, Locations.qml, opened by "Folders to index:
+  Choose Folders…". Start/Stop Indexing a Folder… are its page actions; the row delegate with Indexed/Not indexed combo
+  and Remove entry is unchanged (kcm_baloofile/StartFolder, StopFolder, filteredModel-removeFolder).
+- Indexer state/progress moved from the footer to a section "Indexer"; Pause/Resume Indexer from the toolbar to a button
+  beside the state (kcm_baloofile/IndexerStatus, PauseResume). Delete Index Data message unchanged (DeleteIndex).
+HIG ids: HIG-001/005/006 (order by use), HIG-057 (no Advanced; sub-page instead of a second list), button labels end with an
+ellipsis when they open something.
+
+Speed causes (kcms/baloo): (1) rawIndexFileSize()/prettyIndexFileSize() were evaluated in message bindings (stat of the
+index at load); now read once after the first frame (Qt.callLater) and the text only built while the message shows.
+(2) Baloo.Monitor (D-Bus client to baloo_file) was created with the page; it now lives in IndexerStatus.qml behind an
+asynchronous Loader. (3) The folder list and its file dialog are only built when the sub-page opens.
+After numbers: pending, manager will measure.
+
+Unconfirmed: Loader sourceComponent with the sibling type IndexerStatus {} inside the qml module (same pattern as other sub
+pages, not compiled); Locations.qml picked up by kcmutils_add_qml_kcm's ui/*.qml glob like keyboard's Hardware.qml.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/baloo/ui/IndexerStatus.qml |  64 ++++++
+ kcms/baloo/ui/Locations.qml     | 167 +++++++++++++++
+ kcms/baloo/ui/main.qml          | 369 +++++++++-----------------------
+ 3 files changed, 332 insertions(+), 268 deletions(-)
+ create mode 100644 kcms/baloo/ui/IndexerStatus.qml
+ create mode 100644 kcms/baloo/ui/Locations.qml
+
+diff --git a/kcms/baloo/ui/IndexerStatus.qml b/kcms/baloo/ui/IndexerStatus.qml
+new file mode 100644
+index 0000000..2f027a8
+--- /dev/null
++++ b/kcms/baloo/ui/IndexerStatus.qml
+@@ -0,0 +1,64 @@
++/*
++    SPDX-FileCopyrightText: 2018 Tomaz Canabrava <tcanabrava@kde.org>
++
++    SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++*/
++
++import QtQuick
++import QtQuick.Layouts
++import QtQuick.Controls as QQC2
++import org.kde.baloo.experimental as Baloo
++import org.kde.kirigami as Kirigami
++
++// Indexer state, progress and Pause/Resume. Loaded asynchronously by main.qml: creating Baloo.Monitor connects to the
++// baloo_file D-Bus service, which must not delay the first frame.
++ColumnLayout {
++    id: statusRoot
++
++    spacing: Kirigami.Units.smallSpacing
++
++    Baloo.Monitor {
++        id: monitor
++
++        readonly property bool currentlyIndexing: switch(state) {
++            case Baloo.Global.FirstRun:
++            case Baloo.Global.NewFiles:
++            case Baloo.Global.ModifiedFiles:
++            case Baloo.Global.XAttrFiles:
++            case Baloo.Global.ContentIndexing:
++            case Baloo.Global.UnindexedFileCheck:
++            case Baloo.Global.StaleIndexEntriesClean:
++                return true;
++            default:
++                return false;
++        }
++
++        readonly property int completionPercentage: Math.floor(filesIndexed / totalFiles * 100)
++    }
++
++    RowLayout {
++        spacing: Kirigami.Units.largeSpacing
++
++        QQC2.Label {
++            // ksr: kcm_baloofile/IndexerStatus
++            Layout.fillWidth: true
++            text: i18nc("State and a percentage of progress", "%1, %2% complete", monitor.stateString, monitor.completionPercentage)
++            textFormat: Text.PlainText
++            wrapMode: Text.Wrap
++        }
++
++        QQC2.Button {
++            // ksr: kcm_baloofile/PauseResume
++            icon.name: monitor.state !== Baloo.Global.Suspended ? "media-playback-pause" : "media-playback-start"
++            text: monitor.state !== Baloo.Global.Suspended ? i18nc("@action:button", "Pause Indexer") : i18nc("@action:button", "Resume Indexer")
++            onClicked: monitor.toggleSuspendState()
++        }
++    }
++
++    Kirigami.SelectableLabel {
++        Layout.fillWidth: true
++        Layout.maximumWidth: Kirigami.Units.gridUnit * 24
++        visible: monitor.currentlyIndexing && monitor.completionPercentage !== 100 && monitor.filePath.length > 0
++        text: xi18nc("@info Currently Indexing", "Currently indexing: <filename>%1</filename>", monitor.filePath)
++    }
++}
+diff --git a/kcms/baloo/ui/Locations.qml b/kcms/baloo/ui/Locations.qml
+new file mode 100644
+index 0000000..285e04f
+--- /dev/null
++++ b/kcms/baloo/ui/Locations.qml
+@@ -0,0 +1,167 @@
++/*
++    SPDX-FileCopyrightText: 2018 Tomaz Canabrava <tcanabrava@kde.org>
++
++    SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++*/
++
++import QtCore
++import QtQuick
++import QtQuick.Layouts
++import QtQuick.Controls as QQC2
++import QtQuick.Dialogs as QtDialogs
++import org.kde.kirigami as Kirigami
++import org.kde.kcmutils as KCM
++
++// Locations sub-page (kcm.push from the File Search page): the list of folders that are indexed or left out.
++KCM.ScrollViewKCM {
++    id: root
++
++    title: i18nc("@title", "Locations")
++
++    implicitWidth: Kirigami.Units.gridUnit * 36
++    implicitHeight: Kirigami.Units.gridUnit * 22
++
++    actions: [
++        Kirigami.Action {
++            // ksr: kcm_baloofile/StartFolder
++            text: i18nc("@action:button", "Start Indexing a Folder…")
++            icon.name: "list-add-symbolic"
++            displayHint: Kirigami.DisplayHint.KeepVisible
++            onTriggered: {
++                fileDialogLoader.included = true
++                fileDialogLoader.active = true
++            }
++        },
++        Kirigami.Action {
++            // ksr: kcm_baloofile/StopFolder
++            text: i18nc("@action:button", "Stop Indexing a Folder…")
++            icon.name: "list-remove-symbolic"
++            displayHint: Kirigami.DisplayHint.KeepVisible
++            onTriggered: {
++                fileDialogLoader.included = false
++                fileDialogLoader.active = true
++            }
++        }
++    ]
++
++    view: ListView {
++        id: directoryConfigList
++        clip: true
++        currentIndex: -1
++
++        model: kcm.filteredModel
++        delegate: directoryConfigDelegate
++    }
++
++    Component {
++        id: directoryConfigDelegate
++        QQC2.ItemDelegate {
++            id: listItem
++
++            // Store this as a property so we can access it within the combobox,
++            // which also has a `model` property
++            property var indexingModel: model
++
++            width: directoryConfigList.width
++
++            // There's no need for a list item to ever be selected
++            down: false
++            highlighted: false
++            hoverEnabled: false
++            // ... and because of that, use alternating backgrounds to visually
++            // connect list items' left and right side content elements
++            Kirigami.Theme.useAlternateBackgroundColor: true
++
++            contentItem: RowLayout {
++                spacing: Kirigami.Units.smallSpacing
++
++                // The folder's icon
++                Kirigami.Icon {
++                    source: indexingModel.decoration
++
++                    Layout.preferredHeight: Kirigami.Units.iconSizes.smallMedium
++                    Layout.preferredWidth: Layout.preferredHeight
++                }
++
++                // The folder's path
++                QQC2.Label {
++                    text: indexingModel.folder
++                    textFormat: Text.PlainText
++                    elide: Text.ElideRight
++
++                    Layout.fillWidth: true
++                }
++
++                // What kind of indexing to do for the folder
++                QQC2.ComboBox {
++                    id: indexingOptionsCombobox
++
++                    property bool indexingDisabled: !indexingModel.enableIndex
++                    property bool fullContentIndexing: indexingModel.enableIndex
++
++                    model: [
++                        i18nc("@info:status", "Not indexed"),
++                        i18nc("@info:status", "Indexed"),
++                    ]
++
++                    // Intentionally not a simple ternary to facilitate adding
++                    // more conditions in the future
++                    currentIndex: {
++                        if (indexingDisabled) return 0
++                        if (fullContentIndexing) return 1
++                    }
++
++                    onActivated: {
++                        // New value is "Not indexed"
++                        if (indexingOptionsCombobox.currentIndex === 0 && fullContentIndexing) {
++                            indexingModel.enableIndex = false
++                        // New value is "Full content indexing"
++                        } else if (indexingOptionsCombobox.currentIndex === 1 && indexingDisabled) {
++                            indexingModel.enableIndex = true
++                        }
++                    }
++                }
++
++                // Delete button to remove this folder entry
++                QQC2.Button {
++                    // ksr: kcm_baloofile/filteredModel-removeFolder
++                    enabled: model.deletable
++
++                    icon.name: "edit-delete-remove"
++                    text: i18nc("Remove the list item for this filesystem path", "Remove entry")
++                    display: QQC2.AbstractButton.IconOnly
++
++                    onClicked: kcm.filteredModel.removeFolder(index)
++
++                    QQC2.ToolTip.text: text
++                    QQC2.ToolTip.visible: hovered || visualFocus
++                    QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
++                }
++            }
++        }
++    }
++
++    Loader {
++        id: fileDialogLoader
++
++        property bool included: false
++
++        active: false
++
++        sourceComponent: QtDialogs.FolderDialog {
++            title: fileDialogLoader.included ? i18nc("@title:window", "Select a folder to include") : i18nc("@title:window", "Select a folder to exclude")
++            currentFolder: StandardPaths.standardLocations(StandardPaths.HomeLocation)[0]
++
++            onAccepted: {
++                kcm.filteredModel.addFolder(selectedFolder, fileDialogLoader.included)
++                fileDialogLoader.active = false
++            }
++
++            onRejected: {
++                fileDialogLoader.active = false
++            }
++
++            Component.onCompleted: open()
++        }
++    }
++}
+diff --git a/kcms/baloo/ui/main.qml b/kcms/baloo/ui/main.qml
+index 1da43b1..6cfb970 100644
+--- a/kcms/baloo/ui/main.qml
++++ b/kcms/baloo/ui/main.qml
+@@ -4,49 +4,23 @@
+     SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
+ */
+ 
+-import QtCore
+ import QtQuick
+ import QtQuick.Layouts
+ import QtQuick.Controls as QQC2
+-import QtQuick.Dialogs as QtDialogs
+-import org.kde.baloo.experimental as Baloo
+ import org.kde.kirigami as Kirigami
+ import org.kde.kcmutils as KCM
+ 
+-KCM.ScrollViewKCM {
++// Form page (docs/page-design.md). What to index is the question people open this page for, so it is first; the folder
++// list is a sub-page (Locations.qml), and the indexer state (Baloo.Monitor, a D-Bus client) loads after the first frame.
++KCM.SimpleKCM {
+     id: root
+ 
+-    implicitWidth: Kirigami.Units.gridUnit * 42
+-    implicitHeight: Kirigami.Units.gridUnit * 25
++    implicitWidth: Kirigami.Units.gridUnit * 32
++    implicitHeight: Kirigami.Units.gridUnit * 24
+ 
+-    Baloo.Monitor {
+-        id: monitor
+-
+-        readonly property bool currentlyIndexing: switch(state) {
+-            case Baloo.Global.FirstRun:
+-            case Baloo.Global.NewFiles:
+-            case Baloo.Global.ModifiedFiles:
+-            case Baloo.Global.XAttrFiles:
+-            case Baloo.Global.ContentIndexing:
+-            case Baloo.Global.UnindexedFileCheck:
+-            case Baloo.Global.StaleIndexEntriesClean:
+-                return true;
+-            default:
+-                return false;
+-        }
+-
+-        readonly property int completionPercentage: Math.floor(filesIndexed / totalFiles * 100)
+-    }
+-
+-    actions: [
+-        Kirigami.Action {
+-            icon.name: monitor.state !== Baloo.Global.Suspended ? "media-playback-pause" : "media-playback-start"
+-            text: monitor.state !== Baloo.Global.Suspended ? i18nc("@action:button", "Pause Indexer") : i18nc("@action:button", "Resume Indexer")
+-            visible: kcm.balooSettings.indexingEnabled
+-            displayHint: Kirigami.DisplayHint.KeepVisible
+-            onTriggered: monitor.toggleSuspendState()
+-        }
+-    ]
++    // Size of the saved index. It stat()s the index file, so it is read after the first frame instead of in a binding.
++    property int indexFileSize: 0
++    Component.onCompleted: Qt.callLater(() => { root.indexFileSize = kcm.rawIndexFileSize(); })
+ 
+     headerPaddingEnabled: false // Let the InlineMessages touch the edges
+     header: ColumnLayout {
+@@ -62,278 +36,137 @@ KCM.ScrollViewKCM {
+         }
+ 
+         Kirigami.InlineMessage {
++            // ksr: kcm_baloofile/DeleteIndex
+             id: indexingDisabledWarning
+             Layout.fillWidth: true
+-            visible: !kcm.balooSettings.indexingEnabled && !kcm.needsSave && kcm.rawIndexFileSize() > 0
++            visible: !kcm.balooSettings.indexingEnabled && !kcm.needsSave && root.indexFileSize > 0
+             type: Kirigami.MessageType.Warning
+             position: Kirigami.InlineMessage.Position.Header
+             showCloseButton: true
+-            text: i18nc("@info:inlinemessage", "Do you want to delete the saved index data? %1 of space will be freed, but if indexing is re-enabled later, the entire index will have to be re-created from scratch. This may take some time, depending on the number of files to index.", kcm.prettyIndexFileSize());
++            // prettyIndexFileSize() stats the index, so only ask while the message is shown
++            text: !visible ? "" : i18nc("@info:inlinemessage", "Do you want to delete the saved index data? %1 of space will be freed, but if indexing is re-enabled later, the entire index will have to be re-created from scratch. This may take some time, depending on the number of files to index.", kcm.prettyIndexFileSize());
+             actions: Kirigami.Action {
+                 text: i18nc("@action:button", "Delete Index Data")
+                 icon.name: "edit-delete"
+                 onTriggered: {
+                     kcm.deleteIndex();
++                    root.indexFileSize = 0;
+                     indexingDisabledWarning.visible = false;
+                 }
+             }
+         }
++    }
+ 
+-        QQC2.Label {
+-            text: i18nc("@info:usagetip", "File Search helps you quickly locate your files. You can choose which folders and what types of file data are indexed.")
+-            textFormat: Text.PlainText
+-            Layout.fillWidth: true
+-            Layout.maximumWidth: Kirigami.Units.gridUnit * 24
+-            Layout.alignment: Qt.AlignHCenter
+-            Layout.topMargin: Kirigami.Units.largeSpacing * 2
+-            Layout.bottomMargin: Kirigami.Units.largeSpacing
+-            horizontalAlignment: Text.AlignHCenter
+-            wrapMode: Text.WordWrap
+-        }
+-        // By disabling header margins to make the header banners look correct,
+-        // we have to re-add some margins for the content area so it doesn't
+-        // touch the window edges and look ugly. To make it apply to everything,
+-        // we wrap it all in another ColumnLayout with its own margins.
+-        Kirigami.Form {
+-            Layout.bottomMargin: Kirigami.Units.largeSpacing * 2
+-            Layout.fillWidth: true
+-            Kirigami.FormGroup {
+-                Kirigami.FormEntry {
+-                    title: i18nc("@title:group", "Data to index:")
+-                    contentItem: QQC2.RadioButton {
+-                        id: fileSearchDisabled
+-
+-                        text: i18nc("@option:radio Data to index", "Nothing (disable indexing entirely)")
+-                        checked: !kcm.balooSettings.indexingEnabled
+-                        onToggled: kcm.balooSettings.indexingEnabled = false
+-
+-                        QQC2.ButtonGroup.group: indexingStyleGroup
+-
+-                        KCM.SettingStateBinding {
+-                            configObject: kcm.balooSettings
+-                            settingName: "indexingEnabled"
+-                        }
+-                        QQC2.ButtonGroup {
+-                            id: indexingStyleGroup
+-                        }
+-                    }
+-                }
+-
+-                Kirigami.FormEntry {
+-                    contentItem: QQC2.RadioButton {
+-                        text: i18nc("@option:radio Data to index", "File names only")
+-                        checked: kcm.balooSettings.indexingEnabled && kcm.balooSettings.onlyBasicIndexing
+-                        onToggled: {
+-                            kcm.balooSettings.indexingEnabled = true;
+-                            kcm.balooSettings.onlyBasicIndexing = true;
+-                        }
+-
+-                        QQC2.ButtonGroup.group: indexingStyleGroup
++    Kirigami.FormLayout {
++        // ---- What to index (first section, no title) ----
++        RowLayout {
++            Kirigami.FormData.label: i18nc("@title:group", "Data to index:")
++            spacing: 0
+ 
+-                        KCM.SettingStateBinding {
+-                            configObject: kcm.balooSettings
+-                            settingName: "onlyBasicIndexing"
+-                        }
+-                    }
+-                }
++            QQC2.RadioButton {
++                // ksr: kcm_baloofile/indexingEnabled
++                id: fileSearchDisabled
+ 
+-                Kirigami.FormEntry {
+-                    contentItem: QQC2.RadioButton {
+-                        text: i18nc("@option:radio Data to index", "File names and contents")
+-                        checked: kcm.balooSettings.indexingEnabled && !kcm.balooSettings.onlyBasicIndexing
+-                        onToggled: {
+-                            kcm.balooSettings.indexingEnabled = true;
+-                            kcm.balooSettings.onlyBasicIndexing = false;
+-                        }
++                text: i18nc("@option:radio Data to index", "Nothing (disable indexing entirely)")
++                checked: !kcm.balooSettings.indexingEnabled
++                onToggled: kcm.balooSettings.indexingEnabled = false
+ 
+-                        QQC2.ButtonGroup.group: indexingStyleGroup
++                QQC2.ButtonGroup.group: indexingStyleGroup
+ 
+-                        KCM.SettingStateBinding {
+-                            configObject: kcm.balooSettings
+-                            settingName: "onlyBasicIndexing"
+-                        }
+-                    }
++                KCM.SettingStateBinding {
++                    configObject: kcm.balooSettings
++                    settingName: "indexingEnabled"
+                 }
+-
+-
+-                Kirigami.FormEntry {
+-                    contentItem: QQC2.CheckBox {
+-                        id: indexHiddenFolders
+-                        text: i18nc("@option:check", "Also index hidden files and folders")
+-                        checked: kcm.balooSettings.indexHiddenFolders
+-                        onCheckStateChanged: kcm.balooSettings.indexHiddenFolders = checked
+-
+-                        KCM.SettingStateBinding {
+-                            configObject: kcm.balooSettings
+-                            settingName: "indexHiddenFolders"
+-                            extraEnabledConditions: !fileSearchDisabled.checked
+-                        }
+-                    }
++                QQC2.ButtonGroup {
++                    id: indexingStyleGroup
+                 }
+             }
++            Kirigami.ContextualHelpButton {
++                toolTipText: i18nc("@info:usagetip", "File Search helps you quickly locate your files. You can choose which folders and what types of file data are indexed.")
++            }
+         }
+-    }
+ 
+-    view: ListView {
+-        id: directoryConfigList
+-        enabled: !fileSearchDisabled.checked
+-        clip: true
+-        currentIndex: -1
++        QQC2.RadioButton {
++            // ksr: kcm_baloofile/OnlyBasicIndexing
++            text: i18nc("@option:radio Data to index", "File names only")
++            checked: kcm.balooSettings.indexingEnabled && kcm.balooSettings.onlyBasicIndexing
++            onToggled: {
++                kcm.balooSettings.indexingEnabled = true;
++                kcm.balooSettings.onlyBasicIndexing = true;
++            }
+ 
+-        model: kcm.filteredModel
+-        delegate: directoryConfigDelegate
++            QQC2.ButtonGroup.group: indexingStyleGroup
+ 
+-        headerPositioning: ListView.OverlayHeader
+-        header: Kirigami.InlineViewHeader {
+-            width: directoryConfigList.width
+-            text: i18nc("@title:table Locations to include or exclude from indexing", "Locations")
+-            actions: [
+-                Kirigami.Action {
+-                    text: i18nc("@action:button", "Start Indexing a Folder…")
+-                    icon.name: "list-add-symbolic"
+-                    onTriggered: {
+-                        fileDialogLoader.included = true
+-                        fileDialogLoader.active = true
+-                    }
+-                },
+-                Kirigami.Action {
+-                    text: i18nc("@action:button", "Stop Indexing a Folder…")
+-                    icon.name: "list-remove-symbolic"
+-                    onTriggered: {
+-                        fileDialogLoader.included = false
+-                        fileDialogLoader.active = true
+-                    }
+-                }
+-            ]
++            KCM.SettingStateBinding {
++                configObject: kcm.balooSettings
++                settingName: "onlyBasicIndexing"
++            }
+         }
+-    }
+ 
+-    extraFooterTopPadding: true // re-add separator line
+-    footer: ColumnLayout {
+-        visible: !fileSearchDisabled.checked
+-        spacing: Kirigami.Units.smallSpacing
++        QQC2.RadioButton {
++            text: i18nc("@option:radio Data to index", "File names and contents")
++            checked: kcm.balooSettings.indexingEnabled && !kcm.balooSettings.onlyBasicIndexing
++            onToggled: {
++                kcm.balooSettings.indexingEnabled = true;
++                kcm.balooSettings.onlyBasicIndexing = false;
++            }
+ 
+-        QQC2.Label {
+-            Layout.fillWidth: true
+-            text: i18nc("State and a percentage of progress", "%1, %2% complete", monitor.stateString, monitor.completionPercentage)
+-            textFormat: Text.PlainText
+-        }
++            QQC2.ButtonGroup.group: indexingStyleGroup
+ 
+-        Kirigami.SelectableLabel {
+-            Layout.fillWidth: true
+-            visible: monitor.currentlyIndexing && monitor.completionPercentage !== 100 && monitor.filePath.length > 0
+-            text: xi18nc("@info Currently Indexing", "Currently indexing: <filename>%1</filename>", monitor.filePath)
++            KCM.SettingStateBinding {
++                configObject: kcm.balooSettings
++                settingName: "onlyBasicIndexing"
++            }
+         }
+-    }
+-
+-    Component {
+-        id: directoryConfigDelegate
+-        QQC2.ItemDelegate {
+-            id: listItem
+-
+-            // Store this as a property so we can access it within the combobox,
+-            // which also has a `model` property
+-            property var indexingModel: model
+-
+-            width: directoryConfigList.width
+-
+-            // There's no need for a list item to ever be selected
+-            down: false
+-            highlighted: false
+-            hoverEnabled: false
+-            // ... and because of that, use alternating backgrounds to visually
+-            // connect list items' left and right side content elements
+-            Kirigami.Theme.useAlternateBackgroundColor: true
+-
+-            contentItem: RowLayout {
+-                spacing: Kirigami.Units.smallSpacing
+-
+-                // The folder's icon
+-                Kirigami.Icon {
+-                    source: indexingModel.decoration
+-
+-                    Layout.preferredHeight: Kirigami.Units.iconSizes.smallMedium
+-                    Layout.preferredWidth: Layout.preferredHeight
+-                }
+-
+-                // The folder's path
+-                QQC2.Label {
+-                    text: indexingModel.folder
+-                    textFormat: Text.PlainText
+-                    elide: Text.ElideRight
+-
+-                    Layout.fillWidth: true
+-                }
+-
+-                // What kind of indexing to do for the folder
+-                QQC2.ComboBox {
+-                    id: indexingOptionsCombobox
+-
+-                    property bool indexingDisabled: !indexingModel.enableIndex
+-                    property bool fullContentIndexing: indexingModel.enableIndex
+-
+-                    model: [
+-                        i18nc("@info:status", "Not indexed"),
+-                        i18nc("@info:status", "Indexed"),
+-                    ]
+-
+-                    // Intentionally not a simple ternary to facilitate adding
+-                    // more conditions in the future
+-                    currentIndex: {
+-                        if (indexingDisabled) return 0
+-                        if (fullContentIndexing) return 1
+-                    }
+ 
+-                    onActivated: {
+-                        // New value is "Not indexed"
+-                        if (indexingOptionsCombobox.currentIndex === 0 && fullContentIndexing) {
+-                            indexingModel.enableIndex = false
+-                        // New value is "Full content indexing"
+-                        } else if (indexingOptionsCombobox.currentIndex === 1 && indexingDisabled) {
+-                            indexingModel.enableIndex = true
+-                        }
+-                    }
+-                }
+-
+-                // Delete button to remove this folder entry
+-                QQC2.Button {
+-                    enabled: model.deletable
+-
+-                    icon.name: "edit-delete-remove"
+-                    text: i18nc("Remove the list item for this filesystem path", "Remove entry")
+-                    display: QQC2.AbstractButton.IconOnly
+-
+-                    onClicked: kcm.filteredModel.removeFolder(index)
+-
+-                    QQC2.ToolTip.text: text
+-                    QQC2.ToolTip.visible: hovered || visualFocus
+-                    QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
+-                }
++        // Dependent option: indented, disabled (not hidden) while indexing is off.
++        QQC2.CheckBox {
++            // ksr: kcm_baloofile/indexHiddenFolders
++            id: indexHiddenFolders
++            Layout.leftMargin: Kirigami.Units.gridUnit
++            text: i18nc("@option:check", "Also index hidden files and folders")
++            checked: kcm.balooSettings.indexHiddenFolders
++            onCheckStateChanged: kcm.balooSettings.indexHiddenFolders = checked
++
++            KCM.SettingStateBinding {
++                configObject: kcm.balooSettings
++                settingName: "indexHiddenFolders"
++                extraEnabledConditions: !fileSearchDisabled.checked
+             }
+         }
+-    }
+-
+-    Loader {
+-        id: fileDialogLoader
+ 
+-        property bool included: false
+-
+-        active: false
+-
+-        sourceComponent: QtDialogs.FolderDialog {
+-            title: fileDialogLoader.included ? i18nc("@title:window", "Select a folder to include") : i18nc("@title:window", "Select a folder to exclude")
+-            currentFolder: StandardPaths.standardLocations(StandardPaths.HomeLocation)[0]
++        // ---- Locations: the list is a sub-page ----
++        Kirigami.Separator {
++            Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18nc("@title:group", "Locations")
++        }
+ 
+-            onAccepted: {
+-                kcm.filteredModel.addFolder(selectedFolder, fileDialogLoader.included)
+-                fileDialogLoader.active = false
+-            }
++        QQC2.Button {
++            // ksr: kcm_baloofile/StartFolder
++            // ksr: kcm_baloofile/StopFolder
++            // ksr: kcm_baloofile/filteredModel-removeFolder
++            Kirigami.FormData.label: i18nc("@label", "Folders to index:")
++            icon.name: "folder"
++            text: i18nc("@action:button", "Choose Folders…")
++            enabled: !fileSearchDisabled.checked
++            onClicked: kcm.push("Locations.qml")
++        }
+ 
+-            onRejected: {
+-                fileDialogLoader.active = false
+-            }
++        // ---- Indexer state: Baloo.Monitor loads after the first frame ----
++        Kirigami.Separator {
++            Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18nc("@title:group", "Indexer")
++            visible: !fileSearchDisabled.checked
++        }
+ 
+-            Component.onCompleted: open()
++        Loader {
++            id: statusLoader
++            Kirigami.FormData.label: i18nc("@label", "State:")
++            Layout.fillWidth: true
++            visible: !fileSearchDisabled.checked
++            active: !fileSearchDisabled.checked
++            asynchronous: true
++            sourceComponent: IndexerStatus {}
+         }
+     }
+ }

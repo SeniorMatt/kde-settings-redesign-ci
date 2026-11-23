@@ -1,0 +1,136 @@
+From 54fd7bbce584d660b4c5ca06e1f25668a12db866 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 08:21:23 +0500
+Subject: [PATCH 04/22] ModuleView: keep recently used pages alive
+
+An LRU of pages (setPageCacheSize()) so that returning to a page does not
+rebuild it. The least recently used page beyond the size is destroyed the
+same way closeModules() does. A size of 0 keeps the old behaviour, where
+the caller closes all pages before loading one.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ app/ModuleView.cpp | 52 ++++++++++++++++++++++++++++++++++++++++++++++
+ app/ModuleView.h   | 10 +++++++++
+ 2 files changed, 62 insertions(+)
+
+diff --git a/app/ModuleView.cpp b/app/ModuleView.cpp
+index 6ded0eb..6a12140 100644
+--- a/app/ModuleView.cpp
++++ b/app/ModuleView.cpp
+@@ -38,6 +38,7 @@
+ #include <KTitleWidget>
+ #include <PlasmaActivities/ResourceInstance>
+ 
++#include <algorithm>
+ #include <cmath>
+ 
+ class CustomTitle : public KTitleWidget
+@@ -125,6 +126,9 @@ public:
+     }
+     QMap<KPageWidgetItem *, KCModule *> mPages;
+     QMap<KPageWidgetItem *, QString> mPagesPluginIdMap;
++    // Pages that are kept alive, least recently used first
++    QList<KPageWidgetItem *> mPagesLru;
++    int mPageCacheSize = 0;
+     KPageWidget *mPageWidget = nullptr;
+     CustomTitle *mCustomHeader = nullptr;
+     QVBoxLayout *mLayout = nullptr;
+@@ -259,6 +263,8 @@ void ModuleView::addModule(MenuItem *item, const QStringList &args)
+     }
+ 
+     if (KPageWidgetItem *page = d->mPagesPluginIdMap.key(data.pluginId())) {
++        // A cached page: just make it current again
++        touchPage(page);
+         activeModuleChanged(page, d->mPageWidget->currentPage());
+         return;
+     }
+@@ -303,6 +309,51 @@ void ModuleView::addModule(MenuItem *item, const QStringList &args)
+     updatePageIconHeader(page);
+     // Add the new page
+     d->mPageWidget->addPage(page);
++    touchPage(page);
++    // Only the first page becomes the current one by itself
++    if (d->mPageWidget->currentPage() != page) {
++        activeModuleChanged(page, d->mPageWidget->currentPage());
++    }
++    trimPageCache();
++}
++
++void ModuleView::touchPage(KPageWidgetItem *page)
++{
++    d->mPagesLru.removeAll(page);
++    d->mPagesLru.append(page);
++}
++
++void ModuleView::trimPageCache()
++{
++    // The current page counts, so a size of 1 (or 0) keeps nothing but the current page
++    const int maxPages = qMax(1, d->mPageCacheSize);
++    while (d->mPagesLru.size() > maxPages) {
++        const auto oldest = std::find_if(d->mPagesLru.cbegin(), d->mPagesLru.cend(), [this](KPageWidgetItem *page) {
++            return page != d->mPageWidget->currentPage();
++        });
++        if (oldest == d->mPagesLru.cend()) {
++            break;
++        }
++        KPageWidgetItem *page = *oldest;
++        d->mPagesLru.erase(oldest);
++
++        d->pageChangeSupressed = true;
++        // Same as closeModules(): delete the KCM first, because e.g. the KFontInst KCM accesses its widgets in the destructor
++        delete d->mPages.take(page);
++        d->mPagesPluginIdMap.remove(page);
++        d->mPageWidget->removePage(page);
++        d->pageChangeSupressed = false;
++    }
++}
++
++void ModuleView::setPageCacheSize(int size)
++{
++    d->mPageCacheSize = qMax(0, size);
++}
++
++int ModuleView::pageCacheSize() const
++{
++    return d->mPageCacheSize;
+ }
+ 
+ void ModuleView::updatePageIconHeader(KPageWidgetItem *page)
+@@ -407,6 +458,7 @@ void ModuleView::closeModules()
+ 
+     d->mPages.clear();
+     d->mPagesPluginIdMap.clear();
++    d->mPagesLru.clear();
+     d->pageChangeSupressed = false;
+ }
+ 
+diff --git a/app/ModuleView.h b/app/ModuleView.h
+index e7997d3..ed30d03 100644
+--- a/app/ModuleView.h
++++ b/app/ModuleView.h
+@@ -76,6 +76,14 @@ public:
+      */
+     void closeModules();
+ 
++    /**
++     * How many pages (including the current one) are kept alive after the user leaves them, so that going back to
++     * one is instant. The least recently used ones are destroyed. With 0 (the default) the caller is expected
++     * to call closeModules() before loading a page.
++     */
++    void setPageCacheSize(int size);
++    int pageCacheSize() const;
++
+     void setFaceType(KPageView::FaceType type);
+ 
+     /**
+@@ -171,6 +179,8 @@ private:
+     void addModule(MenuItem *item, const QStringList &args);
+     void moduleSave(KCModule *module);
+     void updatePageIconHeader(KPageWidgetItem *page);
++    void touchPage(KPageWidgetItem *page);
++    void trimPageCache();
+     void updateButtons();
+     bool eventFilter(QObject *watched, QEvent *event) override;
+     void updateScrollAreaFocusPolicy();

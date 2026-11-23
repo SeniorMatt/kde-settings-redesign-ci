@@ -1,0 +1,400 @@
+From 418e305778858e494cd39c7ff57ec1ebaf16efeb Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 14:12:53 +0500
+Subject: [PATCH 08/24] kcm_cursortheme: themes scanned after the first frame,
+ Launch Feedback on a sub-page
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Page type: Gallery (docs/page-design.md section 5). Config keys (kcminputrc Mouse/cursorTheme, cursorSize, the
+launch-feedback keys in klaunchrc and plasmarc), the XCursor code, KNS config, plasma-apply-cursortheme are unchanged.
+NOT BUILT YET (owner stopped heavy work); checked statically only.
+
+Moved / renamed:
+- "Configure Launch Feedback…" was a popup Kirigami.Dialog; now the page action "Launch Feedback…" -> kcm.push
+  ("LaunchFeedbackPage.qml", renamed from LaunchFeedbackDialog.qml), a Form page: "Pointer feedback:" (None, Static,
+  Blinking, Bouncing, same one radio group over three keys), "Task Manager feedback:" checkbox "Enable animation" ->
+  "Animate the launching application's button" (no "Enable" prefix), a section "Duration" (noun) with "Stop animations
+  after:" (was an empty section spacer). The intro sentence is a small help line under the radios.
+- Toolbar stays as page actions top right: Size combo, Launch Feedback…, Install from File…, Get New…; per theme
+  Remove / Don't delete stay GridDelegate actions. Empty state: "No pointer themes found" with the Install from File…
+  action; busy indicator only after 150 ms.
+- Relabel table: inventory/relabel/kcm_cursortheme.tsv (outer repo). Inventory --strict: 10 rows ok, 0 lost.
+- HIG ids: HIG-001, HIG-005, HIG-006, HIG-057; page-design sections 3, 5, 7.
+
+Speed (cause found in code, not measured):
+- The CursorThemeConfig constructor built CursorThemeModel, whose constructor ran insertThemes() synchronously
+  (thememodel.cpp): QDir::entryList of every icon search path (~/.icons, /usr/share/icons, ...), and for each directory
+  an index.theme/cursors check and an XCursorTheme (index.theme parse), then CursorThemeConfig::load() called
+  updateSizeComboBox(), which renders two QPixmaps per available size of the selected theme (theme->createIcon). All
+  before the first frame.
+- Now: CursorThemeModel(parent, loadNow=false) and CursorThemeModel::load(); the KCM scans in loadThemes() from
+  QTimer::singleShot(0), with the proxy's dynamic sort off during the scan (one sort at the end), then
+  updateSizeComboBox() (needsSave kept as it was). New property kcm.themesLoaded; the grid has no model and
+  currentIndex -1 until it is true, and the index-changed handler does not write the theme back before then (so a
+  half-built list can never overwrite the setting). plasma-apply-cursortheme still uses the default (immediate) constructor.
+- Not changed: PreviewWidget (QQuickPaintedItem) still paints each visible card's cursors synchronously on the GUI
+  thread; GridView only creates visible delegates.
+- After numbers: pending, manager will measure.
+
+Not built yet; uncertain: that setNeedsSave(false) after the deferred updateSizeComboBox() is right for a managed module
+(mirrors load()); QSortFilterProxyModel::setDynamicSortFilter(true) re-sorts as documented; header actions use
+kcm.push from a Kirigami.Action inside GridViewKCM as kcm_style does.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/cursortheme/kcmcursortheme.cpp           | 31 +++++++++-
+ kcms/cursortheme/kcmcursortheme.h             |  7 +++
+ kcms/cursortheme/ui/Delegate.qml              |  1 +
+ ...dbackDialog.qml => LaunchFeedbackPage.qml} | 31 +++++-----
+ kcms/cursortheme/ui/main.qml                  | 59 +++++++++++++------
+ kcms/cursortheme/xcursor/thememodel.cpp       |  9 ++-
+ kcms/cursortheme/xcursor/thememodel.h         |  6 +-
+ 7 files changed, 110 insertions(+), 34 deletions(-)
+ rename kcms/cursortheme/ui/{LaunchFeedbackDialog.qml => LaunchFeedbackPage.qml} (84%)
+
+diff --git a/kcms/cursortheme/kcmcursortheme.cpp b/kcms/cursortheme/kcmcursortheme.cpp
+index 53efc93..37c17c3 100644
+--- a/kcms/cursortheme/kcmcursortheme.cpp
++++ b/kcms/cursortheme/kcmcursortheme.cpp
+@@ -29,6 +29,7 @@
+ 
+ #include <QDir>
+ #include <QStandardItemModel>
++#include <QTimer>
+ #include <QTemporaryFile>
+ 
+ using namespace Qt::StringLiterals;
+@@ -49,7 +50,8 @@ CursorThemeConfig::CursorThemeConfig(QObject *parent, const KPluginMetaData &dat
+     qmlRegisterAnonymousType<CursorThemeSettings>("CursorThemeSettings", 1);
+     qmlRegisterAnonymousType<LaunchFeedbackSettings>("LaunchFeedbackSettings", 1);
+ 
+-    m_themeModel = new CursorThemeModel(this);
++    // The theme directories are scanned in loadThemes(), one event-loop turn after the page exists
++    m_themeModel = new CursorThemeModel(this, false);
+ 
+     m_themeProxyModel = new SortProxyModel(this);
+     m_themeProxyModel->setSourceModel(m_themeModel);
+@@ -65,6 +67,8 @@ CursorThemeConfig::CursorThemeConfig(QObject *parent, const KPluginMetaData &dat
+         setCanInstall(false);
+     }
+ 
++    QTimer::singleShot(0, this, &CursorThemeConfig::loadThemes);
++
+     connect(m_themeModel, &QAbstractItemModel::dataChanged, this, &CursorThemeConfig::settingsChanged);
+     connect(m_themeModel, &QAbstractItemModel::dataChanged, this, [this](const QModelIndex &start, const QModelIndex &end, const QList<int> &roles) {
+         const QModelIndex currentThemeIndex = m_themeModel->findIndex(cursorThemeSettings()->cursorTheme());
+@@ -111,6 +115,31 @@ bool CursorThemeConfig::canInstall() const
+     return m_canInstall;
+ }
+ 
++bool CursorThemeConfig::themesLoaded() const
++{
++    return m_themesLoaded;
++}
++
++void CursorThemeConfig::loadThemes()
++{
++    if (m_themesLoaded) {
++        return;
++    }
++    // No re-sorting per inserted row; one sort when the scan is done
++    m_themeProxyModel->setDynamicSortFilter(false);
++    m_themeModel->load();
++    m_themeProxyModel->setDynamicSortFilter(true);
++    m_themesLoaded = true;
++
++    // The size list needs the selected theme; the same call load() makes. It must not mark the page as changed.
++    const bool hadChanges = needsSave();
++    updateSizeComboBox();
++    if (!hadChanges) {
++        setNeedsSave(false);
++    }
++    Q_EMIT themesLoadedChanged();
++}
++
+ void CursorThemeConfig::setCanResize(bool can)
+ {
+     if (m_canResize == can) {
+diff --git a/kcms/cursortheme/kcmcursortheme.h b/kcms/cursortheme/kcmcursortheme.h
+index cbed8f9..2917ffe 100644
+--- a/kcms/cursortheme/kcmcursortheme.h
++++ b/kcms/cursortheme/kcmcursortheme.h
+@@ -40,6 +40,7 @@ class CursorThemeConfig : public KQuickManagedConfigModule
+     Q_PROPERTY(QAbstractItemModel *cursorsModel READ cursorsModel CONSTANT)
+     Q_PROPERTY(QAbstractItemModel *sizesModel READ sizesModel CONSTANT)
+ 
++    Q_PROPERTY(bool themesLoaded READ themesLoaded NOTIFY themesLoadedChanged)
+     Q_PROPERTY(bool downloadingFile READ downloadingFile NOTIFY downloadingFileChanged)
+     Q_PROPERTY(int preferredSize READ preferredSize WRITE setPreferredSize NOTIFY preferredSizeChanged)
+ 
+@@ -58,6 +59,9 @@ public:
+     bool canInstall() const;
+     void setCanInstall(bool can);
+ 
++    /** False until the theme directories have been scanned (one event-loop turn after the page was created). */
++    bool themesLoaded() const;
++
+     bool canResize() const;
+     void setCanResize(bool can);
+ 
+@@ -79,6 +83,7 @@ public:
+     Q_INVOKABLE QString cursorThemeFromIndex(int index) const;
+ 
+ Q_SIGNALS:
++    void themesLoadedChanged();
+     void canInstallChanged();
+     void canResizeChanged();
+     void canConfigureChanged();
+@@ -103,6 +108,8 @@ private Q_SLOTS:
+     void updateSizeComboBox();
+ 
+ private:
++    void loadThemes();
++    bool m_themesLoaded = false;
+     bool isSaveNeeded() const override;
+     void installThemeFile(const QString &path);
+     bool iconsIsWritable() const;
+diff --git a/kcms/cursortheme/ui/Delegate.qml b/kcms/cursortheme/ui/Delegate.qml
+index bdbb556..7bb1532 100644
+--- a/kcms/cursortheme/ui/Delegate.qml
++++ b/kcms/cursortheme/ui/Delegate.qml
+@@ -46,6 +46,7 @@ KCM.GridDelegate {
+ 
+     actions: [
+         Kirigami.Action {
++            // ksr: kcm_cursortheme/RemoveTheme
+             icon.name: "edit-delete"
+             tooltip: if (enabled) {
+                 return i18nc("@info:tooltip", "Remove pointer theme");
+diff --git a/kcms/cursortheme/ui/LaunchFeedbackDialog.qml b/kcms/cursortheme/ui/LaunchFeedbackPage.qml
+similarity index 84%
+rename from kcms/cursortheme/ui/LaunchFeedbackDialog.qml
+rename to kcms/cursortheme/ui/LaunchFeedbackPage.qml
+index 5910db8..ede9b82 100644
+--- a/kcms/cursortheme/ui/LaunchFeedbackDialog.qml
++++ b/kcms/cursortheme/ui/LaunchFeedbackPage.qml
+@@ -10,25 +10,15 @@ import QtQuick.Layouts
+ import org.kde.kcmutils as KCM
+ import org.kde.kirigami as Kirigami
+ 
+-Kirigami.Dialog {
++// Sub-page of the Pointers page (was a popup dialog): the animations played while an application starts.
++KCM.SimpleKCM {
+     id: sheet
+ 
+     title: i18nc("@title", "Launch Feedback")
+ 
+-    padding: Kirigami.Units.largeSpacing
+-
+     ColumnLayout {
+-        Layout.preferredWidth: Kirigami.Units.gridUnit * 20
+-        Layout.maximumWidth: Kirigami.Units.gridUnit * 30
+         spacing: Kirigami.Units.largeSpacing
+ 
+-        QQC2.Label {
+-            Layout.fillWidth: true
+-            text: i18nc("@info:usagetip", "Configure the animations played while an application is launching.")
+-            textFormat: Text.PlainText
+-            wrapMode: Text.Wrap
+-        }
+-
+         Kirigami.FormLayout {
+             id: formLayout
+ 
+@@ -43,6 +33,7 @@ Kirigami.Dialog {
+                 }
+             }
+ 
++            // ksr: kcm_cursortheme/launchFeedbackSettings-busyCursor
+             QQC2.RadioButton {
+                 id: busyCursorDisabled
+ 
+@@ -86,12 +77,22 @@ Kirigami.Dialog {
+                 }
+             }
+ 
++            QQC2.Label {
++                Layout.fillWidth: true
++                Layout.maximumWidth: Kirigami.Units.gridUnit * 16
++                text: i18nc("@info:usagetip", "Configure the animations played while an application is launching.")
++                textFormat: Text.PlainText
++                wrapMode: Text.Wrap
++                font: Kirigami.Theme.smallFont
++            }
++
+             QQC2.CheckBox {
+                 id: taskManagerNotification
+ 
+                 Kirigami.FormData.label: i18nc("@label", "Task Manager feedback:")
+ 
+-                text: i18nc("@option:check", "Enable animation")
++                // ksr: kcm_cursortheme/taskbarButton
++                text: i18nc("@option:check", "Animate the launching application's button")
+ 
+                 checked: kcm.launchFeedbackSettings.taskbarButton
+                 enabled: !kcm.launchFeedbackSettings.isTaskbarButtonImmutable
+@@ -103,12 +104,14 @@ Kirigami.Dialog {
+                 }
+             }
+ 
+-            Item {
++            Kirigami.Separator {
+                 Kirigami.FormData.isSection: true
++                Kirigami.FormData.label: i18nc("@title:group", "Duration")
+             }
+ 
+             QQC2.SpinBox {
+                 id: notificationTimeout
++                // ksr: kcm_cursortheme/cursorTimeout
+                 Layout.preferredWidth: notificationTimeoutMetrics.implicitWidth + leftPadding + rightPadding
+                 Kirigami.FormData.label: i18nc("@label", "Stop animations after:")
+ 
+diff --git a/kcms/cursortheme/ui/main.qml b/kcms/cursortheme/ui/main.qml
+index 20aaebc..40e917b 100644
+--- a/kcms/cursortheme/ui/main.qml
++++ b/kcms/cursortheme/ui/main.qml
+@@ -27,17 +27,20 @@ KCM.GridViewKCM {
+     // enforce a minimum spacing so they don't overlap.
+     readonly property int previewSpacing: Math.max(16, kcm.cursorThemeSettings.cursorSize / 2)
+ 
+-    property LaunchFeedbackDialog launchFeedbackDialog: null as LaunchFeedbackDialog
+-
+-    view.model: kcm.cursorsModel
++    // The theme directories are scanned one event-loop turn after the first frame (kcm.themesLoaded); until then
++    // the grid has no model, so its current index is not applied (and not written back) on a half-filled list.
++    view.model: kcm.themesLoaded ? kcm.cursorsModel : null
+     view.delegate: Delegate {
+         previewPadding: root.previewPadding
+         previewSpacing: root.previewSpacing
+         maximumPreviewCount: root.previewCursorRows * root.previewCursorsPerRow
+     }
+-    view.currentIndex: kcm.cursorThemeIndex(kcm.cursorThemeSettings.cursorTheme);
++    view.currentIndex: kcm.themesLoaded ? kcm.cursorThemeIndex(kcm.cursorThemeSettings.cursorTheme) : -1
+ 
+     view.onCurrentIndexChanged: {
++        if (!kcm.themesLoaded) {
++            return;
++        }
+         kcm.cursorThemeSettings.cursorTheme = kcm.cursorThemeFromIndex(view.currentIndex)
+         view.positionViewAtIndex(view.currentIndex, view.GridView.Beginning);
+     }
+@@ -49,8 +52,36 @@ KCM.GridViewKCM {
+                              + root.previewSpacing * (root.previewCursorRows - 1)
+                              + 2 * root.previewPadding + 4 * Kirigami.Units.gridUnit
+ 
+-    Component.onCompleted: {
+-        view.positionViewAtIndex(view.currentIndex, GridView.Beginning);
++    Connections {
++        target: kcm
++        function onThemesLoadedChanged() {
++            root.view.positionViewAtIndex(root.view.currentIndex, GridView.Beginning);
++        }
++    }
++
++    // Busy only when the scan takes longer than 150 ms; an empty state when it found nothing.
++    Timer {
++        id: busyTimer
++        interval: 150
++        running: !kcm.themesLoaded
++    }
++    QtControls.BusyIndicator {
++        anchors.centerIn: parent
++        running: visible
++        visible: !kcm.themesLoaded && !busyTimer.running
++    }
++    Kirigami.PlaceholderMessage {
++        anchors.centerIn: parent
++        width: parent.width - Kirigami.Units.gridUnit * 4
++        visible: kcm.themesLoaded && root.view.count === 0
++        icon.name: "edit-select"
++        text: i18nc("@info", "No pointer themes found")
++        helpfulAction: Kirigami.Action {
++            icon.name: "document-import"
++            text: i18nc("@action:button", "Install from File…")
++            enabled: kcm.canInstall
++            onTriggered: fileDialogLoader.active = true
++        }
+     }
+ 
+     KCM.SettingStateBinding {
+@@ -150,27 +181,21 @@ KCM.GridViewKCM {
+             }
+         },
+         Kirigami.Action {
+-            text: i18nc("@action:button", "&Configure Launch Feedback…")
++            // ksr: kcm_cursortheme/ConfigureLaunchFeedback
++            text: i18nc("@action:button opens the launch feedback sub-page", "&Launch Feedback…")
+             Accessible.name: text // https://bugreports.qt.io/browse/QTBUG-130360
+             icon.name: "preferences-desktop-launch-feedback"
+-            onTriggered: {
+-                if (root.launchFeedbackDialog === null) {
+-                    const component = Qt.createComponent("LaunchFeedbackDialog.qml");
+-                    root.launchFeedbackDialog = component.createObject(root, {
+-                        "parent": root,
+-                    });
+-                    component.destroy();
+-                }
+-                root.launchFeedbackDialog.open();
+-            }
++            onTriggered: kcm.push("LaunchFeedbackPage.qml")
+         },
+         Kirigami.Action {
++            // ksr: kcm_cursortheme/InstallFromFile
+             text: i18n("&Install from File…")
+             icon.name: "document-import"
+             onTriggered: fileDialogLoader.active = true
+             enabled: kcm.canInstall
+         },
+         NewStuff.Action {
++            // ksr: kcm_cursortheme/GetNew
+             text: i18n("&Get New…")
+             configFile: "xcursor.knsrc"
+             onEntryEvent: function (entry, event) {
+diff --git a/kcms/cursortheme/xcursor/thememodel.cpp b/kcms/cursortheme/xcursor/thememodel.cpp
+index e51f12b..5f053cc 100644
+--- a/kcms/cursortheme/xcursor/thememodel.cpp
++++ b/kcms/cursortheme/xcursor/thememodel.cpp
+@@ -20,8 +20,15 @@ using namespace Qt::StringLiterals;
+ 
+ Q_LOGGING_CATEGORY(KCM_CURSORTHEME, "kcm_cursortheme", QtWarningMsg)
+ 
+-CursorThemeModel::CursorThemeModel(QObject *parent)
++CursorThemeModel::CursorThemeModel(QObject *parent, bool loadNow)
+     : QAbstractListModel(parent)
++{
++    if (loadNow) {
++        insertThemes();
++    }
++}
++
++void CursorThemeModel::load()
+ {
+     insertThemes();
+ }
+diff --git a/kcms/cursortheme/xcursor/thememodel.h b/kcms/cursortheme/xcursor/thememodel.h
+index 6d061db..b7ca8f8 100644
+--- a/kcms/cursortheme/xcursor/thememodel.h
++++ b/kcms/cursortheme/xcursor/thememodel.h
+@@ -42,7 +42,8 @@ class CursorThemeModel : public QAbstractListModel
+     Q_OBJECT
+ 
+ public:
+-    explicit CursorThemeModel(QObject *parent = nullptr);
++    /// With @p loadNow = false the themes are not scanned until load() is called (the KCM does it after its first frame).
++    explicit CursorThemeModel(QObject *parent = nullptr, bool loadNow = true);
+     ~CursorThemeModel() override;
+     QHash<int, QByteArray> roleNames() const override;
+     inline int rowCount(const QModelIndex &parent = QModelIndex()) const override;
+@@ -70,6 +71,9 @@ public:
+     /// Refresh the list of themes by checking what's on disk.
+     void refreshList();
+ 
++    /// Scans the theme directories once (done by the constructor unless it was told not to).
++    void load();
++
+ private:
+     bool handleDefault(const QDir &dir);
+     void processThemeDir(const QDir &dir, const QStringList &whitelist);

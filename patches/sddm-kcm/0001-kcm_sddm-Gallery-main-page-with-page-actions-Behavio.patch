@@ -1,0 +1,606 @@
+From b8d68b2eb4edf64c0e66bd2c227e251a19f80600 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 02:26:34 +0500
+Subject: [PATCH 1/2] kcm_sddm: Gallery main page with page actions; Behavior
+ sub-page as a Form that matches kcm_plasmalogin
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Page types: main page Gallery, Behavior sub-page Form (docs/page-design.md). KAuth flows (save, installtheme,
+uninstalltheme, sync/reset), config keys, defaults and SDDM theme.conf.user handling are unchanged.
+Note KDE Linux ships Plasma Login Manager (kcm_plasmalogin), not SDDM; this page stays consistent with it.
+
+Moved / renamed:
+- Page actions at the top right in use order: Get New…, Install From File…, Behavior…, Apply Plasma Settings…
+  (kcm_sddm/GetNew, InstallFromFile, Behavior, ApplyPlasmaSettings; labels unchanged).
+- Empty state: Kirigami.PlaceholderMessage "No login screen themes found" with a pointer to Get New… / Install From
+  File…; busy indicator only after 150 ms.
+- Behavior (was Kirigami.Page + "Automatically log in: [as user:] [with session]" in one row) is now a
+  KCM.SimpleKCM + Kirigami.FormLayout using the same rows and wording as kcm_plasmalogin: "Auto-login:" checkbox
+  "Log in automatically", "User:", "Session:", "Log in again immediately after logging off", wallet warning as its
+  own capped-width row (kcm_sddm/sddmSettings-user, User, Session, Relogin, OpenWallet). User and session are
+  disabled, not hidden, while auto-login is off.
+- Sections "Users" (Minimum/Maximum user UID with a one-line hint) and "Shutdown commands" ("Halt command:" /
+  "Reboot command:", sentence case; file-chooser buttons get a tooltip and an accessible name).
+  (kcm_sddm/MinimumUid, MaximumUid, HaltCommand, RebootCommand). Old wording is added to the layout aliases.
+- Theme thumbnails load with asynchronous: true. Relabel table: inventory/relabel/kcm_sddm.tsv (outer repo).
+
+Speed: ThemesModel's constructor called populate(), which lists the theme folders and reads metadata.desktop,
+theme.conf and theme.conf.user of every theme (src/themesmodel.cpp ctor, populate, add), before the page existed. It is
+now queued with QTimer::singleShot(0); a new loaded property tells the page when the list is complete, and the current
+theme (set by SddmKcm before the list existed) is re-applied after the scan. m_currentIndex was uninitialised; it is -1
+now and currentTheme() no longer indexes out of range. UsersModel/SessionModel were already only created by the
+Behavior sub-page. After: pending, manager will measure.
+
+HIG: HIG-001, HIG-005, HIG-006, HIG-013, HIG-017, HIG-019, HIG-020, HIG-023, HIG-058.
+Not built yet. Unconfirmed: nothing outside the repo's own APIs was used.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ src/themesmodel.cpp |  35 ++++++-
+ src/themesmodel.h   |   8 +-
+ src/ui/Advanced.qml | 247 ++++++++++++++++++++++++--------------------
+ src/ui/main.qml     |  54 +++++++---
+ 4 files changed, 219 insertions(+), 125 deletions(-)
+
+diff --git a/src/themesmodel.cpp b/src/themesmodel.cpp
+index 9c9c156..85ec252 100644
+--- a/src/themesmodel.cpp
++++ b/src/themesmodel.cpp
+@@ -11,6 +11,7 @@
+ #include <QDir>
+ #include <QStandardPaths>
+ #include <QString>
++#include <QTimer>
+ #include <QUrl>
+ 
+ #include <KConfig>
+@@ -21,7 +22,9 @@
+ ThemesModel::ThemesModel(QObject *parent)
+     : QAbstractListModel(parent)
+ {
+-    populate();
++    // Listing the theme folders and reading each theme's metadata.desktop, theme.conf and theme.conf.user is disk work:
++    // it runs right after the first frame, not in the constructor. loaded() tells the page when the list is complete.
++    QTimer::singleShot(0, this, &ThemesModel::populate);
+     m_customInstalledThemes = KSharedConfig::openConfig(QStringLiteral("sddmthemeinstallerrc"))->group(QStringLiteral("DownloadedThemes")).entryMap().values();
+ }
+ 
+@@ -140,6 +143,32 @@ bool ThemesModel::setData(const QModelIndex &index, const QVariant &value, int r
+ }
+ 
+ void ThemesModel::populate()
++{
++    populateThemes();
++
++    // The current theme may have been set before the list existed.
++    if (!m_requestedTheme.isEmpty()) {
++        const auto it = std::find_if(mThemeList.cbegin(), mThemeList.cend(), [this](const ThemeMetadata &themeData) {
++            return themeData.themeid() == m_requestedTheme;
++        });
++        if (it != mThemeList.cend()) {
++            m_currentIndex = it - mThemeList.cbegin();
++        }
++        Q_EMIT currentIndexChanged();
++    }
++
++    if (!m_loaded) {
++        m_loaded = true;
++        Q_EMIT loadedChanged();
++    }
++}
++
++bool ThemesModel::loaded() const
++{
++    return m_loaded;
++}
++
++void ThemesModel::populateThemes()
+ {
+     if (!mThemeList.isEmpty()) {
+         beginResetModel();
+@@ -234,11 +263,15 @@ int ThemesModel::currentIndex() const
+ 
+ QString ThemesModel::currentTheme() const
+ {
++    if (m_currentIndex < 0 || m_currentIndex >= mThemeList.size()) {
++        return m_requestedTheme;
++    }
+     return mThemeList[m_currentIndex].themeid();
+ }
+ 
+ void ThemesModel::setCurrentTheme(const QString &theme)
+ {
++    m_requestedTheme = theme;
+     auto it = std::find_if(mThemeList.cbegin(), mThemeList.cend(), [&theme](const ThemeMetadata &themeData) {
+         return themeData.themeid() == theme;
+     });
+diff --git a/src/themesmodel.h b/src/themesmodel.h
+index 7c7cedc..a2b2d07 100644
+--- a/src/themesmodel.h
++++ b/src/themesmodel.h
+@@ -16,6 +16,7 @@ class ThemesModel : public QAbstractListModel
+     Q_OBJECT
+     Q_PROPERTY(QString currentTheme READ currentTheme WRITE setCurrentTheme NOTIFY currentIndexChanged)
+     Q_PROPERTY(int currentIndex READ currentIndex NOTIFY currentIndexChanged)
++    Q_PROPERTY(bool loaded READ loaded NOTIFY loadedChanged)
+ public:
+     enum Roles {
+         IdRole = Qt::UserRole,
+@@ -48,17 +49,22 @@ public:
+     QString currentTheme() const;
+     void setCurrentTheme(const QString &theme);
+     int currentIndex() const;
++    bool loaded() const;
+ 
+ public Q_SLOTS:
+     void populate();
+ Q_SIGNALS:
+     void currentIndexChanged();
++    void loadedChanged();
+ 
+ private:
++    void populateThemes();
+     void add(const QString &name, const QString &path);
+     void dump(const QString &id, const QString &path);
+ 
+-    int m_currentIndex;
++    int m_currentIndex = -1;
++    QString m_requestedTheme;
++    bool m_loaded = false;
+     QList<ThemeMetadata> mThemeList;
+     QHash<QString, QString> m_currentWallpapers;
+     QHash<QString, bool> m_wallpaperDirty;
+diff --git a/src/ui/Advanced.qml b/src/ui/Advanced.qml
+index 5f78ca6..2c4e97a 100644
+--- a/src/ui/Advanced.qml
++++ b/src/ui/Advanced.qml
+@@ -13,118 +13,132 @@ import org.kde.kirigami 2.14 as Kirigami
+ import org.kde.kitemmodels 1.0 as ItemModels
+ import org.kde.private.kcms.sddm 1.0
+ 
+-Kirigami.Page {
++KCM.SimpleKCM {
+     title: i18nc("@title", "Behavior")
+ 
+     Kirigami.FormLayout {
+-        width: parent.width
+ 
+-        RowLayout {
+-            Kirigami.FormData.label: i18nc("option:check", "Automatically log in:")
+-            spacing: Kirigami.Units.smallSpacing
++        // Same rows and wording as the Auto-login section of kcm_plasmalogin. The user and session are disabled,
++        // not hidden, while auto-login is off.
++        QQC2.CheckBox {
++            id: autologinBox
++            // ksr: kcm_sddm/sddmSettings-user
++            Kirigami.FormData.label: i18nc("@label", "Auto-login:")
++            text: i18nc("@option:check", "Log in automatically")
++            checked: kcm.sddmSettings.user != ""
++            KCM.SettingHighlighter {
++                highlight: (kcm.sddmSettings.user != "" && kcm.sddmSettings.defaultUser == "") ||
++                            (kcm.sddmSettings.user == "" && kcm.sddmSettings.defaultUser != "")
++            }
++            onToggled: {
+ 
+-            QQC2.CheckBox {
+-                id: autologinBox
+-                text: i18nc("@label:listbox, the following combobox selects the user to log in automatically", "as user:")
+-                checked: kcm.sddmSettings.user != ""
+-                KCM.SettingHighlighter {
+-                    highlight: (kcm.sddmSettings.user != "" && kcm.sddmSettings.defaultUser == "") ||
+-                                (kcm.sddmSettings.user == "" && kcm.sddmSettings.defaultUser != "")
++                if (checked) {
++                    kcm.sddmSettings.user = autologinUser.currentText
++                    kcm.sddmSettings.session = autologinSession.currentValue
++                } else {
++                    kcm.sddmSettings.user = ""
++                    kcm.sddmSettings.session = ""
+                 }
+-                onToggled: {
+-
+-                    if (checked) {
+-                        kcm.sddmSettings.user = autologinUser.currentText
+-                        kcm.sddmSettings.session = autologinSession.currentValue
+-                    } else {
+-                        kcm.sddmSettings.user = ""
+-                        kcm.sddmSettings.session = ""
+-                    }
+-
+-                    // Deliberately imperative because we only want the message
+-                    // to appear when the user checks the checkbox, not all the
+-                    // time when the checkbox is checked.
+-                    if (checked && kcm.KDEWalletAvailable()) {
+-                        autologinMessage.visible = true;
+-                    }
++
++                // Deliberately imperative because we only want the message
++                // to appear when the user checks the checkbox, not all the
++                // time when the checkbox is checked.
++                if (checked && kcm.KDEWalletAvailable()) {
++                    autologinMessage.visible = true;
+                 }
+             }
+-            QQC2.ComboBox {
+-                id: autologinUser
+-                model: ItemModels.KSortFilterProxyModel {
+-                    sourceModel: UsersModel {
+-                        id: userModel
+-                    }
+-                    filterRowCallback: function(sourceRow, sourceParent) {
+-                        const id = userModel.data(userModel.index(sourceRow, 0, sourceParent), UsersModel.UidRole)
+-                        return kcm.sddmSettings.minimumUid <= id && id <= kcm.sddmSettings.maximumUid
+-                    }
+-                }
+-                textRole: "display"
+-                editable: true
+-                onActivated: kcm.sddmSettings.user = currentText
+-                KCM.SettingStateBinding {
+-                    visible: autologinBox.checked
+-                    configObject: kcm.sddmSettings
+-                    settingName: "User"
+-                    extraEnabledConditions: autologinBox.checked
+-                }
+-                Component.onCompleted: {
+-                    updateSelectedUser();
+-
+-                    // In the initial state, comboBox sets currentIndex to 0 (the first value from the comboBox).
+-                    // After component is completed currentIndex changes to the correct value using `updateSelectUser` here.
+-                    // This implicit initial changing of the currentIndex (to 0) calls the onEditTextChanged handler,
+-                    // which in turn saves the wrong login in kcm.sddmSettings.user (the first value from the comboBox).
+-                    // So we need connect to editTextChanged signal here after the correct currentIndex was settled
+-                    // thus reacting only to user input and pressing the Reset/Default buttons.
+-                    autologinUser.editTextChanged.connect(setUserFromEditText);
+-                }
+-                function setUserFromEditText() {
+-                    kcm.sddmSettings.user = editText;
+-                }
+-                function updateSelectedUser() {
+-                    const index = find(kcm.sddmSettings.user);
+-                    if (index != -1) {
+-                        currentIndex = index;
+-                    }
+-                    editText = kcm.sddmSettings.user;
++            Accessible.name: i18n("Automatically log in with a specific user and session")
++        }
++        QQC2.ComboBox {
++            id: autologinUser
++            // ksr: kcm_sddm/User
++            Kirigami.FormData.label: i18nc("@label:listbox", "User:")
++            implicitWidth: Kirigami.Units.gridUnit * 12
++            model: ItemModels.KSortFilterProxyModel {
++                sourceModel: UsersModel {
++                    id: userModel
+                 }
+-                Connections { // Needed for "Reset" and "Default" buttons to work
+-                    target: kcm.sddmSettings
+-                    function onUserChanged() { autologinUser.updateSelectedUser(); }
++                filterRowCallback: function(sourceRow, sourceParent) {
++                    const id = userModel.data(userModel.index(sourceRow, 0, sourceParent), UsersModel.UidRole)
++                    return kcm.sddmSettings.minimumUid <= id && id <= kcm.sddmSettings.maximumUid
+                 }
+             }
+-            QQC2.Label {
+-                enabled: autologinBox.checked
+-                text: i18nc("@label:listbox, the following combobox selects the session that is started automatically", "with session")
++            textRole: "display"
++            editable: true
++            onActivated: kcm.sddmSettings.user = currentText
++            KCM.SettingStateBinding {
++                configObject: kcm.sddmSettings
++                settingName: "User"
++                extraEnabledConditions: autologinBox.checked
++            }
++            Component.onCompleted: {
++                updateSelectedUser();
++
++                // In the initial state, comboBox sets currentIndex to 0 (the first value from the comboBox).
++                // After component is completed currentIndex changes to the correct value using `updateSelectUser` here.
++                // This implicit initial changing of the currentIndex (to 0) calls the onEditTextChanged handler,
++                // which in turn saves the wrong login in kcm.sddmSettings.user (the first value from the comboBox).
++                // So we need connect to editTextChanged signal here after the correct currentIndex was settled
++                // thus reacting only to user input and pressing the Reset/Default buttons.
++                autologinUser.editTextChanged.connect(setUserFromEditText);
+             }
+-            QQC2.ComboBox {
+-                id: autologinSession
+-                model: SessionModel {}
+-                textRole: "name"
+-                valueRole: "file"
+-                onActivated: kcm.sddmSettings.session = currentValue
+-                KCM.SettingStateBinding {
+-                    visible: autologinBox.checked
+-                    configObject: kcm.sddmSettings
+-                    settingName: "Session"
+-                    extraEnabledConditions: autologinBox.checked
+-                }
+-                Component.onCompleted: updateCurrentIndex()
+-                function updateCurrentIndex() {
+-                    currentIndex = Math.max(indexOfValue(kcm.sddmSettings.session), 0);
+-                }
+-                Connections { // Needed for "Reset" and "Default" buttons to work
+-                    target: kcm.sddmSettings
+-                    function onSessionChanged() { autologinSession.updateCurrentIndex(); }
++            function setUserFromEditText() {
++                kcm.sddmSettings.user = editText;
++            }
++            function updateSelectedUser() {
++                const index = find(kcm.sddmSettings.user);
++                if (index != -1) {
++                    currentIndex = index;
+                 }
++                editText = kcm.sddmSettings.user;
++            }
++            Connections { // Needed for "Reset" and "Default" buttons to work
++                target: kcm.sddmSettings
++                function onUserChanged() { autologinUser.updateSelectedUser(); }
++            }
++        }
++        QQC2.ComboBox {
++            id: autologinSession
++            // ksr: kcm_sddm/Session
++            Kirigami.FormData.label: i18nc("@label:listbox", "Session:")
++            implicitWidth: Kirigami.Units.gridUnit * 12
++            model: SessionModel {}
++            textRole: "name"
++            valueRole: "file"
++            onActivated: kcm.sddmSettings.session = currentValue
++            KCM.SettingStateBinding {
++                configObject: kcm.sddmSettings
++                settingName: "Session"
++                extraEnabledConditions: autologinBox.checked
++            }
++            Component.onCompleted: updateCurrentIndex()
++            function updateCurrentIndex() {
++                currentIndex = Math.max(indexOfValue(kcm.sddmSettings.session), 0);
++            }
++            Connections { // Needed for "Reset" and "Default" buttons to work
++                target: kcm.sddmSettings
++                function onSessionChanged() { autologinSession.updateCurrentIndex(); }
++            }
++        }
++        QQC2.CheckBox {
++            // ksr: kcm_sddm/Relogin
++            text: i18nc("@option:check", "Log in again immediately after logging off")
++            checked: kcm.sddmSettings.relogin
++            onToggled: kcm.sddmSettings.relogin = checked
++            KCM.SettingStateBinding {
++                configObject: kcm.sddmSettings
++                settingName: "Relogin"
++                extraEnabledConditions: autologinBox.checked
+             }
+         }
++        // Own form row with a capped width, so that this long message does not push the form into narrow mode.
+         Kirigami.InlineMessage {
+             id: autologinMessage
++            // ksr: kcm_sddm/OpenWallet
+ 
+             Layout.fillWidth: true
++            Layout.preferredWidth: Kirigami.Units.gridUnit * 24
++            Layout.maximumWidth: Kirigami.Units.gridUnit * 24
+ 
+             type: Kirigami.MessageType.Warning
+ 
+@@ -138,20 +152,13 @@ To avoid this, you can change the wallet to have a blank password. Note that thi
+                 onTriggered: kcm.openKDEWallet();
+             }
+         }
+-        QQC2.CheckBox {
+-            text: i18nc("@option:check", "Log in again immediately after logging off")
+-            checked: kcm.sddmSettings.relogin
+-            onToggled: kcm.sddmSettings.relogin = checked
+-            KCM.SettingStateBinding {
+-                configObject: kcm.sddmSettings
+-                settingName: "Relogin"
+-                extraEnabledConditions: autologinBox.checked
+-            }
+-        }
+-        Item {
++
++        Kirigami.Separator {
+             Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18nc("@title:group", "Users")
+         }
+         QQC2.SpinBox {
++            // ksr: kcm_sddm/MinimumUid
+             Kirigami.FormData.label: i18nc("@label:spinbox", "Minimum user UID:")
+             id: minSpinBox
+             from: 1000
+@@ -164,6 +171,7 @@ To avoid this, you can change the wallet to have a blank password. Note that thi
+             }
+         }
+         QQC2.SpinBox {
++            // ksr: kcm_sddm/MaximumUid
+             Kirigami.FormData.label: i18nc("@label:spinbox", "Maximum user UID:")
+             id: maxSpinBox
+             from: minSpinBox.value
+@@ -175,17 +183,27 @@ To avoid this, you can change the wallet to have a blank password. Note that thi
+                 settingName: "MaximumUid"
+             }
+         }
+-        Item {
++        QQC2.Label {
++            Layout.maximumWidth: Kirigami.Units.gridUnit * 16
++            Layout.fillWidth: true
++            text: i18nc("@info", "Only users with a UID in this range are listed.")
++            font: Kirigami.Theme.smallFont
++            wrapMode: Text.Wrap
++        }
++
++        Kirigami.Separator {
+             Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18nc("@title:group", "Shutdown commands")
+         }
+         RowLayout {
+-            Kirigami.FormData.label: i18nc("@label:textbox", "Halt Command:")
+-            Layout.fillWidth: true
++            // ksr: kcm_sddm/HaltCommand
++            Kirigami.FormData.label: i18nc("@label:textbox", "Halt command:")
++            Kirigami.FormData.buddyFor: haltField
+             spacing: Kirigami.Units.smallSpacing
+ 
+             Kirigami.ActionTextField {
+                 id: haltField
+-                Layout.fillWidth: true
++                Layout.preferredWidth: Kirigami.Units.gridUnit * 14
+                 text: kcm.sddmSettings.haltCommand
+                 readOnly: false
+                 onTextChanged: kcm.sddmSettings.haltCommand = text
+@@ -208,16 +226,20 @@ To avoid this, you can change the wallet to have a blank password. Note that thi
+                     fileDialog.open()
+                 }
+                 onClicked: selectFile()
++                QQC2.ToolTip.text: i18nc("@info:tooltip", "Choose a file")
++                QQC2.ToolTip.visible: hovered
++                Accessible.name: i18nc("@action:button", "Choose halt command file")
+             }
+         }
+         RowLayout {
+-            Layout.fillWidth: true
+-            Kirigami.FormData.label: i18nc("@label:textbox", "Reboot Command:")
++            // ksr: kcm_sddm/RebootCommand
++            Kirigami.FormData.label: i18nc("@label:textbox", "Reboot command:")
++            Kirigami.FormData.buddyFor: rebootField
+             spacing: Kirigami.Units.smallSpacing
+ 
+             Kirigami.ActionTextField {
+                 id: rebootField
+-                Layout.fillWidth: true
++                Layout.preferredWidth: Kirigami.Units.gridUnit * 14
+                 text: kcm.sddmSettings.rebootCommand
+                 readOnly: false
+                 onTextChanged: kcm.sddmSettings.rebootCommand = text
+@@ -240,6 +262,9 @@ To avoid this, you can change the wallet to have a blank password. Note that thi
+                     fileDialog.open()
+                 }
+                 onClicked: selectFile()
++                QQC2.ToolTip.text: i18nc("@info:tooltip", "Choose a file")
++                QQC2.ToolTip.visible: hovered
++                Accessible.name: i18nc("@action:button", "Choose reboot command file")
+             }
+         }
+         FileDialog {
+diff --git a/src/ui/main.qml b/src/ui/main.qml
+index 3bf0a88..da7d7af 100644
+--- a/src/ui/main.qml
++++ b/src/ui/main.qml
+@@ -19,28 +19,33 @@ import org.kde.private.kcms.sddm 1.0
+ 
+ KCM.GridViewKCM {
+     id: root
++    // Page actions at the top right: getting themes first, then the Behavior sub-page and the sync dialog.
+     actions: [
++        NewStuff.Action {
++            // ksr: kcm_sddm/GetNew
++            text: i18nc("@action:button as in, \"get new SDDM themes\"", "Get New…")
++            configFile: "sddmtheme.knsrc"
++            onEntryEvent: function(entry, event) {
++                kcm.themesModel.populate();
++            }
++        },
+         Kirigami.Action {
++            // ksr: kcm_sddm/InstallFromFile
++            text: i18nc("@action:button", "Install From File…")
++            icon.name: "document-import"
++            onTriggered: themeDialog.open()
++        },
++        Kirigami.Action {
++            // ksr: kcm_sddm/Behavior
+             text: i18nc("@action:button", "Behavior…")
+             icon.name: "settings-configure"
+             onTriggered: { kcm.push("Advanced.qml") }
+         },
+         Kirigami.Action {
++            // ksr: kcm_sddm/ApplyPlasmaSettings
+             text: i18nc("@action:button", "Apply Plasma Settings…")
+             icon.name: "plasma"
+             onTriggered: syncSheet.open()
+-        },
+-        Kirigami.Action {
+-            text: i18nc("@action:button", "Install From File…")
+-            icon.name: "document-import"
+-            onTriggered: themeDialog.open()
+-        },
+-        NewStuff.Action {
+-            text: i18nc("@action:button as in, \"get new SDDM themes\"", "Get New…")
+-            configFile: "sddmtheme.knsrc"
+-            onEntryEvent: function(entry, event) {
+-                kcm.themesModel.populate();
+-            }
+         }
+     ]
+ 
+@@ -67,6 +72,7 @@ KCM.GridViewKCM {
+         configObject: kcm.sddmSettings
+         settingName: "Current"
+     }
++    // The theme folders are read right after the first frame (kcm.themesModel.loaded); busy only when that takes longer than 150 ms.
+     view.model: kcm.themesModel
+     view.currentIndex: kcm.themesModel.currentIndex
+     view.delegate: KCM.GridDelegate {
+@@ -77,6 +83,7 @@ KCM.GridViewKCM {
+         thumbnail: Image {
+             anchors.fill: parent
+             source: model.preview
++            asynchronous: true
+             sourceSize: Qt.size(delegate.GridView.view.cellWidth * Screen.devicePixelRatio,
+                                 delegate.GridView.view.cellHeight * Screen.devicePixelRatio)
+             fillMode: Image.PreserveAspectFit
+@@ -85,6 +92,7 @@ KCM.GridViewKCM {
+         actions: [
+             Kirigami.Action {
+                 icon.name: "documentinfo"
++                // ksr: kcm_sddm/ViewDetails
+                 tooltip: i18nc("@info:tooltip", "View details")
+                 onTriggered: {
+                     detailsDialog.themeName = model.display
+@@ -111,6 +119,7 @@ KCM.GridViewKCM {
+             },
+             Kirigami.Action {
+                 icon.name: "edit-delete"
++                // ksr: kcm_sddm/RemoveTheme
+                 tooltip: if (enabled) {
+                     return i18nc("@info:tooltip", "Remove login screen theme");
+                 } else if (model.deletable) {
+@@ -128,6 +137,25 @@ KCM.GridViewKCM {
+             kcm.save();
+         }
+     }
++    Timer {
++        id: busyDelay
++        interval: 150
++        running: !kcm.themesModel.loaded
++    }
++    QQC2.BusyIndicator {
++        anchors.centerIn: parent
++        z: 1
++        running: visible
++        visible: !kcm.themesModel.loaded && !busyDelay.running
++    }
++    Kirigami.PlaceholderMessage {
++        anchors.centerIn: parent
++        width: parent.width - Kirigami.Units.gridUnit * 4
++        visible: kcm.themesModel.loaded && root.view.count === 0
++        icon.name: "preferences-system-login"
++        text: i18nc("@info", "No login screen themes found")
++        explanation: i18nc("@info", "Use “Get New…” or “Install From File…” to add one.")
++    }
+     FileDialog {
+         id: themeDialog
+         onAccepted: kcm.installTheme(selectedFile)
+@@ -266,11 +294,13 @@ KCM.GridViewKCM {
+         customFooterActions: [
+             Kirigami.Action {
+                 icon.name: "document-open"
++                // ksr: kcm_sddm/LoadFromFile
+                 text: i18nc("@action:button", "Load From File…")
+                 onTriggered: imageDialog.open()
+             },
+             Kirigami.Action {
+                 icon.name: "edit-clear"
++                // ksr: kcm_sddm/ClearImage
+                 text: i18nc("@action:button", "Clear Image")
+                 onTriggered: {
+                     view.model.setData(backgroundSheet.modelIndex, "", ThemesModel.CurrentBackgroundRole)

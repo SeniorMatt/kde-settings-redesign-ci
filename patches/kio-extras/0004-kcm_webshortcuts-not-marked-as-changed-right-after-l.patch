@@ -1,0 +1,25 @@
+From 8c4a4dcb96d66165ae8241d42643e1556fa581ef Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 16:02:53 +0500
+Subject: [PATCH 4/4] kcm_webshortcuts: not marked as changed right after load
+ (filling the widgets emitted markAsChanged)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/webshortcuts/ikwsopts.cpp | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/kcms/webshortcuts/ikwsopts.cpp b/kcms/webshortcuts/ikwsopts.cpp
+index f5c16b0..5244ad4 100644
+--- a/kcms/webshortcuts/ikwsopts.cpp
++++ b/kcms/webshortcuts/ikwsopts.cpp
+@@ -353,6 +353,8 @@ void FilterOptions::load()
+ 
+     const QString delimiter = group.readEntry("KeywordDelimiter", ":");
+     setDelimiter(delimiter.at(0).toLatin1());
++    // filling the widgets above emitted markAsChanged(): the page was "changed" right after opening
++    setNeedsSave(false);
+ }
+ 
+ char FilterOptions::delimiter()

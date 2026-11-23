@@ -1,0 +1,48 @@
+From f0a262e2ee7de85782acb921081052109f54a0d8 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 08:39:17 +0500
+Subject: [PATCH 06/34] ModuleView: re-read a cached page's settings when it is
+ shown again
+
+Another page, an applet or an app may have changed them meanwhile. The page is shown first and reloaded right after,
+so the switch stays instant.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ app/ModuleView.cpp | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/app/ModuleView.cpp b/app/ModuleView.cpp
+index 6a12140..7cfb69a 100644
+--- a/app/ModuleView.cpp
++++ b/app/ModuleView.cpp
+@@ -38,6 +38,9 @@
+ #include <KTitleWidget>
+ #include <PlasmaActivities/ResourceInstance>
+ 
++#include <QPointer>
++#include <QTimer>
++
+ #include <algorithm>
+ #include <cmath>
+ 
+@@ -263,9 +266,17 @@ void ModuleView::addModule(MenuItem *item, const QStringList &args)
+     }
+ 
+     if (KPageWidgetItem *page = d->mPagesPluginIdMap.key(data.pluginId())) {
+-        // A cached page: just make it current again
++        // A cached page: make it current again at once, then re-read its settings (another page, an applet or an app
++        // may have changed them while it was hidden). It has no unsaved changes: they were resolved when it was left.
+         touchPage(page);
+         activeModuleChanged(page, d->mPageWidget->currentPage());
++        if (QPointer<KCModule> kcm = d->mPages.value(page)) {
++            QTimer::singleShot(0, kcm, [kcm]() {
++                if (kcm && !kcm->needsSave()) {
++                    kcm->load();
++                }
++            });
++        }
+         return;
+     }
+ 

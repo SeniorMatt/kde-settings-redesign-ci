@@ -1,0 +1,46 @@
+From bae85da3491cba62fdc08f789d18669474e40f78 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 02:07:53 +0500
+Subject: [PATCH 16/31] kcm_smserver: Ignored applications as its own form row
+ so the form stays in wide mode
+
+The indented Label+TextField row was the widest form item; at the System Settings page width it pushed
+FormLayout into narrow mode, which puts the first Kirigami.FormData.label above the radios. Now a normal
+FormData row. Config keys unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/ksmserver/ui/main.qml | 13 ++++++-------
+ 1 file changed, 6 insertions(+), 7 deletions(-)
+
+diff --git a/kcms/ksmserver/ui/main.qml b/kcms/ksmserver/ui/main.qml
+index 3231352..ed0a250 100644
+--- a/kcms/ksmserver/ui/main.qml
++++ b/kcms/ksmserver/ui/main.qml
+@@ -88,19 +88,18 @@ KCM.SimpleKCM {
+             }
+         }
+ 
+-        // A child option of the restore choices: indented, disabled (not hidden) while they are off.
++        // A child option of the restore choices: its own form row (label in the label column, like every other form),
++        // disabled (not hidden) while they are off. The old indented Label + field row was the widest item and pushed the
++        // form into narrow mode, which puts the first label above the radios.
+         RowLayout {
+             // ksr: kcm_smserver/excludeApps
+-            Layout.leftMargin: Kirigami.Units.gridUnit
++            Kirigami.FormData.label: i18nc("@label:textbox", "Ignored applications:")
++            Kirigami.FormData.buddyFor: excludeAppsField
+             spacing: Kirigami.Units.smallSpacing
+ 
+-            Label {
+-                text: i18nc("@label:textbox", "Ignored applications:")
+-                enabled: !loginEmpty.checked
+-            }
+             TextField {
+                 id: excludeAppsField
+-                Layout.preferredWidth: Kirigami.Units.gridUnit * 14
++                Layout.preferredWidth: Kirigami.Units.gridUnit * 12
+                 text: kcm.settings.excludeApps
+                 enabled: !loginEmpty.checked
+                 Accessible.name: i18nc("@label:textbox", "Ignored applications:")

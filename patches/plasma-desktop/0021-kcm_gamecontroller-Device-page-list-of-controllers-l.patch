@@ -1,0 +1,500 @@
+From 64da666dae5c85a94b8c27692c57bcd2502e7b74 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 02:21:37 +0500
+Subject: [PATCH 21/31] kcm_gamecontroller: Device page, list of controllers,
+ live test view on its own sub-page
+
+Page type: Device (docs/page-design.md). C++ (DeviceModel, Device, models, kcm pluginEnabled kcfg) unchanged. Not built yet.
+
+Moved / renamed:
+- Main page is the list of connected controllers (name, then type / controller type / connection as a subtitle); clicking one
+  does kcm.push("Controller.qml", {deviceId}). The Device combo is gone (kcm_gamecontroller/Device).
+- "Allow using as pointer and keyboard" switch (was a toolbar action) is a checkbox "Use controllers as pointer and
+  keyboard" at the top with its ContextualHelpButton (pluginEnabled); the sleep/lock warning is an inline message under it
+  (SleepWarning), now not tied to the old header slot. Empty state unchanged (NoControllers).
+- Controller.qml (new): Device type / Controller type / Connection type as read-only FormLayout rows
+  (DeviceType, ControllerType, ConnectionType), then Left/Right position widgets and the Buttons and Axes tables
+  unchanged (LeftPosition, RightPosition, Buttons, Axes). Goes back to the list by itself if the controller is unplugged.
+HIG ids: HIG-001/005/006 (order by use), HIG-057 (test view on a named sub-page).
+
+Speed cause (devicemodel.cpp): the DeviceModel singleton arms a 2 s poll timer and a first poll after 100 ms; SDL_Init and device
+opening run in that poll on the GUI thread, i.e. after the first frame, not in the constructor. The old page built both
+tables, both position widgets and their models (updating every 100 ms) for the selected device up front; now they are only
+created when a controller is opened. SDL_Init itself still runs on the GUI thread (not moved: needs a C++ thread change).
+After numbers: pending, manager will measure.
+
+Unconfirmed: kcm.push with a relative QML name and an initial-properties map in this KCM (same call as kcm_activities); the
+delegate reading model.id/model.text roles; Controller.qml picked up by kcmutils_add_qml_kcm's ui/* glob (it is). The
+pluginEnabled checkbox has no SettingStateBinding: the KCM exposes the value as a property, not a config object. Not compiled.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/gamecontroller/ui/Controller.qml | 158 ++++++++++++++++
+ kcms/gamecontroller/ui/main.qml       | 254 +++++++-------------------
+ 2 files changed, 224 insertions(+), 188 deletions(-)
+ create mode 100644 kcms/gamecontroller/ui/Controller.qml
+
+diff --git a/kcms/gamecontroller/ui/Controller.qml b/kcms/gamecontroller/ui/Controller.qml
+new file mode 100644
+index 0000000..f2dfb02
+--- /dev/null
++++ b/kcms/gamecontroller/ui/Controller.qml
+@@ -0,0 +1,158 @@
++/*
++    SPDX-FileCopyrightText: 2023 Joshua Goins <josh@redstrate.com>
++    SPDX-FileCopyrightText: 2025 Yelsin Sepulveda <yelsin.sepulveda@kdemail.org>
++    SPDX-FileCopyrightText: 2025 Jakob Petsovits <jpetso@petsovits.com>
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++
++import QtQuick
++import QtQuick.Layouts
++import QtQuick.Controls as QQC2
++
++import org.kde.kcmutils as KCM
++import org.kde.kirigami as Kirigami
++
++import org.kde.plasma.gamecontroller.kcm
++
++// Sub-page for one controller: what it is, and a live view of its sticks, buttons and axes.
++KCM.SimpleKCM {
++    id: root
++
++    property int deviceId: -1
++
++    readonly property var device: DeviceModel.device(deviceId)
++    readonly property var deviceType: device?.type ?? ""
++    readonly property var deviceControllerType: device?.controllerTypeName ?? ""
++    readonly property var deviceConnectionType: device?.connectionType ?? ""
++
++    title: i18nc("@title", "Test Controller")
++
++    implicitWidth: Kirigami.Units.gridUnit * 38
++    implicitHeight: Kirigami.Units.gridUnit * 28
++
++    Connections {
++        target: DeviceModel
++
++        // Controller unplugged while its page is open: go back to the list.
++        function onDevicesChanged() {
++            if (DeviceModel.device(root.deviceId) === null) {
++                kcm.pop();
++            }
++        }
++    }
++
++    ColumnLayout {
++        anchors.fill: parent
++        spacing: Kirigami.Units.largeSpacing
++
++        Kirigami.FormLayout {
++            Layout.fillWidth: true
++
++            QQC2.Label {
++                // ksr: kcm_gamecontroller/DeviceType
++                Kirigami.FormData.label: i18nc("@label game controller device type (wheel, joystick, game controller, etc.)", "Device type:")
++                text: root.deviceType
++                textFormat: Text.PlainText
++            }
++
++            QQC2.Label {
++                // ksr: kcm_gamecontroller/ControllerType
++                Kirigami.FormData.label: i18nc("@label game controller controller type (which brand, etc.)", "Controller type:")
++                text: root.deviceControllerType
++                textFormat: Text.PlainText
++            }
++
++            QQC2.Label {
++                // ksr: kcm_gamecontroller/ConnectionType
++                Kirigami.FormData.label: i18nc("@label:textbox", "Connection type:")
++                text: root.deviceConnectionType
++                textFormat: Text.PlainText
++            }
++        }
++
++        RowLayout {
++            spacing: Kirigami.Units.largeSpacing
++
++            Layout.fillWidth: true
++            Layout.fillHeight: true
++
++            ColumnLayout {
++                spacing: Kirigami.Units.largeSpacing
++
++                Layout.alignment: Qt.AlignTop
++
++                QQC2.Label {
++                    // ksr: kcm_gamecontroller/LeftPosition
++                    text: i18nc("@label Visual representation of the axis position for the left axis", "Left position:")
++                    textFormat: Text.PlainText
++                }
++
++                PositionWidget {
++                    id: leftPosWidget
++
++                    device: root.device
++                    leftAxis: true
++                }
++
++                QQC2.Label {
++                    // ksr: kcm_gamecontroller/RightPosition
++                    text: i18nc("@label Visual representation of the axis position for the right axis", "Right position:")
++                    textFormat: Text.PlainText
++                }
++
++                PositionWidget {
++                    id: rightPosWidget
++                    device: root.device
++                    leftAxis: false
++                }
++            }
++
++            ColumnLayout {
++                spacing: Kirigami.Units.largeSpacing
++
++                Layout.fillWidth: true
++                Layout.fillHeight: true
++                Layout.preferredWidth: 50 // Same space for the two columns
++
++                QQC2.Label {
++                    // ksr: kcm_gamecontroller/Buttons
++                    text: i18nc("@label Gamepad buttons", "Buttons:")
++                    textFormat: Text.PlainText
++                }
++
++                Table {
++                    model: ButtonModel {
++                        device: root.device
++                    }
++
++                    Layout.fillWidth: true
++                    Layout.fillHeight: true
++                }
++            }
++
++            ColumnLayout {
++                spacing: Kirigami.Units.largeSpacing
++
++                Layout.fillWidth: true
++                Layout.fillHeight: true
++                Layout.preferredWidth: 50 // Same space for the two columns
++
++                QQC2.Label {
++                    // ksr: kcm_gamecontroller/Axes
++                    text: i18nc("@label Gamepad axes (sticks)", "Axes:")
++                    textFormat: Text.PlainText
++                }
++
++                Table {
++                    model: AxesProxyModel {
++                        device: root.device
++                    }
++
++                    Layout.fillWidth: true
++                    Layout.fillHeight: true
++                }
++            }
++        }
++    }
++}
+diff --git a/kcms/gamecontroller/ui/main.qml b/kcms/gamecontroller/ui/main.qml
+index ff24c85..2950b25 100644
+--- a/kcms/gamecontroller/ui/main.qml
++++ b/kcms/gamecontroller/ui/main.qml
+@@ -15,228 +15,106 @@ import org.kde.kirigami as Kirigami
+ 
+ import org.kde.plasma.gamecontroller.kcm
+ 
+-KCM.SimpleKCM {
++// Device page: the list of connected controllers; each opens Controller.qml (live test view).
++KCM.ScrollViewKCM {
+     id: root
+ 
+-    readonly property var device: deviceCombo.currentValue !== null ? DeviceModel.device(deviceCombo.currentValue) : null
+-    readonly property var deviceType: device?.type ?? ""
+-    readonly property var deviceControllerType: device?.controllerTypeName ?? ""
+-    readonly property var deviceConnectionType: device?.connectionType ?? ""
++    implicitWidth: Kirigami.Units.gridUnit * 38
++    implicitHeight: Kirigami.Units.gridUnit * 28
+ 
+-    actions: [
+-        Kirigami.Action {
+-            displayComponent: RowLayout {
+-                spacing: Kirigami.Units.smallSpacing
+-                Layout.fillWidth: true
+-
+-                QQC2.Switch {
+-                    id: plasmaIntegrationSwitch
+-                    text: i18nc("@option:check Allow using game controllers as a pointer and keyboard", "Allow using as pointer and keyboard")
+-                    checked: kcm.pluginEnabled
+-
+-                    onToggled: {
+-                        kcm.pluginEnabled = checked
+-                    }
+-                }
+-
+-                Kirigami.ContextualHelpButton {
+-                    toolTipText: xi18nc("@info:tooltip", "Allow game controllers to act like pointer and keyboard devices in Plasma and non-game applications.<nl/><nl/>Games can always use the controller.")
+-                }
+-            }
+-        }
+-    ]
+-
+-    Kirigami.PlaceholderMessage {
+-        icon.name: "input-gamepad"
+-        text: i18nc("@info placeholdermessage text", "No game controllers found")
+-        explanation: i18nc("@info:usagetip placeholdermessage text", "Connect a wired or wireless controller")
+-        anchors.centerIn: parent
+-        visible: DeviceModel.count === 0
+-        width: parent.width - (Kirigami.Units.largeSpacing * 4)
+-    }
+-
+-    Connections {
+-        target: DeviceModel
+-
+-        function onDevicesChanged() {
+-            // If there are no devices, make sure the combo box is set to no selection
+-            if (DeviceModel.count === 0) {
+-                deviceCombo.currentIndex = -1;
+-            } else if (deviceCombo.currentIndex === -1) {
+-                // However if we didn't have a selection before, and now have a device
+-                deviceCombo.currentIndex = 0;
+-            } else if (deviceCombo.currentIndex >= DeviceModel.count) {
+-                // If the last device in the popup list was disconnected, select a previous one
+-                deviceCombo.currentIndex = DeviceModel.count - 1;
+-            }
+-        }
+-    }
+-
+-    headerPaddingEnabled: false // Let the InlineMessages touch the edges
+-    header: Kirigami.InlineMessage {
+-        Layout.fillWidth: true
+-        visible: !kcm.pluginEnabled && deviceCombo.count !== 0
+-        type: Kirigami.MessageType.Warning
+-        position: Kirigami.InlineMessage.Position.Header
+-        showCloseButton: true
+-        text: i18nc("@info:usagetip", "The system may automatically go to sleep or lock the screen while the controller is in use. Consider manually blocking them while using the controller, or enable automatic blocking by allowing the use as pointer and keyboard.")
+-    }
+-
+-    ColumnLayout {
+-        anchors.fill: parent
+-
+-        visible: deviceCombo.count !== 0
+-        spacing: Kirigami.Units.largeSpacing
++    header: ColumnLayout {
++        spacing: Kirigami.Units.smallSpacing
+ 
+         RowLayout {
+-            spacing: Kirigami.Units.largeSpacing
++            spacing: Kirigami.Units.smallSpacing
+ 
+-            Layout.fillWidth: true
+-
+-            QQC2.Label {
+-                text: i18nc("@label:textbox", "Device:")
+-                textFormat: Text.PlainText
+-            }
+-
+-            QQC2.ComboBox {
+-                id: deviceCombo
+-
+-                model: DeviceModel
+-
+-                textRole: "text"
+-                valueRole: "id"
+-
+-                Layout.fillWidth: true
+-            }
+-        }
++            QQC2.CheckBox {
++                // ksr: kcm_gamecontroller/pluginEnabled
++                id: plasmaIntegrationSwitch
++                text: i18nc("@option:check Allow using game controllers as a pointer and keyboard", "Use controllers as pointer and keyboard")
++                checked: kcm.pluginEnabled
+ 
+-        RowLayout {
+-            spacing: Kirigami.Units.largeSpacing
+-
+-            Layout.fillWidth: true
+-
+-            QQC2.Label {
+-                text: i18nc("@label game controller device type (wheel, joystick, game controller, etc.)", "Device type:")
+-                textFormat: Text.PlainText
++                onToggled: {
++                    kcm.pluginEnabled = checked
++                }
+             }
+ 
+-            QQC2.Label {
+-                id: typeLabel
+-                text: deviceType
++            Kirigami.ContextualHelpButton {
++                toolTipText: xi18nc("@info:tooltip", "Allow game controllers to act like pointer and keyboard devices in Plasma and non-game applications.<nl/><nl/>Games can always use the controller.")
+             }
+         }
+ 
+-        RowLayout {
+-            spacing: Kirigami.Units.largeSpacing
+-
++        Kirigami.InlineMessage {
++            // ksr: kcm_gamecontroller/SleepWarning
+             Layout.fillWidth: true
+-
+-            QQC2.Label {
+-                text: i18nc("@label game controller controller type (which brand, etc.)", "Controller type:")
+-                textFormat: Text.PlainText
+-            }
+-
+-            QQC2.Label {
+-                id: controllerTypeLabel
+-                text: deviceControllerType
+-            }
++            visible: !kcm.pluginEnabled && DeviceModel.count !== 0
++            type: Kirigami.MessageType.Warning
++            showCloseButton: true
++            text: i18nc("@info:usagetip", "The system may automatically go to sleep or lock the screen while the controller is in use. Consider manually blocking them while using the controller, or enable automatic blocking by allowing the use as pointer and keyboard.")
+         }
++    }
+ 
+-        RowLayout {
+-            spacing: Kirigami.Units.largeSpacing
+-
+-            Layout.fillWidth: true
++    view: ListView {
++        id: controllersList
+ 
+-            QQC2.Label {
+-                text: i18nc("@label:textbox", "Connection type:")
+-                textFormat: Text.PlainText
+-            }
++        clip: true
++        model: DeviceModel
+ 
+-            QQC2.Label {
+-                id: connectionTypeLabel
+-                text: deviceConnectionType
+-            }
++        Kirigami.PlaceholderMessage {
++            // ksr: kcm_gamecontroller/NoControllers
++            icon.name: "input-gamepad"
++            text: i18nc("@info placeholdermessage text", "No game controllers found")
++            explanation: i18nc("@info:usagetip placeholdermessage text", "Connect a wired or wireless controller")
++            anchors.centerIn: parent
++            visible: DeviceModel.count === 0
++            width: parent.width - (Kirigami.Units.largeSpacing * 4)
+         }
+ 
+-        RowLayout {
+-            spacing: Kirigami.Units.largeSpacing
+-
+-            Layout.fillWidth: true
+-            Layout.fillHeight: true
+-
+-            ColumnLayout {
+-                spacing: Kirigami.Units.largeSpacing
+-
+-                Layout.alignment: Qt.AlignTop
+-
+-                QQC2.Label {
+-                    text: i18nc("@label Visual representation of the axis position for the left axis", "Left position:")
+-                    textFormat: Text.PlainText
+-                }
+-
+-                PositionWidget {
+-                    id: leftPosWidget
++        delegate: QQC2.ItemDelegate {
++            id: delegate
+ 
+-                    device: root.device
+-                    leftAxis: true
+-                }
++            // ksr: kcm_gamecontroller/Device
++            readonly property var controller: DeviceModel.device(model.id)
+ 
+-                QQC2.Label {
+-                    text: i18nc("@label Visual representation of the axis position for the right axis", "Right position:")
+-                    textFormat: Text.PlainText
+-                }
++            width: ListView.view.width
+ 
+-                PositionWidget {
+-                    id: rightPosWidget
+-                    device: root.device
+-                    leftAxis: false
+-                }
+-            }
++            onClicked: kcm.push("Controller.qml", {deviceId: model.id})
+ 
+-            ColumnLayout {
++            contentItem: RowLayout {
+                 spacing: Kirigami.Units.largeSpacing
+ 
+-                Layout.fillWidth: true
+-                Layout.fillHeight: true
+-                Layout.preferredWidth: 50 // Same space for the two columns
+-
+-                QQC2.Label {
+-                    text: i18nc("@label Gamepad buttons", "Buttons:")
+-                    textFormat: Text.PlainText
++                Kirigami.Icon {
++                    source: "input-gamepad"
++                    Layout.preferredWidth: Kirigami.Units.iconSizes.medium
++                    Layout.preferredHeight: Kirigami.Units.iconSizes.medium
+                 }
+ 
+-                Table {
+-                    model: ButtonModel {
+-                        device: root.device
+-                    }
+-
++                ColumnLayout {
+                     Layout.fillWidth: true
+-                    Layout.fillHeight: true
+-                }
+-            }
+-
+-            ColumnLayout {
+-                spacing: Kirigami.Units.largeSpacing
+-
+-                Layout.fillWidth: true
+-                Layout.fillHeight: true
+-                Layout.preferredWidth: 50 // Same space for the two columns
++                    spacing: 0
+ 
+-                QQC2.Label {
+-                    text: i18nc("@label Gamepad axes (sticks)", "Axes:")
+-                    textFormat: Text.PlainText
+-                }
++                    QQC2.Label {
++                        Layout.fillWidth: true
++                        text: model.text
++                        textFormat: Text.PlainText
++                        elide: Text.ElideRight
++                    }
+ 
+-                Table {
+-                    model: AxesProxyModel {
+-                        device: root.device
++                    QQC2.Label {
++                        Layout.fillWidth: true
++                        text: [delegate.controller?.type, delegate.controller?.controllerTypeName, delegate.controller?.connectionType].filter(t => t).join(" · ")
++                        textFormat: Text.PlainText
++                        elide: Text.ElideRight
++                        font: Kirigami.Theme.smallFont
+                     }
++                }
+ 
+-                    Layout.fillWidth: true
+-                    Layout.fillHeight: true
++                Kirigami.Icon {
++                    source: "go-next-symbolic"
++                    Layout.preferredWidth: Kirigami.Units.iconSizes.small
++                    Layout.preferredHeight: Kirigami.Units.iconSizes.small
+                 }
+             }
+         }
+-        Item { Layout.fillHeight: true }
+     }
+ }

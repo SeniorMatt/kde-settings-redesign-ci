@@ -1,0 +1,179 @@
+From eb8fecd04e73271efeb9dfbf475cf30d91c1d608 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 01:30:45 +0500
+Subject: [PATCH 4/9] kcm_memory: onto the shared information page
+ (CommandOutputKCM), data from the KAuth helper arrives through the same
+ context
+
+Page type: Info, same as the other 18. The page had its own QML (own busy indicator, own placeholder, theme mono font, no
+toolbar); now it is CommandOutputKCM, so it gets Copy to Clipboard, Filter (Ctrl+I), Refresh (F5, also the way to retry
+after a refused authorization), the 150 ms busy indicator and the same empty/error states as the other pages. The dmidecode
+reply is put into the page through CommandOutputContext's new manual mode (setOutput / setFailure, refreshRequested).
+Nothing about the KAuth action, helper id or the reply key "memory" changed. kcm.memoryInformation stays as a property
+(inventory anchor). An error is shown without the "Report to <distribution>" button (not reportable: usually the user said
+no to the prompt).
+Marker rows: kcm_memory/Output, kcm_memory/NoData; inventory_check --kcm kcm_memory --strict: 0 lost.
+
+Speed (cause found in code): the constructor started the KAuth job itself (loadData() in the constructor), i.e. the polkit
+request went out during page creation. Now the context queues refreshRequested() and the job starts from the event loop;
+the page shows the busy indicator (after 150 ms) while polkit and dmidecode work. The root helper's duration itself is
+unchanged. After numbers: pending, manager will measure. Not built yet.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/memory/main.cpp    | 45 ++++++++++++++++++++----------------
+ kcms/memory/ui/main.qml | 51 ++++++++---------------------------------
+ 2 files changed, 34 insertions(+), 62 deletions(-)
+
+diff --git a/kcms/memory/main.cpp b/kcms/memory/main.cpp
+index d82d5c9..fcdbf02 100644
+--- a/kcms/memory/main.cpp
++++ b/kcms/memory/main.cpp
+@@ -10,17 +10,27 @@
+ #include <KPluginFactory>
+ #include <KQuickConfigModule>
+ 
++#include "CommandOutputContext.h"
++
+ class KCMMemory : public KQuickConfigModule
+ {
+     Q_OBJECT
++    // ksr: kcm_memory/Output (the page is CommandOutputKCM now; the text of the KAuth reply goes into this context)
++    Q_PROPERTY(CommandOutputContext *infoOutputContext READ outputContext CONSTANT FINAL)
+     Q_PROPERTY(QString memoryInformation READ memoryInformation NOTIFY changed)
+-    Q_PROPERTY(QString error MEMBER m_error NOTIFY errorChanged)
+-    Q_PROPERTY(bool ready MEMBER m_ready NOTIFY readyChanged)
+ public:
+     explicit KCMMemory(QObject *parent, const KPluginMetaData &data)
+         : KQuickConfigModule(parent, data)
++        , m_outputContext(new CommandOutputContext(this))
++    {
++        // The context asks for the data from the event loop, after the page exists (and again on Refresh), so the
++        // polkit prompt does not hold up page creation.
++        connect(m_outputContext, &CommandOutputContext::refreshRequested, this, &KCMMemory::loadData);
++    }
++
++    CommandOutputContext *outputContext() const
+     {
+-        loadData();
++        return m_outputContext;
+     }
+ 
+     QString memoryInformation() const
+@@ -28,20 +38,17 @@ public:
+         return m_memoryInformation;
+     }
+ 
++Q_SIGNALS:
++    void changed();
++
+ private:
+-    Q_SIGNAL void changed();
++    CommandOutputContext *m_outputContext;
+ 
+     /**
+      * The memory information that will be displayed in the KCM.
+      */
+     QString m_memoryInformation;
+ 
+-    bool m_ready = false;
+-    Q_SIGNAL void readyChanged();
+-
+-    QString m_error;
+-    Q_SIGNAL void errorChanged();
+-
+     /**
+      * Load the memory information from the dmidecode helper.
+      */
+@@ -54,19 +61,17 @@ private:
+         connect(job, &KJob::result, this, [this, job]() {
+             if (job->error()) {
+                 qWarning() << "Failed to retrieve memory information: " << job->errorString();
+-                m_error = job->errorString();
+-                Q_EMIT errorChanged();
++                // Not reportable: usually the authorization was refused or dmidecode is missing
++                m_outputContext->setFailure(job->errorString());
+                 return;
+-            } else {
+-                const auto reply = job->data();
+-                if (reply.contains("memory")) {
+-                    m_memoryInformation = reply["memory"].toString();
+-                    Q_EMIT changed();
+-                }
++            }
+ 
+-                m_ready = true;
+-                Q_EMIT readyChanged();
++            const auto reply = job->data();
++            if (reply.contains("memory")) {
++                m_memoryInformation = reply["memory"].toString();
++                Q_EMIT changed();
+             }
++            m_outputContext->setOutput(m_memoryInformation);
+         });
+ 
+         job->start();
+diff --git a/kcms/memory/ui/main.qml b/kcms/memory/ui/main.qml
+index d6eed68..5202e1e 100644
+--- a/kcms/memory/ui/main.qml
++++ b/kcms/memory/ui/main.qml
+@@ -4,49 +4,16 @@
+     SPDX-FileCopyrightText: 2024 Kristen McWilliam <kmcwilliampublic@gmail.com>
+ */
+ 
+-import QtQuick 2.15
+-import QtQuick.Controls as QQC
++// Same page as every other information page: toolbar (Refresh, Copy to Clipboard, Filter), busy indicator after 150 ms,
++// "No data available" and the error message all come from CommandOutputKCM. The text is the dmidecode reply.
++// ksr: kcm_memory/Output
++// ksr: kcm_memory/NoData
+ 
+-import org.kde.kirigami 2.20 as Kirigami
+-import org.kde.kcmutils as KCM
++import QtQuick
+ 
+-KCM.SimpleKCM {
+-    id: kcm_memory
+-    Kirigami.Theme.colorSet: Kirigami.Theme.View
+-    Kirigami.Theme.inherit: false
++import org.kde.kinfocenter.private as KInfoCenter
+ 
+-    QQC.BusyIndicator {
+-        anchors.centerIn: parent
+-        running: !kcm.ready && !kcm.error && !delayBusyIndicatorTimer.running
+-
+-        // Avoid BusyIndicator flashing when it just takes a few milliseconds.
+-        Timer {
+-            id: delayBusyIndicatorTimer
+-            running: true
+-            repeat: false
+-            interval: 500
+-        }
+-    }
+-
+-    Kirigami.PlaceholderMessage {
+-        anchors.centerIn: parent
+-        width: parent.width - (Kirigami.Units.largeSpacing * 8)
+-        visible: text !== ""
+-        icon.name: "edit-none"
+-        text: {
+-            if (kcm.error) {
+-                return kcm.error;
+-            } else if (kcm.ready && kcm.memoryInformation === "") {
+-                return i18ndc("kinfocenter", "@info the KCM has no data to display", "No data available");
+-            } else {
+-                return "";
+-            }
+-        }
+-    }
+-
+-    Kirigami.SelectableLabel {
+-        text: kcm.memoryInformation
+-        font: Kirigami.Theme.fixedWidthFont
+-        visible: kcm.memoryInformation !== ""
+-    }
++KInfoCenter.CommandOutputKCM {
++    output: kcm.infoOutputContext
++    wrapMode: TextEdit.NoWrap
+ }

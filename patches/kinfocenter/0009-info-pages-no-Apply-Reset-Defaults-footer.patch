@@ -1,0 +1,28 @@
+From 3f7a8f82260e83f87b290b74a697c160b72e3b79 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 02:14:13 +0500
+Subject: [PATCH 9/9] info pages: no Apply/Reset/Defaults footer
+
+The pages only show command output; there is nothing to apply. KCM buttons set to NoAdditionalButton (about-distro does the
+same); the default footer showed Defaults / Reset / Apply in System Settings.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ src/qml/CommandOutputKCM.qml | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/src/qml/CommandOutputKCM.qml b/src/qml/CommandOutputKCM.qml
+index c0f1da5..22fde48 100644
+--- a/src/qml/CommandOutputKCM.qml
++++ b/src/qml/CommandOutputKCM.qml
+@@ -21,6 +21,9 @@ import org.kde.kinfocenter.private as Private
+ KCM.AbstractKCM {
+     id: root
+ 
++    // read-only information: nothing to apply, reset or restore (System Settings would show Defaults/Reset/Apply)
++    KCM.ConfigModule.buttons: KCM.ConfigModule.NoAdditionalButton
++
+     implicitWidth: Kirigami.Units.gridUnit * 20
+     implicitHeight: Kirigami.Units.gridUnit * 20
+ 

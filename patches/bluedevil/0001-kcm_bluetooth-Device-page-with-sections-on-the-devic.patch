@@ -1,0 +1,416 @@
+From 58b9885996ff3b18f168b2d336018a11b5f7474b Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 01:35:43 +0500
+Subject: [PATCH 1/2] kcm_bluetooth: Device page with sections on the device
+ sub-page, no false "no adapter" while starting
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Page type: Device (docs/page-design.md section 1): paired-device list on the main page, each device opens its own Form
+sub-page (kcm.push("Device.qml")), adapter/login/file settings on a second sub-page. That structure already existed
+and stays. BluezQt calls, GlobalSettings/FileReceiverSettings keys, wizard launch, NAP/DUN setup and Forget dialog are
+unchanged; main_mediacenter.qml and DeviceConnectionSidebar.qml untouched.
+
+Moved / renamed:
+- Device sub-page order by use: Connect/Disconnect and Name first, then "Connection" (Trusted, Blocked + help),
+  "Sharing" (Send File…, Setup NAP/DUN Network…; the section title shows only while one of these buttons does),
+  "Details" (Type, Battery, Address, Adapter), and "Forget Device…" last. Trusted/Blocked: Switch -> CheckBox (a
+  Form uses checkboxes, section 3). "Send File" -> "Send File…", "Forget" -> "Forget Device…" (they open something).
+  Rows root-device-connected/name/trusted/blocked, Send-File, Setup-NAP/DUN-Network, Forget, DeviceType/Battery/
+  Address/Adapter.
+- Settings sub-page: toolbar action "Configure…" -> "Settings…" (ConfigureSettings). Adapter Enabled/Visible
+  switches -> checkboxes "Adapter: Enabled" and "Visible to other devices" (Enabled, Visible); sections "Login"
+  (On login radios) and "Received Files" got titles; the folder row is a RowLayout and its icon-only button has a
+  tooltip and accessible name (Select-folder).
+- Main page: list rows now say "Connected" / "Blocked" first in the subtitle (model-Name); the empty state "No devices
+  paired" carries the action "Pair Device…" (NoDevices, PairDevice).
+- Relabel table: inventory/relabel/kcm_bluetooth.tsv (outer repo). Inventory --strict: 34 rows ok, 0 lost.
+
+Speed: the first frame waits on the BluezQt manager (async init job, bluetooth.cpp; nothing synchronous in the KCM).
+The page now shows at once and a BusyIndicator appears only if the manager is still not operational after 150 ms.
+"No Bluetooth adapters found" was shown whenever rfkill.state was Unknown, which is also the state before the manager
+is operational; it now needs Manager.operational too, so it no longer flashes at startup (assumption, see below).
+After-numbers: pending, manager will measure.
+
+HIG: HIG-001/005/006, HIG-057. Not built yet. Not confirmed without BluezQt headers (not in src/master): that
+rfkill.state is Unknown before Manager.operational (the message condition is safe either way: it only gets stricter),
+and that Device.connected/blocked are readable from the list-row helper infoText (same properties Device.qml
+already uses).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ src/kcm/ui/Device.qml             | 82 +++++++++++++++++++++----------
+ src/kcm/ui/ForgetDeviceAction.qml |  1 +
+ src/kcm/ui/General.qml            | 28 +++++++++--
+ src/kcm/ui/main.qml               | 41 ++++++++++++++--
+ 4 files changed, 118 insertions(+), 34 deletions(-)
+
+diff --git a/src/kcm/ui/Device.qml b/src/kcm/ui/Device.qml
+index 8581485..d1d008a 100644
+--- a/src/kcm/ui/Device.qml
++++ b/src/kcm/ui/Device.qml
+@@ -122,12 +122,13 @@ KCMUtils.SimpleKCM {
+         }
+ 
+         Kirigami.FormLayout {
+-
++            // First section (no title): the one thing people come here for, then the name
+             Row {
+                 spacing: Kirigami.Units.smallSpacing
+ 
+                 QQC2.Button {
+                     id: connectButton
++                    // ksr: kcm_bluetooth/root-device-connected
+                     enabled: !indicator.running && !root.device.blocked
+                     text: root.device.connected ? i18n("Disconnect") : i18n("Connect")
+                     icon.name: root.device.connected ? "network-disconnect-symbolic" : "network-connect-symbolic"
+@@ -151,34 +152,20 @@ KCMUtils.SimpleKCM {
+                 }
+             }
+ 
+-            QQC2.Label {
+-                text: Script.deviceTypeToString(root.device)
+-                Kirigami.FormData.label: i18n("Type:")
+-            }
+-
+-            QQC2.Label {
+-                text: root.device.battery !== null ? i18n("%1%", root.device.battery.percentage) : ""
+-                visible: root.device.battery !== null
+-                Kirigami.FormData.label: i18n("Battery:")
+-            }
+-
+-            QQC2.Label {
+-                text: root.device.address
+-                Kirigami.FormData.label: i18n("Address:")
+-            }
+-
+-            QQC2.Label {
+-                text: root.device.adapter.name
+-                Kirigami.FormData.label: i18n("Adapter:")
+-            }
+-
+             QQC2.TextField {
++                // ksr: kcm_bluetooth/root-device-name
+                 text: root.device.name
+                 onTextEdited: root.device.name = text
+                 Kirigami.FormData.label: i18n("Name:")
+             }
+ 
+-            QQC2.Switch {
++            Kirigami.Separator {
++                Kirigami.FormData.isSection: true
++                Kirigami.FormData.label: i18nc("@title:group", "Connection")
++            }
++
++            QQC2.CheckBox {
++                // ksr: kcm_bluetooth/root-device-trusted (was a switch; a checkbox in a Form, page-design section 3)
+                 text: i18n("Trusted")
+                 checked: root.device.trusted
+                 onClicked: root.device.trusted = !root.device.trusted
+@@ -187,7 +174,8 @@ KCMUtils.SimpleKCM {
+             RowLayout {
+                 spacing: Kirigami.Units.smallSpacing
+ 
+-                QQC2.Switch {
++                QQC2.CheckBox {
++                    // ksr: kcm_bluetooth/root-device-blocked (was a switch)
+                     text: i18n("Blocked")
+                     checked: root.device.blocked
+                     onClicked: root.device.blocked = !root.device.blocked
+@@ -198,15 +186,25 @@ KCMUtils.SimpleKCM {
+                 }
+             }
+ 
++            // Section header only while at least one of these buttons is shown
++            Kirigami.Separator {
++                visible: sendFileButton.visible || napButton.visible || dunButton.visible
++                Kirigami.FormData.isSection: true
++                Kirigami.FormData.label: i18nc("@title:group", "Sharing")
++            }
++
+             QQC2.Button {
++                id: sendFileButton
++                // ksr: kcm_bluetooth/Send-File (was "Send File")
+                 icon.name: "document-share-symbolic"
+-                text: i18n("Send File")
++                text: i18n("Send File…")
+                 visible: root.device.uuids.includes(BluezQt.Services.ObexObjectPush) && root.device.connected
+                 onClicked: root.KCMUtils.ConfigModule.runSendFile(root.device.ubi)
+             }
+ 
+             QQC2.Button {
+                 id: napButton
++                // ksr: kcm_bluetooth/Setup-NAP-Network
+                 icon.name: "network-wireless-bluetooth-symbolic"
+                 text: i18n("Setup NAP Network…")
+                 visible: false
+@@ -215,23 +213,55 @@ KCMUtils.SimpleKCM {
+ 
+             QQC2.Button {
+                 id: dunButton
++                // ksr: kcm_bluetooth/Setup-DUN-Network
+                 icon.name: "network-wireless-bluetooth-symbolic"
+                 text: i18n("Setup DUN Network…")
+                 visible: false
+                 onClicked: root.KCMUtils.ConfigModule.setupNetworkConnection("dun", root.device.address, root.device.name)
+             }
+ 
++            Kirigami.Separator {
++                Kirigami.FormData.isSection: true
++                Kirigami.FormData.label: i18nc("@title:group", "Details")
++            }
++
++            QQC2.Label {
++                // ksr: kcm_bluetooth/DeviceType
++                text: Script.deviceTypeToString(root.device)
++                Kirigami.FormData.label: i18n("Type:")
++            }
++
++            QQC2.Label {
++                // ksr: kcm_bluetooth/DeviceBattery
++                text: root.device.battery !== null ? i18n("%1%", root.device.battery.percentage) : ""
++                visible: root.device.battery !== null
++                Kirigami.FormData.label: i18n("Battery:")
++            }
++
++            QQC2.Label {
++                // ksr: kcm_bluetooth/DeviceAddress
++                text: root.device.address
++                Kirigami.FormData.label: i18n("Address:")
++            }
++
++            QQC2.Label {
++                // ksr: kcm_bluetooth/DeviceAdapter
++                text: root.device.adapter.name
++                Kirigami.FormData.label: i18n("Adapter:")
++            }
++
+             Kirigami.Separator {
+                 Kirigami.FormData.isSection: true
+             }
+ 
+             QQC2.Button {
++                // ksr: kcm_bluetooth/Forget (was "Forget"; opens a confirmation dialog)
+                 action: ForgetDeviceAction {
+                     dialog: forgetDeviceDialog
+                     device: root.device
+                 }
+                 // override action's text with a shorter label
+-                text: i18nc("@action:button Forget the Bluetooth device", "Forget");
++                text: i18nc("@action:button Forget the Bluetooth device", "Forget Device…");
+             }
+         }
+     }
+diff --git a/src/kcm/ui/ForgetDeviceAction.qml b/src/kcm/ui/ForgetDeviceAction.qml
+index 0fcf8ed..3ef3e7d 100644
+--- a/src/kcm/ui/ForgetDeviceAction.qml
++++ b/src/kcm/ui/ForgetDeviceAction.qml
+@@ -16,6 +16,7 @@ Kirigami.Action {
+     required property BluedevilComponents.ForgetDeviceDialog dialog
+     required property BluezQt.Device device
+ 
++    // ksr: kcm_bluetooth/ForgetFromList
+     text: i18nc("@action:button %1 is the name of a Bluetooth device", "Forget \"%1\"", device?.name ?? "");
+     icon.name: "edit-delete-remove-symbolic"
+ 
+diff --git a/src/kcm/ui/General.qml b/src/kcm/ui/General.qml
+index 4e43398..dc1458d 100644
+--- a/src/kcm/ui/General.qml
++++ b/src/kcm/ui/General.qml
+@@ -32,6 +32,7 @@ KCMUtils.SimpleKCM {
+ 
+         QQC2.ComboBox {
+             id: box
++            // ksr: kcm_bluetooth/Device
+             Kirigami.FormData.label: i18n("Device:")
+             model: BluezQt.Manager.adapters
+             textRole: "name"
+@@ -39,30 +40,36 @@ KCMUtils.SimpleKCM {
+         }
+ 
+         QQC2.TextField {
++            // ksr: kcm_bluetooth/Name
+             text: root.adapter.name
+             Kirigami.FormData.label: i18n("Name:")
+             onEditingFinished: root.adapter.name = text
+         }
+ 
+         QQC2.Label {
++            // ksr: kcm_bluetooth/AdapterAddress
+             text: root.adapter.address
+             Kirigami.FormData.label: i18n("Address:")
+         }
+ 
+-        QQC2.Switch {
+-            Kirigami.FormData.label: i18n("Enabled:")
++        QQC2.CheckBox {
++            // ksr: kcm_bluetooth/Enabled (was a switch "Enabled:")
++            Kirigami.FormData.label: i18nc("@label", "Adapter:")
++            text: i18n("Enabled")
+             checked: root.adapter.powered
+             onToggled: root.adapter.powered = checked
+         }
+ 
+-        QQC2.Switch {
+-            Kirigami.FormData.label: i18n("Visible:")
++        QQC2.CheckBox {
++            // ksr: kcm_bluetooth/Visible (was a switch "Visible:"; the text says to whom)
++            text: i18n("Visible to other devices")
+             checked: root.adapter.discoverable
+             onToggled: root.adapter.discoverable = checked
+         }
+ 
+         Kirigami.Separator {
+             Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18nc("@title:group", "Login")
+         }
+ 
+         QQC2.ButtonGroup {
+@@ -70,6 +77,7 @@ KCMUtils.SimpleKCM {
+         }
+ 
+         QQC2.RadioButton {
++            // ksr: kcm_bluetooth/Enable-Bluetooth
+             Kirigami.FormData.label: i18n("On login:")
+             text: i18n("Enable Bluetooth")
+             QQC2.ButtonGroup.group: loginStateRadioGroup
+@@ -106,6 +114,7 @@ KCMUtils.SimpleKCM {
+ 
+         Kirigami.Separator {
+             Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18nc("@title:group", "Received Files")
+         }
+ 
+         QQC2.ButtonGroup {
+@@ -113,6 +122,7 @@ KCMUtils.SimpleKCM {
+         }
+ 
+         QQC2.RadioButton {
++            // ksr: kcm_bluetooth/Ask-for-confirmation
+             Kirigami.FormData.label: i18n("When receiving files:")
+             checked: FileReceiverSettings.autoAccept === 0
+             text: i18n("Ask for confirmation")
+@@ -143,9 +153,12 @@ KCMUtils.SimpleKCM {
+             }
+         }
+ 
+-        Row {
++        RowLayout {
+             Kirigami.FormData.label: i18n("Save files in:")
++            spacing: Kirigami.Units.smallSpacing
++
+             QQC2.TextField {
++                // ksr: kcm_bluetooth/receiveFolderPath
+                 text: kcm.receiveFolderPath
+ 
+                 onEditingFinished: {
+@@ -157,7 +170,12 @@ KCMUtils.SimpleKCM {
+             QQC2.Button {
+                 icon.name: "document-open-folder-symbolic"
+                 display: QQC2.AbstractButton.IconOnly
++                // ksr: kcm_bluetooth/Select-folder
+                 text: i18n("Select folder")
++                Accessible.name: text
++                QQC2.ToolTip.text: text
++                QQC2.ToolTip.visible: hovered || visualFocus
++                QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
+                 onClicked: folderDialogLoader.active = true
+             }
+ 
+diff --git a/src/kcm/ui/main.qml b/src/kcm/ui/main.qml
+index 5d0da10..a80ac56 100644
+--- a/src/kcm/ui/main.qml
++++ b/src/kcm/ui/main.qml
+@@ -31,6 +31,7 @@ KCMUtils.ScrollViewKCM {
+ 
+     actions: [
+         Kirigami.Action {
++            // ksr: kcm_bluetooth/PairDevice
+             text: i18n("Pair Device…")
+             icon.name: "list-add-symbolic"
+             onTriggered: root.KCMUtils.ConfigModule.runWizard(root)
+@@ -38,7 +39,8 @@ KCMUtils.ScrollViewKCM {
+             displayHint: Kirigami.DisplayHint.KeepVisible
+         },
+         Kirigami.Action {
+-            text: i18n("Configure…")
++            // ksr: kcm_bluetooth/ConfigureSettings (was "Configure…"; the page it opens is titled Settings)
++            text: i18n("Settings…")
+             icon.name: "configure-symbolic"
+             onTriggered: root.KCMUtils.ConfigModule.push("General.qml")
+             visible: BluezQt.Manager.bluetoothOperational
+@@ -120,8 +122,10 @@ KCMUtils.ScrollViewKCM {
+         Kirigami.PlaceholderMessage {
+             id: noBluetoothMessage
+             // We cannot use the adapter count here because that can be zero when
+-            // bluetooth is disabled even when there are physical devices
+-            visible: BluezQt.Manager.rfkill.state === BluezQt.Rfkill.Unknown
++            // bluetooth is disabled even when there are physical devices.
++            // ksr: kcm_bluetooth/NoAdapter (only once the manager is operational: before that the state is Unknown
++            // for every machine and the page flashed "No Bluetooth adapters found" while the manager started)
++            visible: BluezQt.Manager.operational && BluezQt.Manager.rfkill.state === BluezQt.Rfkill.Unknown
+             icon.name: "edit-none"
+             text: i18n("No Bluetooth adapters found")
+             explanation: i18n("Connect an external Bluetooth adapter")
+@@ -139,6 +143,7 @@ KCMUtils.ScrollViewKCM {
+ 
+             helpfulAction: Kirigami.Action {
+                 icon.name: "network-bluetooth-symbolic"
++                // ksr: kcm_bluetooth/EnableBluetoothNotice
+                 text: i18n("Enable")
+                 onTriggered: {
+                     root.setBluetoothEnabled(true);
+@@ -150,7 +155,13 @@ KCMUtils.ScrollViewKCM {
+             visible: !noBluetoothMessage.visible && !bluetoothDisabledMessage.visible && list.count === 0
+             icon.name: "network-bluetooth-activated"
+             text: i18n("No devices paired")
++            // ksr: kcm_bluetooth/NoDevices
+             explanation: xi18nc("@info", "Click <interface>Pair Device…</interface> to pair some")
++            helpfulAction: Kirigami.Action {
++                icon.name: "list-add-symbolic"
++                text: i18n("Pair Device…")
++                onTriggered: root.KCMUtils.ConfigModule.runWizard(root)
++            }
+             width: parent.width - (Kirigami.Units.largeSpacing * 4)
+             anchors.centerIn: parent
+         }
+@@ -163,6 +174,22 @@ KCMUtils.ScrollViewKCM {
+             anchors.centerIn: parent
+         }
+ 
++        // The page is shown at once; the BluezQt manager initialises asynchronously. Only if that takes longer than
++        // 150 ms (docs/page-design.md section 3) a busy indicator appears.
++        QQC2.BusyIndicator {
++            id: loadingIndicator
++            property bool waitedLongEnough: false
++            running: waitedLongEnough && !BluezQt.Manager.operational
++            visible: running
++            anchors.centerIn: parent
++
++            Timer {
++                interval: 150
++                running: !BluezQt.Manager.operational
++                onTriggered: loadingIndicator.waitedLongEnough = true
++            }
++        }
++
+ 
+         DevicesProxyModel {
+             id: devicesModel
+@@ -228,6 +255,14 @@ KCMUtils.ScrollViewKCM {
+         const { battery } = device;
+         const labels = [];
+ 
++        // ksr: kcm_bluetooth/model-Name (state first in the subtitle: connected / blocked)
++        if (device.connected) {
++            labels.push(i18n("Connected"));
++        }
++        if (device.blocked) {
++            labels.push(i18n("Blocked"));
++        }
++
+         labels.push(Script.deviceTypeToString(device));
+ 
+         if (battery) {

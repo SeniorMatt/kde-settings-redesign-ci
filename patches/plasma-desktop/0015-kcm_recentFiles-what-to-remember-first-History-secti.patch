@@ -1,0 +1,267 @@
+From a5447aa81f9d5f99f3d96aff005df239e59648e7 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 01:33:13 +0500
+Subject: [PATCH 15/31] kcm_recentFiles: what to remember first, History
+ section last; application list and QML engine started after the first frame
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Page type: Form (QtWidgets kept, docs/page-design.md §8: QFormLayout, bold section labels, no frames). Config keys, kcfg,
+D-Bus DeleteRecentStats calls and the "Forget ..." menu unchanged. Not built yet.
+
+Moved / renamed:
+- Order by use: "Remember opened documents" (all / none / only for specific applications + the application list and
+  "Exclude applications not on the list") is first; the rarer "History" section follows: "Keep history:" and the Clear History
+  menu button, now on its own row and labelled "Clear History…" because it opens a menu (kcm_recentFiles/whatToRemember,
+  keepHistoryFor, buttonClearRecentHistory).
+- The label next to the radios became a bold section label above them; the form layout only holds the History rows
+  (buddy set on "Keep history:").
+HIG ids: HIG-001/005/006 (order by use), HIG-057 (noun section titles), ellipsis on buttons that open a menu.
+
+Speed causes (kcms/recentFiles): (1) ExcludedApplicationsModel::load() opened the activity SQLite database and called
+KService::serviceByDesktopName per application inside load(); it now runs from QTimer::singleShot(0) so the page paints
+first and the list fills in (the model resets/inserts rows itself). (2) QQuickWidget::setSource (QML engine start for the
+list) is deferred the same way. After numbers: pending, manager will measure.
+
+Unconfirmed: a Qt .ui XML comment before a widget inside <item> is ignored by uic (standard XML comment; not compiled).
+Not done: porting to QML (large; the model needs a QObject-owned config); duplicate with kcm_activities isPrivate left as is.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/recentFiles/kcm_recentFiles.cpp |  13 +-
+ kcms/recentFiles/ui/RecentFiles.ui   | 174 ++++++++++++++++-----------
+ 2 files changed, 114 insertions(+), 73 deletions(-)
+
+diff --git a/kcms/recentFiles/kcm_recentFiles.cpp b/kcms/recentFiles/kcm_recentFiles.cpp
+index 1db0985..59c375a 100644
+--- a/kcms/recentFiles/kcm_recentFiles.cpp
++++ b/kcms/recentFiles/kcm_recentFiles.cpp
+@@ -12,6 +12,7 @@
+ #include <QDBusPendingCall>
+ 
+ #include <QMenu>
++#include <QTimer>
+ #include <QQmlComponent>
+ #include <QQmlContext>
+ #include <QQmlEngine>
+@@ -95,7 +96,11 @@ RecentFilesKcm::RecentFilesKcm(QObject *parent, const KPluginMetaData &data)
+ 
+     d->viewExcludeddApplications->setClearColor(QGuiApplication::palette().window().color());
+     d->viewExcludeddApplications->rootContext()->setContextProperty(QStringLiteral("applicationModel"), d->excludedApplicationsModel);
+-    d->viewExcludeddApplications->setSource(QUrl::fromLocalFile(KAMD_KCM_DATADIR + QStringLiteral("/qml/recentFiles/ExcludedApplicationView.qml")));
++    // ksr: speed. Creating the QML engine and the application list used to happen before the first frame.
++    // Both run from the event loop once the page has been shown.
++    QTimer::singleShot(0, this, [this]() {
++        d->viewExcludeddApplications->setSource(QUrl::fromLocalFile(KAMD_KCM_DATADIR + QStringLiteral("/qml/recentFiles/ExcludedApplicationView.qml")));
++    });
+ 
+     // React to changes
+ 
+@@ -147,7 +152,11 @@ void RecentFilesKcm::defaults()
+ 
+ void RecentFilesKcm::load()
+ {
+-    d->excludedApplicationsModel->load();
++    // ksr: speed. load() opens the activity SQLite database and looks up a KService per application; do it after the
++    // first frame. The model resets itself (removeRows/insertRows) so the view fills in when it is done.
++    QTimer::singleShot(0, this, [this]() {
++        d->excludedApplicationsModel->load();
++    });
+ 
+     KCModule::load();
+ 
+diff --git a/kcms/recentFiles/ui/RecentFiles.ui b/kcms/recentFiles/ui/RecentFiles.ui
+index 13db9b1..5b18ac0 100644
+--- a/kcms/recentFiles/ui/RecentFiles.ui
++++ b/kcms/recentFiles/ui/RecentFiles.ui
+@@ -25,78 +25,53 @@
+     </widget>
+    </item>
+    <item>
+-    <layout class="QFormLayout" name="formLayout">
+-     <property name="formAlignment">
+-      <set>Qt::AlignHCenter|Qt::AlignTop</set>
++    <!-- ksr: kcm_recentFiles/whatToRemember (section title: bold label, no frame) -->
++    <widget class="QLabel" name="labelRememberDocuments">
++     <property name="text">
++      <string>Remember opened documents</string>
+      </property>
+-     <item row="0" column="0">
+-      <widget class="QLabel" name="labelKeepHistory">
+-       <property name="text">
+-        <string>Keep history:</string>
+-       </property>
+-      </widget>
+-     </item>
+-     <item row="0" column="1">
+-      <layout class="QHBoxLayout" name="horizontalLayout">
+-       <item>
+-        <widget class="QSpinBox" name="kcfg_keepHistoryFor"/>
+-       </item>
+-       <item>
+-        <widget class="QPushButton" name="buttonClearRecentHistory">
+-         <property name="text">
+-          <string>Clear History</string>
+-         </property>
+-         <property name="icon">
+-          <iconset theme="edit-clear-history"/>
+-         </property>
+-        </widget>
+-       </item>
+-      </layout>
+-     </item>
+-     <item row="1" column="1">
+-      <widget class="QGroupBox" name="kcfg_whatToRemember">
+-       <property name="title">
+-        <string/>
+-       </property>
+-       <property name="flat">
+-        <bool>true</bool>
+-       </property>
+-       <layout class="QVBoxLayout" name="verticalLayout_2">
+-        <item>
+-         <widget class="QRadioButton" name="radioRememberAllApplications">
+-          <property name="text">
+-           <string>For a&amp;ll applications</string>
+-          </property>
+-          <property name="checked">
+-           <bool>true</bool>
+-          </property>
+-         </widget>
+-        </item>
+-        <item>
+-         <widget class="QRadioButton" name="radioDontRememberApplications">
+-          <property name="text">
+-           <string>&amp;Do not remember</string>
+-          </property>
+-         </widget>
+-        </item>
+-        <item>
+-         <widget class="QRadioButton" name="radioRememberSpecificApplications">
+-          <property name="text">
+-           <string>O&amp;nly for specific applications:</string>
+-          </property>
+-         </widget>
+-        </item>
+-       </layout>
+-      </widget>
+-     </item>
+-     <item row="1" column="0">
+-      <widget class="QLabel" name="labelRememberDocuments">
+-       <property name="text">
+-        <string>Remember opened documents:</string>
+-       </property>
+-      </widget>
+-     </item>
+-    </layout>
++     <property name="font">
++      <font>
++       <bold>true</bold>
++      </font>
++     </property>
++    </widget>
++   </item>
++   <item>
++    <widget class="QGroupBox" name="kcfg_whatToRemember">
++     <property name="title">
++      <string/>
++     </property>
++     <property name="flat">
++      <bool>true</bool>
++     </property>
++     <layout class="QVBoxLayout" name="verticalLayout_2">
++      <item>
++       <widget class="QRadioButton" name="radioRememberAllApplications">
++        <property name="text">
++         <string>For a&amp;ll applications</string>
++        </property>
++        <property name="checked">
++         <bool>true</bool>
++        </property>
++       </widget>
++      </item>
++      <item>
++       <widget class="QRadioButton" name="radioDontRememberApplications">
++        <property name="text">
++         <string>&amp;Do not remember</string>
++        </property>
++       </widget>
++      </item>
++      <item>
++       <widget class="QRadioButton" name="radioRememberSpecificApplications">
++        <property name="text">
++         <string>O&amp;nly for specific applications:</string>
++        </property>
++       </widget>
++      </item>
++     </layout>
++    </widget>
+    </item>
+    <item>
+     <widget class="QQuickWidget" name="viewExcludeddApplications">
+@@ -131,6 +106,63 @@
+      </item>
+     </layout>
+    </item>
++   <item>
++    <!-- ksr: kcm_recentFiles/keepHistoryFor ksr: kcm_recentFiles/buttonClearRecentHistory -->
++    <widget class="QLabel" name="labelHistory">
++     <property name="text">
++      <string>History</string>
++     </property>
++     <property name="font">
++      <font>
++       <bold>true</bold>
++      </font>
++     </property>
++    </widget>
++   </item>
++   <item>
++    <layout class="QFormLayout" name="formLayout">
++     <item row="0" column="0">
++      <widget class="QLabel" name="labelKeepHistory">
++       <property name="text">
++        <string>Keep history:</string>
++       </property>
++       <property name="buddy">
++        <cstring>kcfg_keepHistoryFor</cstring>
++       </property>
++      </widget>
++     </item>
++     <item row="0" column="1">
++      <widget class="QSpinBox" name="kcfg_keepHistoryFor"/>
++     </item>
++     <item row="1" column="1">
++      <layout class="QHBoxLayout" name="horizontalLayout">
++       <item>
++        <widget class="QPushButton" name="buttonClearRecentHistory">
++         <property name="text">
++          <string>Clear History…</string>
++         </property>
++         <property name="icon">
++          <iconset theme="edit-clear-history"/>
++         </property>
++        </widget>
++       </item>
++       <item>
++        <spacer name="horizontalSpacer">
++         <property name="orientation">
++          <enum>Qt::Horizontal</enum>
++         </property>
++         <property name="sizeHint" stdset="0">
++          <size>
++           <width>40</width>
++           <height>20</height>
++          </size>
++         </property>
++        </spacer>
++       </item>
++      </layout>
++     </item>
++    </layout>
++   </item>
+   </layout>
+  </widget>
+  <customwidgets>

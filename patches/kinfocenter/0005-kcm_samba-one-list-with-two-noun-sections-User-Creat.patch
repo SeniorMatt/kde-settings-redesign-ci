@@ -1,0 +1,241 @@
+From 21aba8daf4e4a21d1ee9d51f32c170bda3549f4a Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 01:31:29 +0500
+Subject: [PATCH 5/9] kcm_samba: one list with two noun sections (User-Created
+ Shares, Remote Share Mounts) instead of two side-by-side lists; models load
+ after the first frame
+
+Page type: List (docs/page-design.md 1, 4): KCM.ScrollViewKCM with one ListView; section headers are
+Kirigami.ListSectionHeader, empty states are Kirigami.PlaceholderMessage (icon + sentence), View colours like the
+information pages. The share rows (Path, Shared at, "Open folder properties..." button) and the mounted-share rows
+(click opens the mount) are the same delegates; no label changed (ia aliases not needed). Rows kept with markers:
+kcm_samba/UserShares, RemoteMounts, OpenProperties; inventory_check --kcm kcm_samba --strict: 0 lost.
+Why: two 50 % wide lists with their own frames broke on narrow windows and looked unlike every other page (HIG-001,
+design 2). The second list is the ListView footer (a Repeater over the mount model).
+
+Also: ShareListItem called showPropertiesDialog through the id "view" of the page file; it now goes through its own
+ListView.view, so it does not depend on ids of another file.
+
+Speed (cause found in code): KSambaShareModel's constructor called reloadData() directly (invokeMethod on the same thread
+is a direct call), which calls KSambaShare::instance() (reads the Samba config and user shares) and starts the Avahi
+D-Bus query; SmbMountModel did Solid::Device::listFromType the same way. Both are now Qt::QueuedConnection, so the page
+appears first and the rows are filled in from the event loop. After numbers: pending, manager will measure.
+
+Not built yet. Uncertain: the header/footer ColumnLayouts get height = implicitHeight (a layout in a ListView header has no
+height otherwise); Repeater delegates keep using the injected ROLE_ names (no required properties, on purpose).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/samba/ksambasharemodel.cpp |  11 ++-
+ kcms/samba/smbmountmodel.cpp    |   3 +-
+ kcms/samba/ui/ShareListItem.qml |   2 +-
+ kcms/samba/ui/main.qml          | 121 +++++++++++++++++---------------
+ 4 files changed, 75 insertions(+), 62 deletions(-)
+
+diff --git a/kcms/samba/ksambasharemodel.cpp b/kcms/samba/ksambasharemodel.cpp
+index ab59483..4618d5e 100644
+--- a/kcms/samba/ksambasharemodel.cpp
++++ b/kcms/samba/ksambasharemodel.cpp
+@@ -17,8 +17,15 @@
+ KSambaShareModel::KSambaShareModel(QObject *parent)
+     : QAbstractListModel(parent)
+ {
+-    connect(KSambaShare::instance(), &KSambaShare::changed, this, &KSambaShareModel::reloadData);
+-    metaObject()->invokeMethod(this, &KSambaShareModel::reloadData);
++    // From the event loop, after the page exists: KSambaShare::instance() reads the Samba configuration and the
++    // user-share list, and reloadData() asks Avahi over D-Bus. Neither belongs in the constructor (page creation).
++    metaObject()->invokeMethod(
++        this,
++        [this] {
++            connect(KSambaShare::instance(), &KSambaShare::changed, this, &KSambaShareModel::reloadData);
++            reloadData();
++        },
++        Qt::QueuedConnection);
+ }
+ 
+ KSambaShareModel::~KSambaShareModel() = default;
+diff --git a/kcms/samba/smbmountmodel.cpp b/kcms/samba/smbmountmodel.cpp
+index d368754..fc4e235 100644
+--- a/kcms/samba/smbmountmodel.cpp
++++ b/kcms/samba/smbmountmodel.cpp
+@@ -18,7 +18,8 @@ SmbMountModel::SmbMountModel(QObject *parent)
+ {
+     connect(Solid::DeviceNotifier::instance(), &Solid::DeviceNotifier::deviceAdded, this, &SmbMountModel::addDevice);
+     connect(Solid::DeviceNotifier::instance(), &Solid::DeviceNotifier::deviceRemoved, this, &SmbMountModel::removeDevice);
+-    metaObject()->invokeMethod(this, &SmbMountModel::reloadData);
++    // From the event loop: Solid::Device::listFromType() is not needed for the first frame
++    metaObject()->invokeMethod(this, &SmbMountModel::reloadData, Qt::QueuedConnection);
+ }
+ 
+ SmbMountModel::~SmbMountModel() = default;
+diff --git a/kcms/samba/ui/ShareListItem.qml b/kcms/samba/ui/ShareListItem.qml
+index cbc6986..a66a3e6 100644
+--- a/kcms/samba/ui/ShareListItem.qml
++++ b/kcms/samba/ui/ShareListItem.qml
+@@ -68,7 +68,7 @@ QQC2.ItemDelegate {
+                 icon.name: "document-properties"
+                 tooltip: xi18nc("@info:tooltip", "Open folder properties to change share settings")
+                 displayHint: Kirigami.DisplayHint.IconOnly
+-                onTriggered: source => view.model.showPropertiesDialog(model.row)
++                onTriggered: source => listItem.ListView.view.model.showPropertiesDialog(model.row)
+             }
+ 
+             QQC2.ToolTip {
+diff --git a/kcms/samba/ui/main.qml b/kcms/samba/ui/main.qml
+index 90d4402..743a96e 100644
+--- a/kcms/samba/ui/main.qml
++++ b/kcms/samba/ui/main.qml
+@@ -2,73 +2,87 @@
+ // SPDX-FileCopyrightText: 2020 Harald Sitter <sitter@kde.org>
+ 
+ import org.kde.kcmutils as KCM
+-import QtQuick 2.14
+-import org.kde.kirigami 2.12 as Kirigami
++import QtQuick
++import org.kde.kirigami as Kirigami
+ import org.kde.kirigami.delegates as KD
+-import QtQuick.Controls 2.14 as QQC2
+-import QtQuick.Layouts 1.14
++import QtQuick.Controls as QQC2
++import QtQuick.Layouts
+ import org.kde.kinfocenter.samba 1.0 as Samba
+ 
+-KCM.AbstractKCM {
+-    GridLayout {
+-        anchors.fill: parent
+-        columns: 2
++// List page (docs/page-design.md): one list with two noun sections instead of two side-by-side lists, so it fits a
++// narrow window and reads top to bottom. Same look as the other information pages (View colours).
++KCM.ScrollViewKCM {
++    id: root
+ 
+-        Kirigami.Heading {
+-            text: i18nc("@title heading above listview", "User-Created Shares")
+-            level: 2
+-        }
+-
+-        Kirigami.Heading {
+-            text: i18nc("@title heading above listview", "Remote Share Mounts")
+-            level: 2
+-        }
++    implicitWidth: Kirigami.Units.gridUnit * 30
++    implicitHeight: Kirigami.Units.gridUnit * 25
+ 
+-        QQC2.ScrollView {
+-            Layout.fillWidth: true
+-            Layout.fillHeight: true
++    Kirigami.Theme.colorSet: Kirigami.Theme.View
++    Kirigami.Theme.inherit: false
+ 
+-            Kirigami.Theme.colorSet: Kirigami.Theme.View
+-            Kirigami.Theme.inherit: false
+-            Kirigami.StyleHints.showFramedBackground: true
++    view: ListView {
++        id: shareView
+ 
+-            ListView {
+-                id: view
+-                keyNavigationEnabled: false
+-                model: Samba.ShareModel{}
++        keyNavigationEnabled: false
++        model: Samba.ShareModel {}
+ 
+-                delegate: ShareListItem {
+-                    width: view.width
++        // ksr: kcm_samba/UserShares
++        header: ColumnLayout {
++            width: shareView.width
++            height: implicitHeight
++            spacing: 0
+ 
+-                    // The view isn't navigatable nor interactable. Disable highlighting.
+-                    highlighted: false
+-                    hoverEnabled: false
+-                    down: false
+-                }
++            Kirigami.ListSectionHeader {
++                Layout.fillWidth: true
++                label: i18nc("@title heading above listview", "User-Created Shares")
++            }
+ 
+-                Kirigami.PlaceholderMessage {
+-                    anchors.centerIn: parent
+-                    width: parent.width - (Kirigami.Units.largeSpacing * 4)
+-                    visible: parent.count == 0
+-                    icon.name: "network-server"
+-                    text: i18nc("@info place holder for empty listview", "There are no directories shared by users")
+-                }
++            Kirigami.PlaceholderMessage {
++                Layout.fillWidth: true
++                Layout.margins: Kirigami.Units.largeSpacing
++                visible: shareView.count === 0
++                icon.name: "network-server"
++                text: i18nc("@info place holder for empty listview", "There are no directories shared by users")
+             }
+         }
+ 
+-        QQC2.ScrollView {
+-            Layout.fillWidth: true
+-            Layout.fillHeight: true
++        // ksr: kcm_samba/OpenProperties (ShareListItem.qml)
++        delegate: ShareListItem {
++            width: shareView.width
++
++            // The view isn't navigatable nor interactable. Disable highlighting.
++            highlighted: false
++            hoverEnabled: false
++            down: false
++        }
+ 
+-            Kirigami.Theme.colorSet: Kirigami.Theme.View
+-            Kirigami.Theme.inherit: false
+-            Kirigami.StyleHints.showFramedBackground: true
++        // ksr: kcm_samba/RemoteMounts
++        footer: ColumnLayout {
++            width: shareView.width
++            height: implicitHeight
++            spacing: 0
+ 
+-            ListView {
+-                currentIndex: -1
++            Kirigami.ListSectionHeader {
++                Layout.fillWidth: true
++                label: i18nc("@title heading above listview", "Remote Share Mounts")
++            }
++
++            Kirigami.PlaceholderMessage {
++                Layout.fillWidth: true
++                Layout.margins: Kirigami.Units.largeSpacing
++                visible: mounts.count === 0
++                icon.name: "folder-network"
++                text: i18nc("@info place holder for empty listview",
++                            "There are no Samba shares mounted on this system")
++            }
++
++            Repeater {
++                id: mounts
+                 model: Samba.MountModel {}
+ 
+                 delegate: KD.SubtitleDelegate {
++                    Layout.fillWidth: true
++
+                     // TODO document-open-remote is actually pretty cool but lacks a visualization for not connected
+                     //   emblem icons are kind of a crutch
+                     icon.name: ROLE_Accessible ? "emblem-mounted" : "emblem-unmounted"
+@@ -82,15 +96,6 @@ KCM.AbstractKCM {
+                         Qt.openUrlExternally("file://" + ROLE_Path + "/")
+                     }
+                 }
+-
+-                Kirigami.PlaceholderMessage {
+-                    anchors.centerIn: parent
+-                    width: parent.width - (Kirigami.Units.largeSpacing * 4)
+-                    visible: parent.count == 0
+-                    icon.name: "folder-network"
+-                    text: i18nc("@info place holder for empty listview",
+-                                "There are no Samba shares mounted on this system")
+-                }
+             }
+         }
+     }

@@ -1,0 +1,56 @@
+From dcc6edeb38eaffaa3574ce0e577c20db66615031 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 02:23:37 +0500
+Subject: [PATCH 23/31] kcm_tablet: do not use the tablet protocol object when
+ the compositor lacks zwp_tablet_manager_v2
+
+TabletEvents::TabletEvents called get_tablet_seat on a TabletManager that was never bound (weston and other compositors without
+the protocol), a null wl_proxy dereference (docs/upstream-bugs.md, found by gdb in the bench under weston). Now it returns early
+when isActive() is false and when there is no seat; the manager's destructor only calls destroy() when initialized, and the
+Q_ASSERT(isInitialized()) in its constructor is gone because it fired for the same case in debug builds. Not built yet.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/tablet/tabletevents.cpp | 15 +++++++++++++--
+ 1 file changed, 13 insertions(+), 2 deletions(-)
+
+diff --git a/kcms/tablet/tabletevents.cpp b/kcms/tablet/tabletevents.cpp
+index 0098574..7547784 100644
+--- a/kcms/tablet/tabletevents.cpp
++++ b/kcms/tablet/tabletevents.cpp
+@@ -178,12 +178,14 @@ public:
+     {
+         setParent(q);
+         initialize();
+-        Q_ASSERT(isInitialized());
+     }
+ 
+     ~TabletManager()
+     {
+-        destroy();
++        // destroy() on a protocol object that was never bound (compositor without the protocol) would dereference null
++        if (isInitialized()) {
++            destroy();
++        }
+     }
+ 
+     TabletEvents *const q;
+@@ -225,8 +227,17 @@ TabletEvents::TabletEvents(QQuickItem *parent)
+         return;
+     }
+     auto seat = waylandApp->seat();
++    if (!seat) {
++        return;
++    }
+ 
+     auto tabletClient = new TabletManager(this);
++    // Compositors without zwp_tablet_manager_v2 (e.g. weston) leave the protocol object inactive; calling get_tablet_seat on it
++    // dereferences a null wl_proxy and crashes. Without the protocol there are simply no live events.
++    if (!tabletClient->isActive()) {
++        delete tabletClient;
++        return;
++    }
+     auto _seat = tabletClient->get_tablet_seat(seat);
+     new TabletSeat(this, _seat);
+ }

@@ -1,0 +1,442 @@
+From 4a44bdb269eaee890e1df1e983d5d5e7a4c81cfb Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 01:30:35 +0500
+Subject: [PATCH 13/31] kcm_spellchecking: Form page, languages first,
+ dictionary model bound after the first frame
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Page type: Form (docs/page-design.md). Sonnet settings, config keys and defaults unchanged. Not built yet.
+
+Moved / renamed:
+- First section (untitled): Default Language, "Preferred Languages: Choose Languages…" (was "Configure Preferred Languages…",
+  kcm_spellchecking/Configure-Preferred-Languages), and the language autodetect checkbox (moved up from Options, relabelled
+  "Detect the language automatically"; settings-autodetectLanguage).
+- Section "Checking" (was "Options"): "Check spelling automatically by default" (was "Automatic spell checking enabled by
+  default"), "Skip words in all uppercase", "Skip run-together words".
+- Section "Ignored Words": "Ignored Words: Edit Ignored Words…" (was "Configure Ignored Words…"; "Configure" says nothing).
+- Both dialogs kept as they were (built only on click).
+- Shell aliases (ia/layout.json) already cover spelling/dictionary/sonnet.
+HIG ids: HIG-001/005 (order by use), HIG-057 (no Options/Advanced title), button labels end with an ellipsis when they open
+something. Accessible.name on the combo box.
+
+Speed cause: settings->dictionaryModel enumerates every Sonnet backend/dictionary and was bound to the ComboBox when the
+page was created. It is now assigned with Qt.callLater after the first frame; currentIndex reads `count` so it follows the model.
+Also nine Kirigami.FormEntry/FormGroup items replaced by plain rows. After numbers: pending, manager will measure.
+
+Unconfirmed: whether the Sonnet::Settings constructor itself already loads backends (then the first-frame win is smaller);
+needs a measurement. Markers added for the two unchanged dialog rows because strict mode needs them.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/spellchecking/ui/main.qml | 362 ++++++++++++++++-----------------
+ 1 file changed, 179 insertions(+), 183 deletions(-)
+
+diff --git a/kcms/spellchecking/ui/main.qml b/kcms/spellchecking/ui/main.qml
+index 6477ab2..633c74c 100644
+--- a/kcms/spellchecking/ui/main.qml
++++ b/kcms/spellchecking/ui/main.qml
+@@ -15,222 +15,218 @@ import org.kde.kitemmodels
+ KCM.SimpleKCM {
+     id: root
+ 
+-    Kirigami.Form {
+-        Kirigami.FormGroup {
+-            Kirigami.FormEntry {
+-                contentItem: QQC2.ComboBox {
+-                    id: defaultLanguage
+-                    Kirigami.FormData.label: i18nc("@label", "Default Language:")
+-                    model: kcm.settings.dictionaryModel
+-                    textRole: "display"
+-                    valueRole: "languageCode"
+-
+-                    onActivated: kcm.settings.defaultLanguage = currentValue
+-
+-                    currentIndex: indexOfValue(kcm.settings.defaultLanguage)
+-
+-                    Connections {
+-                        target: kcm.settings
+-                        function onDefaultLanguageChanged(): void {
+-                            defaultLanguage.currentIndex = defaultLanguage.indexOfValue(kcm.settings.defaultLanguage)
+-                        }
+-                    }
+-                }
+-                KCM.SettingHighlighter {
+-                    highlight: kcm.settings.defaultLanguage !== kcm.settings.defaultDefaultLanguage
++    // Form page (docs/page-design.md): languages first, then how checking behaves. The two lists (preferred languages,
++    // ignored words) open in dialogs built only on click. Plain FormLayout rows, no Kirigami.Form/FormGroup/FormEntry.
++    Kirigami.FormLayout {
++        QQC2.ComboBox {
++            // ksr: kcm_spellchecking/settings-dictionaryModel
++            id: defaultLanguage
++            Kirigami.FormData.label: i18nc("@label", "Default Language:")
++            textRole: "display"
++            valueRole: "languageCode"
++            Accessible.name: i18nc("@label", "Default Language:")
++
++            // The dictionary model enumerates every Sonnet backend, so it is bound after the first frame.
++            Component.onCompleted: Qt.callLater(() => { defaultLanguage.model = kcm.settings.dictionaryModel; })
++
++            onActivated: kcm.settings.defaultLanguage = currentValue
++
++            // `count` is read so the index is recomputed when the model arrives.
++            currentIndex: count >= 0 ? indexOfValue(kcm.settings.defaultLanguage) : -1
++
++            Connections {
++                target: kcm.settings
++                function onDefaultLanguageChanged(): void {
++                    defaultLanguage.currentIndex = defaultLanguage.indexOfValue(kcm.settings.defaultLanguage)
+                 }
+             }
++            KCM.SettingHighlighter {
++                target: defaultLanguage
++                highlight: kcm.settings.defaultLanguage !== kcm.settings.defaultDefaultLanguage
++            }
+         }
+ 
+-        Kirigami.FormGroup {
+-            title: i18nc("@title", "Preferred Languages")
+-
+-            Kirigami.FormEntry {
+-                contentItem: QQC2.Button {
+-                    text: i18nc("@action:button", "Configure Preferred Languages…")
+-                    icon.name: "languages"
+-                    onClicked: {
+-                        let dialog = spellCheckingLanguageList.createObject(root) as Kirigami.Dialog;
+-                        dialog.open();
+-                    }
+-                    KCM.SettingHighlighter {
+-                        highlight: kcm.settings.preferredLanguages.length !== kcm.settings.defaultPreferredLanguages.length || !kcm.settings.preferredLanguages.every(value => kcm.settings.defaultPreferredLanguages.includes(value))
+-                    }
++        QQC2.Button {
++            // ksr: kcm_spellchecking/Configure-Preferred-Languages
++            Kirigami.FormData.label: i18nc("@label", "Preferred Languages:")
++            text: i18nc("@action:button", "Choose Languages…")
++            icon.name: "languages"
++            onClicked: {
++                let dialog = spellCheckingLanguageList.createObject(root) as Kirigami.Dialog;
++                dialog.open();
++            }
++            KCM.SettingHighlighter {
++                highlight: kcm.settings.preferredLanguages.length !== kcm.settings.defaultPreferredLanguages.length || !kcm.settings.preferredLanguages.every(value => kcm.settings.defaultPreferredLanguages.includes(value))
++            }
+ 
+-                    Component {
+-                        id: spellCheckingLanguageList
+-                        Kirigami.Dialog {
+-                            id: scroll
+-                            title: i18ndc("kirigami-addons6", "@title:window", "Spell Checking Languages")
++            Component {
++                id: spellCheckingLanguageList
++                Kirigami.Dialog {
++                    id: scroll
++                    title: i18ndc("kirigami-addons6", "@title:window", "Spell Checking Languages")
+ 
+-                            width: Kirigami.Units.gridUnit * 24
++                    width: Kirigami.Units.gridUnit * 24
+ 
+-                            onRejected: scroll.close()
++                    onRejected: scroll.close()
+ 
+-                            header: DialogHeader {
+-                                dialog: scroll
++                    header: DialogHeader {
++                        dialog: scroll
+ 
+-                                contentItem: ColumnLayout {
+-                                    spacing: Kirigami.Units.smallSpacing
++                        contentItem: ColumnLayout {
++                            spacing: Kirigami.Units.smallSpacing
+ 
+-                                    Kirigami.DialogHeaderTopContent {
+-                                        Layout.fillWidth: true
+-                                        dialog: scroll
+-                                    }
++                            Kirigami.DialogHeaderTopContent {
++                                Layout.fillWidth: true
++                                dialog: scroll
++                            }
+ 
+-                                    Kirigami.SearchField {
+-                                        id: searchField
+-                                        Layout.fillWidth: true
+-                                    }
+-                                }
++                            Kirigami.SearchField {
++                                id: searchField
++                                Layout.fillWidth: true
+                             }
++                        }
++                    }
+ 
+-                            ListView {
+-                                id: listView
+-                                clip: true
+-                                model: KSortFilterProxyModel {
+-                                    sourceModel: kcm.settings.dictionaryModel
+-                                    filterRoleName: "display"
+-                                    filterString: searchField.text
+-                                }
++                    ListView {
++                        id: listView
++                        clip: true
++                        model: KSortFilterProxyModel {
++                            sourceModel: kcm.settings.dictionaryModel
++                            filterRoleName: "display"
++                            filterString: searchField.text
++                        }
+ 
+-                                delegate: QQC2.CheckDelegate {
+-                                    id: delegate
+-                                    width: ListView.view.width
++                        delegate: QQC2.CheckDelegate {
++                            id: delegate
++                            width: ListView.view.width
+ 
+-                                    required property var model
+-                                    required property bool isDefault
++                            required property var model
++                            required property bool isDefault
+ 
+-                                    text: model.display
+-                                    onClicked: delegate.model.checked = checked
+-                                    checked: delegate.model.checked
+-                                    Accessible.description: delegate.isDefault ? i18nd("kirigami-addons6", "Default Language") : ""
+-                                }
+-                            }
++                            text: model.display
++                            onClicked: delegate.model.checked = checked
++                            checked: delegate.model.checked
++                            Accessible.description: delegate.isDefault ? i18nd("kirigami-addons6", "Default Language") : ""
+                         }
+                     }
+                 }
+             }
+         }
+-
+-        Kirigami.FormGroup {
+-            title: i18nc("@title", "Options")
+-
+-            Kirigami.FormEntry {
+-                contentItem: QQC2.CheckBox {
+-                    text: i18nc("@option:check", "Enable autodetection of language")
+-                    checked: kcm.settings.autodetectLanguage
+-                    onClicked: kcm.settings.autodetectLanguage = checked
+-                }
+-                KCM.SettingHighlighter {
+-                    highlight: kcm.settings.autodetectLanguage !== kcm.settings.defaultAutodetectLanguage
+-                }
++        QQC2.CheckBox {
++            // ksr: kcm_spellchecking/settings-autodetectLanguage
++            text: i18nc("@option:check", "Detect the language automatically")
++            checked: kcm.settings.autodetectLanguage
++            onToggled: kcm.settings.autodetectLanguage = checked
++            KCM.SettingHighlighter {
++                highlight: kcm.settings.autodetectLanguage !== kcm.settings.defaultAutodetectLanguage
+             }
++        }
+ 
+-            Kirigami.FormEntry {
+-                contentItem: QQC2.CheckBox {
+-                    text: i18nc("@option:check", "Automatic spell checking enabled by default")
+-                    checked: kcm.settings.checkerEnabledByDefault
+-                    onCheckedChanged: kcm.settings.checkerEnabledByDefault = checked
+-                }
+-                KCM.SettingHighlighter {
+-                    highlight: kcm.settings.checkerEnabledByDefault !== kcm.settings.defaultCheckerEnabledByDefault
+-                }
+-            }
++        Kirigami.Separator {
++            Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18nc("@title:group", "Checking")
++        }
+ 
+-            Kirigami.FormEntry {
+-                contentItem: QQC2.CheckBox {
+-                    text: i18nc("@option:check", "Skip all uppercase words")
+-                    checked: kcm.settings.skipUppercase
+-                    onCheckedChanged: kcm.settings.skipUppercase = checked
+-                }
+-                KCM.SettingHighlighter {
+-                    highlight: kcm.settings.skipUppercase !== kcm.settings.defaultSkipUppercase
+-                }
++        QQC2.CheckBox {
++            // ksr: kcm_spellchecking/settings-checkerEnabledByDefault
++            text: i18nc("@option:check", "Check spelling automatically by default")
++            checked: kcm.settings.checkerEnabledByDefault
++            onToggled: kcm.settings.checkerEnabledByDefault = checked
++            KCM.SettingHighlighter {
++                highlight: kcm.settings.checkerEnabledByDefault !== kcm.settings.defaultCheckerEnabledByDefault
+             }
+-
+-            Kirigami.FormEntry {
+-                contentItem: QQC2.CheckBox {
+-                    text: i18nc("@option:check", "Skip run-together words")
+-                    checked: kcm.settings.skipRunTogether
+-                    onCheckedChanged: kcm.settings.skipRunTogether = checked
+-                }
+-                KCM.SettingHighlighter {
+-                    highlight: kcm.settings.skipRunTogether !== kcm.settings.defaultSkipRunTogether
+-                }
++        }
++        QQC2.CheckBox {
++            // ksr: kcm_spellchecking/settings-skipUppercase
++            text: i18nc("@option:check", "Skip words in all uppercase")
++            checked: kcm.settings.skipUppercase
++            onToggled: kcm.settings.skipUppercase = checked
++            KCM.SettingHighlighter {
++                highlight: kcm.settings.skipUppercase !== kcm.settings.defaultSkipUppercase
++            }
++        }
++        QQC2.CheckBox {
++            // ksr: kcm_spellchecking/settings-skipRunTogether
++            text: i18nc("@option:check", "Skip run-together words")
++            checked: kcm.settings.skipRunTogether
++            onToggled: kcm.settings.skipRunTogether = checked
++            KCM.SettingHighlighter {
++                highlight: kcm.settings.skipRunTogether !== kcm.settings.defaultSkipRunTogether
+             }
+         }
+ 
+-        Kirigami.FormGroup {
+-            title: i18nc("@title", "Ignored Words")
+-
+-            Kirigami.FormEntry {
+-                contentItem: QQC2.Button {
+-                    icon.name: "view-visible-off"
+-                    text: i18nc("@action:button", "Configure Ignored Words…")
+-                    onClicked: {
+-                        let dialog = ignoredWordsComponent.createObject(root) as Kirigami.Dialog;
+-                        dialog.open();
+-                    }
+-                }
+-                KCM.SettingHighlighter {
+-                    highlight: kcm.settings.currentIgnoreList.length !== kcm.settings.defaultIgnoreList.length || !kcm.settings.currentIgnoreList.every(value => kcm.settings.defaultIgnoreList.includes(value))
++        Kirigami.Separator {
++            Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18nc("@title:group", "Ignored Words")
++        }
+ 
+-                }
++        QQC2.Button {
++            // ksr: kcm_spellchecking/Configure-Ignored-Words
++            Kirigami.FormData.label: i18nc("@label", "Ignored Words:")
++            icon.name: "view-visible-off"
++            text: i18nc("@action:button", "Edit Ignored Words…")
++            onClicked: {
++                let dialog = ignoredWordsComponent.createObject(root) as Kirigami.Dialog;
++                dialog.open();
++            }
++            KCM.SettingHighlighter {
++                highlight: kcm.settings.currentIgnoreList.length !== kcm.settings.defaultIgnoreList.length || !kcm.settings.currentIgnoreList.every(value => kcm.settings.defaultIgnoreList.includes(value))
++            }
+ 
+-                Component {
+-                    id: ignoredWordsComponent
+-                    Kirigami.Dialog {
+-                        id: dialog
+-                        title: i18nc("@title:dialog", "Ignored Words")
+-
+-                        width: Kirigami.Units.gridUnit * 24
+-
+-                        onRejected: dialog.close()
+-
+-                        footerLeadingComponent: Kirigami.ActionTextField {
+-                            id: newWord
+-                            placeholderText: i18nc("@info:placeholder", "Enter a word to ignore")
+-                            Layout.fillWidth: true
+-                            rightActions: [
+-                                Kirigami.Action {
+-                                    enabled:  newWord.text.length > 0
+-                                    text: i18nc("@action:button", "Ignore this Word")
+-                                    tooltip: text
+-                                    icon.name: "list-add"
+-                                    onTriggered: {
+-                                        let words = kcm.settings.currentIgnoreList;
+-                                        words.push(newWord.text);
+-                                        kcm.settings.currentIgnoreList = words;
+-                                    }
++            Component {
++                id: ignoredWordsComponent
++                Kirigami.Dialog {
++                    id: dialog
++                    title: i18nc("@title:dialog", "Ignored Words")
++
++                    width: Kirigami.Units.gridUnit * 24
++
++                    onRejected: dialog.close()
++
++                    footerLeadingComponent: Kirigami.ActionTextField {
++                        id: newWord
++                        // ksr: kcm_spellchecking/Enter-a-word-to-ignore
++                        placeholderText: i18nc("@info:placeholder", "Enter a word to ignore")
++                        Layout.fillWidth: true
++                        rightActions: [
++                            Kirigami.Action {
++                                enabled:  newWord.text.length > 0
++                                text: i18nc("@action:button", "Ignore this Word")
++                                tooltip: text
++                                icon.name: "list-add"
++                                onTriggered: {
++                                    let words = kcm.settings.currentIgnoreList;
++                                    words.push(newWord.text);
++                                    kcm.settings.currentIgnoreList = words;
+                                 }
+-                            ]
+-                        }
++                            }
++                        ]
++                    }
+ 
+-                        ListView {
+-                            model: kcm.settings.currentIgnoreList
+-                            delegate: QQC2.ItemDelegate {
+-                                id: delegate
+-                                width: ListView.view.width
+-
+-                                required property string modelData
+-
+-                                contentItem: Kirigami.TitleSubtitleWithActions  {
+-                                    title: delegate.modelData
+-                                    actions: [
+-                                        Kirigami.Action {
+-                                            text: i18nc("@action:button", "Delete")
+-                                            tooltip: text
+-                                            icon.name: "list-remove"
+-                                            displayHint: Kirigami.DisplayHint.IconOnly
+-                                            onTriggered: {
+-                                                kcm.settings.currentIgnoreList = kcm.settings.currentIgnoreList.filter((value, _, _) => {
+-                                                    return value !== delegate.modelData;
+-                                                });
+-                                            }
++                    ListView {
++                        model: kcm.settings.currentIgnoreList
++                        delegate: QQC2.ItemDelegate {
++                            id: delegate
++                            width: ListView.view.width
++
++                            required property string modelData
++                            // ksr: kcm_spellchecking/IgnoredWord (Delete action below)
++
++                            contentItem: Kirigami.TitleSubtitleWithActions  {
++                                title: delegate.modelData
++                                actions: [
++                                    Kirigami.Action {
++                                        text: i18nc("@action:button", "Delete")
++                                        tooltip: text
++                                        icon.name: "list-remove"
++                                        displayHint: Kirigami.DisplayHint.IconOnly
++                                        onTriggered: {
++                                            kcm.settings.currentIgnoreList = kcm.settings.currentIgnoreList.filter((value, _, _) => {
++                                                return value !== delegate.modelData;
++                                            });
+                                         }
+-                                    ]
+-                                }
++                                    }
++                                ]
+                             }
+                         }
+                     }

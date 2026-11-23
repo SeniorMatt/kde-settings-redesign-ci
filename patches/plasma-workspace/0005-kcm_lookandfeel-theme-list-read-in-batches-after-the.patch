@@ -1,0 +1,871 @@
+From cf609d24cf62bdd1d49f432730c716f7d99b5e36 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 14:04:16 +0500
+Subject: [PATCH 05/24] kcm_lookandfeel: theme list read in batches after the
+ first frame, Apply dialog built on first use, Day/Night as a Form
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Page type: Gallery (main) + Form (Day/Night) + gallery sub-page (Light/Dark choice), docs/page-design.md. Config keys,
+KLookAndFeelManager calls, the apply flags and plasmashell D-Bus call are unchanged. NOT BUILT YET (owner stopped heavy
+work); checked statically only.
+
+Moved / renamed:
+- Day/Night page is now a Form: "Global themes:" (Light and Dark previews, each opens the chooser sub-page), a
+  "Switching" section with "Wait until the computer is idle before switching" (checkbox, no trailing colon, help in a
+  ContextualHelpButton) and an indented "Idle time before switching:" spin box (disabled, not hidden, while the checkbox
+  is off), and "Configure Day/Night Cycle…" as the link out at the end (was first). The intro sentence is wrapped at
+  gridUnit*20. (HIG-001/005/006, HIG-057: nouns for sections.)
+- Apply dialog: "The following will be applied by this Global Theme:" -> "This Global Theme will apply:". The detailed list
+  is one Kirigami.FormLayout with noun sections "Layout" and "Appearance" (was two twin FormLayouts with
+  "Layout settings:" / "Appearance settings:" labels). "Desktop layout" is now disabled, not hidden, while Plasma is
+  locked (before it read the checkbox's own always-true `enabled`, so the lock was never applied there).
+- Empty state: Kirigami.PlaceholderMessage "No Global Themes found" (was an empty grid); busy indicator only after 150 ms.
+- Thumbnails (page and chooser) load with Image.asynchronous.
+- Relabel table: inventory/relabel/kcm_lookandfeel.tsv (outer repo); old wording added to the page aliases in
+  ia/layout.json. All 31 inventory rows kept, `inventory_check.py --kcm kcm_lookandfeel --strict`: 0 lost.
+- Not changed: the toolbar switch "Switch to Dark Mode at Night" still swaps the gallery for the Day/Night page (apply()
+  skips the theme apply while it is on), Save Current Theme sub-page, Get New.
+
+Speed (cause found in code, kcms/lookandfeel/kcm.cpp):
+- The KCMLookandFeel constructor called loadModel() synchronously: listPackages("Plasma/LookAndFeel"), then
+  loadPackage() for every package a second time, filePath("defaults"/"layouts") on each, then
+  KLookAndFeelManager::packageContents() (reads the package's defaults/layouts config) for each row, all before the page
+  QML was created. Preview PNGs were decoded synchronously per card (Image without asynchronous), and the "Apply <name>?"
+  Kirigami.Dialog with its StackView and option pages was created with the page.
+- Now: the constructor only sets up the model; loadModel() runs from QTimer::singleShot(0) and fills the model in ~8 ms
+  batches (loadNextBatch), same order (sorted by name) and same filter; new property modelLoading drives the busy/empty
+  state; the selected theme's contents are refreshed on rowsInserted. The dialog sits in a Loader (active on first
+  click). Thumbnails are asynchronous.
+- After numbers: pending, manager will measure.
+
+Not built yet; uncertain: kcm.selectedContents = undefined (RESET) replaces the old `kcm.selectedItems = undefined`
+(a property that does not exist); the dialog is created inside Loader{Component{}} and still resolves `root`/ids by
+scope as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/lookandfeel/kcm.cpp                    |  91 +++++++-----
+ kcms/lookandfeel/kcm.h                      |  10 +-
+ kcms/lookandfeel/ui/DayNightLookAndFeel.qml | 134 +++++++++--------
+ kcms/lookandfeel/ui/LookAndFeelSelector.qml |   1 +
+ kcms/lookandfeel/ui/LookAndFeelSnapshot.qml |   3 +
+ kcms/lookandfeel/ui/MoreOptions.qml         | 123 +++++++++-------
+ kcms/lookandfeel/ui/SimpleOptions.qml       |   4 +-
+ kcms/lookandfeel/ui/StaticLookAndFeel.qml   | 153 ++++++++++++--------
+ kcms/lookandfeel/ui/main.qml                |   5 +
+ 9 files changed, 312 insertions(+), 212 deletions(-)
+
+diff --git a/kcms/lookandfeel/kcm.cpp b/kcms/lookandfeel/kcm.cpp
+index e285bf2..c3f9637 100644
+--- a/kcms/lookandfeel/kcm.cpp
++++ b/kcms/lookandfeel/kcm.cpp
+@@ -27,8 +27,10 @@
+ #include <QDBusPendingCall>
+ #include <QDBusPendingReply>
+ #include <QDebug>
++#include <QElapsedTimer>
+ #include <QFileInfo>
+ #include <QStandardPaths>
++#include <QTimer>
+ #include <algorithm>
+ 
+ using namespace Qt::StringLiterals;
+@@ -284,22 +286,30 @@ KCMLookandFeel::KCMLookandFeel(QObject *parent, const KPluginMetaData &data)
+     roles[VariantRole] = "variant";
+ 
+     m_model->setItemRoleNames(roles);
+-    loadModel();
+ 
+-    auto handleLookAndFeelPackageChanged = [this]() {
+-        // When the selected LNF package changes, update the available theme contents
++    // The model is filled after the constructor returns (see loadModel()), so the page is created and shown first.
++    // The available contents of the selected theme are refreshed whenever rows arrive.
++    auto updateThemeContents = [this]() {
+         const int index = pluginIndex(settings()->lookAndFeelPackage());
+         const auto packageContents = m_model->index(index, 0).data(ContentsRole).value<KLookAndFeelManager::Contents>();
+         if (m_themeContents != packageContents) {
+             m_themeContents = packageContents;
+             Q_EMIT themeContentsChanged();
++            // And also reset the user selection to the new available contents
++            resetSelectedContents();
+         }
++    };
++    connect(m_model, &QAbstractItemModel::rowsInserted, this, updateThemeContents);
++
++    auto handleLookAndFeelPackageChanged = [this, updateThemeContents]() {
++        // When the selected LNF package changes, update the available theme contents
++        updateThemeContents();
+         // And also reset the user selection to the new available contents
+         resetSelectedContents();
+     };
+ 
+     connect(settings(), &LookAndFeelSettings::lookAndFeelPackageChanged, handleLookAndFeelPackageChanged);
+-    handleLookAndFeelPackageChanged();
++    QTimer::singleShot(0, this, &KCMLookandFeel::loadModel);
+ 
+     QDBusMessage message = QDBusMessage::createMethodCall(QStringLiteral("org.kde.plasmashell"),
+                                                           QStringLiteral("/PlasmaShell"),
+@@ -400,29 +410,6 @@ int KCMLookandFeel::pluginIndex(const QString &pluginName) const
+     return -1;
+ }
+ 
+-QList<KPackage::Package> KCMLookandFeel::availablePackages(const QStringList &components)
+-{
+-    QList<KPackage::Package> packages;
+-
+-    const QList<KPluginMetaData> packagesMetaData = KPackage::PackageLoader::self()->listPackages(QStringLiteral("Plasma/LookAndFeel"));
+-
+-    for (const KPluginMetaData &metadata : packagesMetaData) {
+-        KPackage::Package pkg = KPackage::PackageLoader::self()->loadPackage(QStringLiteral("Plasma/LookAndFeel"), metadata.pluginId());
+-        if (components.isEmpty()) {
+-            packages << pkg;
+-        } else {
+-            for (const auto &component : components) {
+-                if (!pkg.filePath(component.toUtf8()).isEmpty()) {
+-                    packages << pkg;
+-                    break;
+-                }
+-            }
+-        }
+-    }
+-
+-    return packages;
+-}
+-
+ LookAndFeelSettings *KCMLookandFeel::settings() const
+ {
+     return m_data->settings();
+@@ -430,20 +417,58 @@ LookAndFeelSettings *KCMLookandFeel::settings() const
+ 
+ void KCMLookandFeel::loadModel()
+ {
++    // Before: the constructor loaded EVERY Plasma/LookAndFeel package twice (listPackages, then loadPackage for each),
++    // and read its defaults and layouts (packageContents) before the page could be created. Now the list of packages is
++    // read after the first frame and the model is filled in short batches, so the UI stays responsive and the cards
++    // appear as they are read.
+     m_model->clear();
+ 
+-    QList<KPackage::Package> pkgs = availablePackages({u"defaults"_s, u"layouts"_s});
++    m_pendingPackages = KPackage::PackageLoader::self()->listPackages(QStringLiteral("Plasma/LookAndFeel"));
++    m_pendingIndex = 0;
+ 
+-    // Sort case-insensitively
++    // Sort case-insensitively (same order as before: by the package name)
+     QCollator collator;
+     collator.setCaseSensitivity(Qt::CaseInsensitive);
+-    std::ranges::sort(pkgs, [&collator](const KPackage::Package &a, const KPackage::Package &b) {
+-        return collator.compare(a.metadata().name(), b.metadata().name()) < 0;
++    std::ranges::sort(m_pendingPackages, [&collator](const KPluginMetaData &a, const KPluginMetaData &b) {
++        return collator.compare(a.name(), b.name()) < 0;
+     });
+ 
+-    for (const KPackage::Package &pkg : pkgs) {
+-        addKPackageToModel(pkg);
++    if (!m_modelLoading) {
++        m_modelLoading = true;
++        Q_EMIT modelLoadingChanged();
++    }
++    loadNextBatch();
++}
++
++void KCMLookandFeel::loadNextBatch()
++{
++    QElapsedTimer timer;
++    timer.start();
++
++    // About 8 ms per batch, then yield to the event loop so frames and input are handled
++    while (m_pendingIndex < m_pendingPackages.size() && timer.elapsed() < 8) {
++        const KPluginMetaData &metadata = m_pendingPackages.at(m_pendingIndex++);
++        KPackage::Package pkg = KPackage::PackageLoader::self()->loadPackage(QStringLiteral("Plasma/LookAndFeel"), metadata.pluginId());
++        // List only packages which provide at least one of the components
++        if (!pkg.filePath("defaults").isEmpty() || !pkg.filePath("layouts").isEmpty()) {
++            addKPackageToModel(pkg);
++        }
++    }
++
++    if (m_pendingIndex < m_pendingPackages.size()) {
++        QTimer::singleShot(0, this, &KCMLookandFeel::loadNextBatch);
++        return;
+     }
++
++    m_pendingPackages.clear();
++    m_pendingIndex = 0;
++    m_modelLoading = false;
++    Q_EMIT modelLoadingChanged();
++}
++
++bool KCMLookandFeel::isModelLoading() const
++{
++    return m_modelLoading;
+ }
+ 
+ void KCMLookandFeel::addKPackageToModel(const KPackage::Package &pkg)
+diff --git a/kcms/lookandfeel/kcm.h b/kcms/lookandfeel/kcm.h
+index efc9f41..4d1ae08 100644
+--- a/kcms/lookandfeel/kcm.h
++++ b/kcms/lookandfeel/kcm.h
+@@ -129,6 +129,8 @@ class KCMLookandFeel : public KQuickManagedConfigModule
+                    selectedContentsChanged)
+ 
+     Q_PROPERTY(bool plasmaLocked READ isPlasmaLocked NOTIFY plasmaLockedChanged)
++    /** True while the theme list is still being read in the background (after the page is shown) */
++    Q_PROPERTY(bool modelLoading READ isModelLoading NOTIFY modelLoadingChanged)
+ 
+ public:
+     enum Roles {
+@@ -180,6 +182,7 @@ public:
+     void resetSelectedContents();
+ 
+     bool isPlasmaLocked() const;
++    bool isModelLoading() const;
+ 
+ public Q_SLOTS:
+     void defaults() override;
+@@ -191,11 +194,11 @@ Q_SIGNALS:
+     void themeContentsChanged();
+     void selectedContentsChanged();
+     void plasmaLockedChanged();
++    void modelLoadingChanged();
+ 
+ private:
+-    // List only packages which provide at least one of the components
+-    QList<KPackage::Package> availablePackages(const QStringList &components);
+     void loadModel();
++    void loadNextBatch();
+     int pluginIndex(const QString &pluginName) const;
+ 
+     LookAndFeelData *const m_data;
+@@ -206,4 +209,7 @@ private:
+ 
+     QStandardItemModel *m_model;
+     bool m_plasmaLocked = false;
++    bool m_modelLoading = false;
++    QList<KPluginMetaData> m_pendingPackages;
++    qsizetype m_pendingIndex = 0;
+ };
+diff --git a/kcms/lookandfeel/ui/DayNightLookAndFeel.qml b/kcms/lookandfeel/ui/DayNightLookAndFeel.qml
+index 6fc0c96..7d63421 100644
+--- a/kcms/lookandfeel/ui/DayNightLookAndFeel.qml
++++ b/kcms/lookandfeel/ui/DayNightLookAndFeel.qml
+@@ -36,65 +36,68 @@ Rectangle {
+         packageId: kcm.settings.defaultDarkLookAndFeel
+     }
+ 
+-    ColumnLayout {
++    // Form page (docs/page-design.md): which theme to use at day and at night, then when to switch.
++    // Choosing a theme opens the gallery sub-page (LookAndFeelSelector.qml); the cycle times live in kcm_nighttime.
++    QtControls.ScrollView {
+         anchors.fill: parent
+-        anchors.margins: 6
+-        spacing: Kirigami.Units.smallSpacing
+-
+-        QtControls.Label {
+-            Layout.fillWidth: true
+-            text: i18nc("@info", "The chosen light Global Theme will be used during the day, and the dark one will be used at night.")
+-            textFormat: Text.PlainText
+-            wrapMode: Text.WordWrap
+-            horizontalAlignment: Text.AlignHCenter
+-        }
+-
+-        QtControls.Button {
+-            Layout.alignment: Qt.AlignHCenter
+-            enabled: KConfig.KAuthorized.authorizeControlModule("kcm_nighttime")
+-            text: i18nc("@action:button Configure day-night cycle times", "Configure Day/Night Cycle…")
+-            icon.name: "configure"
+-            onClicked: KCM.KCMLauncher.open("kcm_nighttime")
+-        }
+-
+-        Row {
+-            Layout.alignment: Qt.AlignHCenter
+-            Layout.topMargin: Kirigami.Units.largeSpacing
+-            spacing: Kirigami.Units.largeSpacing
++        contentWidth: availableWidth
+ 
+-            LookAndFeelBox {
+-                id: lightLookAndFeelRadioButton
+-                preview: lightLookAndFeelInformation.preview
+-                text: i18nc("@option:radio Light global theme", "Light")
++        Kirigami.FormLayout {
++            width: parent.width
+ 
+-                onClicked: {
+-                    kcm.push("LookAndFeelSelector.qml", {
+-                        "variant": Private.LookAndFeel.Variant.Light,
+-                    });
+-                }
++            QtControls.Label {
++                Layout.fillWidth: true
++                Layout.maximumWidth: Kirigami.Units.gridUnit * 20
++                text: i18nc("@info", "The chosen light Global Theme will be used during the day, and the dark one will be used at night.")
++                textFormat: Text.PlainText
++                wrapMode: Text.WordWrap
+             }
+ 
+-            LookAndFeelBox {
+-                id: darkLookAndFeelRadioButton
+-                preview: darkLookAndFeelInformation.preview
+-                text: i18nc("@option:radio Dark global theme", "Dark")
++            Row {
++                Kirigami.FormData.label: i18nc("@label", "Global themes:")
++                spacing: Kirigami.Units.largeSpacing
++
++                LookAndFeelBox {
++                    // ksr: kcm_lookandfeel/settings-defaultLightLookAndFeel
++                    id: lightLookAndFeelRadioButton
++                    preview: lightLookAndFeelInformation.preview
++                    text: i18nc("@option:radio Light global theme", "Light")
++                    Accessible.name: text
++
++                    onClicked: {
++                        kcm.push("LookAndFeelSelector.qml", {
++                            "variant": Private.LookAndFeel.Variant.Light,
++                        });
++                    }
++                }
+ 
+-                onClicked: {
+-                    kcm.push("LookAndFeelSelector.qml", {
+-                        "variant": Private.LookAndFeel.Variant.Dark,
+-                    });
++                LookAndFeelBox {
++                    // ksr: kcm_lookandfeel/defaultDarkLookAndFeel
++                    id: darkLookAndFeelRadioButton
++                    preview: darkLookAndFeelInformation.preview
++                    text: i18nc("@option:radio Dark global theme", "Dark")
++                    Accessible.name: text
++
++                    onClicked: {
++                        kcm.push("LookAndFeelSelector.qml", {
++                            "variant": Private.LookAndFeel.Variant.Dark,
++                        });
++                    }
+                 }
+             }
+-        }
+ 
+-        Kirigami.FormLayout {
+-            width: parent.width
++            Kirigami.Separator {
++                Kirigami.FormData.isSection: true
++                Kirigami.FormData.label: i18nc("@title:group", "Switching")
++            }
+ 
+             RowLayout {
++                // ksr: kcm_lookandfeel/automaticLookAndFeelOnIdle
+                 spacing: Kirigami.Units.smallSpacing
+ 
+                 QtControls.CheckBox {
+-                    text: i18nc("@option:check", "Wait until idleness before switching:")
++                    text: i18nc("@option:check", "Wait until the computer is idle before switching")
++                    Accessible.name: text
+                     checked: kcm.settings.automaticLookAndFeelOnIdle
+                     onClicked: kcm.settings.automaticLookAndFeelOnIdle = checked;
+ 
+@@ -104,28 +107,35 @@ Rectangle {
+                     }
+                 }
+ 
+-                QtControls.SpinBox {
+-                    from: 1
+-                    value: kcm.settings.automaticLookAndFeelIdleInterval
+-                    textFromValue: (value, locale) => i18ncp("@item:valuesuffix idle interval", "%1 second", "%1 seconds", value)
+-                    valueFromText: (text, locale) => parseInt(text)
+-                    onValueModified: kcm.settings.automaticLookAndFeelIdleInterval = value;
+-
+-                    KCM.SettingStateBinding {
+-                        configObject: kcm.settings
+-                        settingName: "automaticLookAndFeelIdleInterval"
+-                        extraEnabledConditions: kcm.settings.automaticLookAndFeelOnIdle
+-                    }
+-                }
+-
+                 Kirigami.ContextualHelpButton {
+                     toolTipText: i18nc("@info:tooltip", "Minimizes interruptions when actively using the computer.")
+                 }
+             }
+-        }
+ 
+-        Item {
+-            Layout.fillHeight: true
++            QtControls.SpinBox {
++                // ksr: kcm_lookandfeel/automaticLookAndFeelIdleInterval
++                Kirigami.FormData.label: i18nc("@label:spinbox", "Idle time before switching:")
++                Layout.leftMargin: Kirigami.Units.gridUnit
++                from: 1
++                value: kcm.settings.automaticLookAndFeelIdleInterval
++                textFromValue: (value, locale) => i18ncp("@item:valuesuffix idle interval", "%1 second", "%1 seconds", value)
++                valueFromText: (text, locale) => parseInt(text)
++                onValueModified: kcm.settings.automaticLookAndFeelIdleInterval = value;
++
++                KCM.SettingStateBinding {
++                    configObject: kcm.settings
++                    settingName: "automaticLookAndFeelIdleInterval"
++                    extraEnabledConditions: kcm.settings.automaticLookAndFeelOnIdle
++                }
++            }
++
++            QtControls.Button {
++                // ksr: kcm_lookandfeel/Configure-Day-Night-Cycle
++                enabled: KConfig.KAuthorized.authorizeControlModule("kcm_nighttime")
++                text: i18nc("@action:button Configure day-night cycle times", "Configure Day/Night Cycle…")
++                icon.name: "configure"
++                onClicked: KCM.KCMLauncher.open("kcm_nighttime")
++            }
+         }
+     }
+ }
+diff --git a/kcms/lookandfeel/ui/LookAndFeelSelector.qml b/kcms/lookandfeel/ui/LookAndFeelSelector.qml
+index f27c708..a34f859 100644
+--- a/kcms/lookandfeel/ui/LookAndFeelSelector.qml
++++ b/kcms/lookandfeel/ui/LookAndFeelSelector.qml
+@@ -39,6 +39,7 @@ KCM.GridViewKCM {
+         thumbnail: Image {
+             anchors.fill: parent
+             source: model.screenshot || ""
++            asynchronous: true
+             sourceSize: Qt.size(delegate.GridView.view.cellWidth * Screen.devicePixelRatio,
+                                 delegate.GridView.view.cellHeight * Screen.devicePixelRatio)
+         }
+diff --git a/kcms/lookandfeel/ui/LookAndFeelSnapshot.qml b/kcms/lookandfeel/ui/LookAndFeelSnapshot.qml
+index 3e88f47..6b2b087 100644
+--- a/kcms/lookandfeel/ui/LookAndFeelSnapshot.qml
++++ b/kcms/lookandfeel/ui/LookAndFeelSnapshot.qml
+@@ -66,6 +66,7 @@ KCM.SimpleKCM {
+                 Kirigami.PlaceholderMessage {
+                     anchors.fill: parent
+                     visible: previewImage.status === Image.Null || previewImage.status === Image.Error
++                    // ksr: kcm_lookandfeel/AddPreviewImage
+                     text: i18nc("@info:placeholder", "Add a preview image…")
+                 }
+             }
+@@ -76,6 +77,7 @@ KCM.SimpleKCM {
+         QtControls.Button {
+             Layout.alignment: Qt.AlignHCenter
+             Layout.bottomMargin: Kirigami.Units.largeSpacing
++            // ksr: kcm_lookandfeel/Take-a-screenshot
+             text: i18nc("@action:button Configure day-night cycle times", "Take a screenshot…")
+             onClicked: screenshotMaker.take()
+         }
+@@ -88,6 +90,7 @@ KCM.SimpleKCM {
+ 
+                 QtControls.TextField {
+                     id: nameTextField
++                    // ksr: kcm_lookandfeel/Type-in-name
+                     focus: true
+                     placeholderText: i18nc("@info:placeholder", "Type in name…")
+                     validator: Private.LookAndFeelNameValidator {
+diff --git a/kcms/lookandfeel/ui/MoreOptions.qml b/kcms/lookandfeel/ui/MoreOptions.qml
+index 6fc87f9..5d7f676 100644
+--- a/kcms/lookandfeel/ui/MoreOptions.qml
++++ b/kcms/lookandfeel/ui/MoreOptions.qml
+@@ -12,36 +12,39 @@ import QtQuick.Controls as QtControls
+ import org.kde.kirigami as Kirigami
+ import org.kde.private.kcms.lookandfeel as Private
+ 
+-ColumnLayout {
+-    Kirigami.FormLayout {
+-        id: layoutForm
+-        twinFormLayouts: root.hasAppearance ? appearanceForm : null
++// The detailed "what to apply" list, shown inside the Apply dialog: one Form, two noun-titled sections (Layout,
++// Appearance). Only the parts the theme actually provides are shown; flags and bindings are unchanged.
++Kirigami.FormLayout {
++    // ---- Layout
++    Kirigami.Separator {
++        Kirigami.FormData.isSection: true
++        Kirigami.FormData.label: i18nc("@title:group", "Layout")
+         visible: root.hasLayout
+-        Layout.leftMargin: Kirigami.Units.largeSpacing
+-        Layout.rightMargin: Kirigami.Units.largeSpacing
++    }
+ 
+-        ColumnLayout {
+-            Kirigami.FormData.label: i18n("Layout settings:")
+-            Repeater {
+-                model: [
+-                    { text: i18n("Desktop layout"),
+-                      flag: Private.LookandFeelManager.DesktopLayout
+-                            | Private.LookandFeelManager.WindowPlacement,
+-                      enabled: !kcm.plasmaLocked
+-                    },
+-                    { text: i18n("Titlebar Buttons layout"), flag: Private.LookandFeelManager.TitlebarLayout, enabled: true },
+-                ]
+-                delegate: QtControls.CheckBox {
+-                    required property var modelData
+-                    text: modelData.text
+-                    visible: enabled && (kcm.themeContents & modelData.flag)
+-                    checked: kcm.selectedContents & modelData.flag
+-                    onToggled: {
+-                        kcm.selectedContents ^= modelData.flag
+-                        if (modelData.flag | Private.LookandFeelManager.DesktopLayout) {
+-                            resetLayoutWarning.visible = checked;
+-                        }
+-                    }
++    Repeater {
++        model: [
++            // ksr: kcm_lookandfeel/Apply-DesktopLayout
++            { text: i18n("Desktop layout"),
++              flag: Private.LookandFeelManager.DesktopLayout
++                    | Private.LookandFeelManager.WindowPlacement,
++              enabled: !kcm.plasmaLocked
++            },
++            // ksr: kcm_lookandfeel/Apply-TitlebarLayout
++            { text: i18n("Titlebar Buttons layout"), flag: Private.LookandFeelManager.TitlebarLayout, enabled: true },
++        ]
++        delegate: QtControls.CheckBox {
++            required property var modelData
++            text: modelData.text
++            visible: root.hasLayout && (kcm.themeContents & modelData.flag)
++            // Disabled, not hidden, while Plasma is locked (before, this read the checkbox's own always-true "enabled")
++            enabled: modelData.enabled
++            checked: kcm.selectedContents & modelData.flag
++            Accessible.name: text
++            onToggled: {
++                kcm.selectedContents ^= modelData.flag
++                if (modelData.flag | Private.LookandFeelManager.DesktopLayout) {
++                    resetLayoutWarning.visible = checked;
+                 }
+             }
+         }
+@@ -50,41 +53,49 @@ ColumnLayout {
+     Kirigami.InlineMessage {
+         id: resetLayoutWarning
+         Layout.fillWidth: true
++        Layout.maximumWidth: Kirigami.Units.gridUnit * 20
+         visible: false
+         type: Kirigami.MessageType.Warning
+         text: i18n("Applying a Desktop layout will delete the current set of desktops, panels, docks, and widgets, replacing them with what the theme specifies.")
+     }
+ 
+-    Kirigami.FormLayout {
+-        id: appearanceForm
+-        twinFormLayouts: root.hasLayout ? layoutForm : null
++    // ---- Appearance
++    Kirigami.Separator {
++        Kirigami.FormData.isSection: true
++        Kirigami.FormData.label: i18nc("@title:group", "Appearance")
+         visible: root.hasAppearance
+-        Layout.leftMargin: Kirigami.Units.largeSpacing
+-        Layout.rightMargin: Kirigami.Units.largeSpacing
++    }
+ 
+-        ColumnLayout {
+-            Kirigami.FormData.label: i18n("Appearance settings:")
+-            Repeater {
+-                model: [
+-                    { text: i18n("Colors"), flag: Private.LookandFeelManager.Colors },
+-                    { text: i18n("Application Style"), flag: Private.LookandFeelManager.WidgetStyle },
+-                    { text: i18n("Window Decoration Style"), flag: Private.LookandFeelManager.WindowDecoration },
+-                    { text: i18n("Window Decoration Size"), flag: Private.LookandFeelManager.BorderSize },
+-                    { text: i18n("Icons"), flag: Private.LookandFeelManager.Icons },
+-                    { text: i18n("Plasma Style"), flag: Private.LookandFeelManager.PlasmaTheme },
+-                    { text: i18n("Pointers"), flag: Private.LookandFeelManager.Cursors },
+-                    { text: i18n("Fonts"), flag: Private.LookandFeelManager.Fonts },
+-                    { text: i18n("Task Switcher"), flag: Private.LookandFeelManager.WindowSwitcher },
+-                    { text: i18n("Splash Screen"), flag: Private.LookandFeelManager.SplashScreen },
+-                ]
+-                delegate: QtControls.CheckBox {
+-                    required property var modelData
+-                    text: modelData.text
+-                    visible: kcm.themeContents & modelData.flag
+-                    checked: kcm.selectedContents & modelData.flag
+-                    onToggled: kcm.selectedContents ^= modelData.flag
+-                }
+-            }
++    Repeater {
++        model: [
++            // ksr: kcm_lookandfeel/Apply-Colors
++            { text: i18n("Colors"), flag: Private.LookandFeelManager.Colors },
++            // ksr: kcm_lookandfeel/Apply-WidgetStyle
++            { text: i18n("Application Style"), flag: Private.LookandFeelManager.WidgetStyle },
++            // ksr: kcm_lookandfeel/Apply-WindowDecoration
++            { text: i18n("Window Decoration Style"), flag: Private.LookandFeelManager.WindowDecoration },
++            // ksr: kcm_lookandfeel/Apply-BorderSize
++            { text: i18n("Window Decoration Size"), flag: Private.LookandFeelManager.BorderSize },
++            // ksr: kcm_lookandfeel/Apply-Icons
++            { text: i18n("Icons"), flag: Private.LookandFeelManager.Icons },
++            // ksr: kcm_lookandfeel/Apply-PlasmaTheme
++            { text: i18n("Plasma Style"), flag: Private.LookandFeelManager.PlasmaTheme },
++            // ksr: kcm_lookandfeel/Apply-Cursors
++            { text: i18n("Pointers"), flag: Private.LookandFeelManager.Cursors },
++            // ksr: kcm_lookandfeel/Apply-Fonts
++            { text: i18n("Fonts"), flag: Private.LookandFeelManager.Fonts },
++            // ksr: kcm_lookandfeel/Apply-WindowSwitcher
++            { text: i18n("Task Switcher"), flag: Private.LookandFeelManager.WindowSwitcher },
++            // ksr: kcm_lookandfeel/Apply-SplashScreen
++            { text: i18n("Splash Screen"), flag: Private.LookandFeelManager.SplashScreen },
++        ]
++        delegate: QtControls.CheckBox {
++            required property var modelData
++            text: modelData.text
++            visible: root.hasAppearance && (kcm.themeContents & modelData.flag)
++            checked: kcm.selectedContents & modelData.flag
++            Accessible.name: text
++            onToggled: kcm.selectedContents ^= modelData.flag
+         }
+     }
+ }
+diff --git a/kcms/lookandfeel/ui/SimpleOptions.qml b/kcms/lookandfeel/ui/SimpleOptions.qml
+index 692c0fc..877be19 100644
+--- a/kcms/lookandfeel/ui/SimpleOptions.qml
++++ b/kcms/lookandfeel/ui/SimpleOptions.qml
+@@ -16,7 +16,7 @@ ColumnLayout {
+ 
+     Kirigami.Heading {
+         Layout.fillWidth: true
+-        text: i18n("The following will be applied by this Global Theme:")
++        text: i18n("This Global Theme will apply:")
+         textFormat: Text.PlainText
+         level: 2
+         wrapMode: Text.WordWrap
+@@ -29,6 +29,7 @@ ColumnLayout {
+         Layout.rightMargin: Kirigami.Units.largeSpacing
+ 
+         QtControls.CheckBox {
++            // ksr: kcm_lookandfeel/selectedContents
+             visible: root.hasAppearance && root.hasLayout
+             text: i18n("Appearance settings")
+             checked: kcm.selectedContents & Private.LookandFeelManager.AppearanceSettings
+@@ -44,6 +45,7 @@ ColumnLayout {
+ 
+         QtControls.CheckBox {
+             id: resetLayoutCheckbox
++            // ksr: kcm_lookandfeel/plasmaLocked
+             visible: !kcm.plasmaLocked && root.hasAppearance && root.hasLayout
+             text: i18n("Desktop and window layout")
+             checked: kcm.selectedContents & Private.LookandFeelManager.LayoutSettings
+diff --git a/kcms/lookandfeel/ui/StaticLookAndFeel.qml b/kcms/lookandfeel/ui/StaticLookAndFeel.qml
+index 6e0c182..8c295fd 100644
+--- a/kcms/lookandfeel/ui/StaticLookAndFeel.qml
++++ b/kcms/lookandfeel/ui/StaticLookAndFeel.qml
+@@ -23,16 +23,13 @@ KCM.GridView {
+ 
+     KCM.ConfigModule.buttons: KCM.ConfigModule.Default | KCM.ConfigModule.Help
+ 
+-    function showConfirmation() { //Show the Kirigami Sheet
+-        if (stackSwitcher.depth !== 1) {
+-            stackSwitcher.pop();
+-        }
+-        resetCheckboxes()
+-        globalThemeConfirmSheet.open()
+-        globalThemeConfirmSheet.standardButton(Kirigami.Dialog.Apply).forceActiveFocus()
++    // The "Apply <name>?" dialog is only created the first time a theme is chosen (see confirmLoader)
++    function showConfirmation() {
++        confirmLoader.active = true;
++        confirmLoader.item.present();
+     }
+-    function resetCheckboxes() { //This call is used whenever you switch pages (More/Less Options) or trigger the Kirigami Sheet
+-        kcm.selectedItems = undefined //triggers RESET
++    function resetCheckboxes() { //This call is used whenever you switch pages (More/Less Options) or trigger the dialog
++        kcm.selectedContents = undefined //triggers RESET
+     }
+ 
+     Connections {
+@@ -57,12 +54,14 @@ KCM.GridView {
+         thumbnail: Image {
+             anchors.fill: parent
+             source: model.screenshot || ""
++            asynchronous: true
+             sourceSize: Qt.size(delegate.GridView.view.cellWidth * Screen.devicePixelRatio,
+                                 delegate.GridView.view.cellHeight * Screen.devicePixelRatio)
+         }
+         actions: [
+             Kirigami.Action {
+                 visible: model.fullScreenPreview !== ""
++                // ksr: kcm_lookandfeel/PreviewTheme
+                 icon.name: "view-preview"
+                 tooltip: i18nc("@info:tooltip", "Preview Theme")
+                 onTriggered: {
+@@ -70,6 +69,7 @@ KCM.GridView {
+                 }
+             },
+             Kirigami.Action {
++                // ksr: kcm_lookandfeel/RemoveTheme
+                 icon.name: "edit-delete"
+                 tooltip: if (enabled) {
+                     return i18nc("@info:tooltip", "Remove theme");
+@@ -106,61 +106,98 @@ KCM.GridView {
+         packageId: kcm.settings.lookAndFeelPackage
+     }
+ 
+-    Kirigami.Dialog {
+-        id: globalThemeConfirmSheet
+-        title: i18nc("Confirmation question about applying the Global Theme - %1 is the Global Theme's name",
+-                     "Apply %1?", selectedLookAndFeelInformation.name)
+-        standardButtons: Kirigami.Dialog.Apply | Kirigami.Dialog.Cancel
+-        padding: Kirigami.Units.largeSpacing
+-        clip: true
+-
+-        onApplied: {
+-            kcm.apply();
+-            globalThemeConfirmSheet.close()
+-            view.forceActiveFocus() //Prevent further button presses via keyboard
+-        }
+-        onRejected: {
+-            globalThemeConfirmSheet.close()
+-            view.forceActiveFocus()
+-        }
++    // Built on first use: the dialog, its two option pages and their bindings used to be created with the page
++    Loader {
++        id: confirmLoader
++        active: false
++        sourceComponent: Component {
++            Kirigami.Dialog {
++                id: globalThemeConfirmSheet
++                title: i18nc("Confirmation question about applying the Global Theme - %1 is the Global Theme's name",
++                             "Apply %1?", selectedLookAndFeelInformation.name)
++                standardButtons: Kirigami.Dialog.Apply | Kirigami.Dialog.Cancel
++                padding: Kirigami.Units.largeSpacing
++                clip: true
++
++                function present() {
++                    if (stackSwitcher.depth !== 1) {
++                        stackSwitcher.pop();
++                    }
++                    root.resetCheckboxes()
++                    open()
++                    standardButton(Kirigami.Dialog.Apply).forceActiveFocus()
++                }
+ 
+-        QtControls.StackView {
+-            id: stackSwitcher
+-            initialItem: simpleOptions
+-            implicitHeight: currentItem.implicitHeight
+-            implicitWidth: Kirigami.Units.gridUnit * 30
+-            Component {
+-                id: simpleOptions
+-                SimpleOptions {}
+-            }
+-            Component {
+-                id: moreOptions
+-                MoreOptions {}
+-            }
+-        }
++                onApplied: {
++                    kcm.apply();
++                    globalThemeConfirmSheet.close()
++                    root.view.forceActiveFocus() //Prevent further button presses via keyboard
++                }
++                onRejected: {
++                    globalThemeConfirmSheet.close()
++                    root.view.forceActiveFocus()
++                }
+ 
+-        footerLeadingComponent: QtControls.Button {
+-            text: stackSwitcher.depth === 1 ? i18n("Choose what to apply…") : i18n("Show fewer options…")
+-            icon.name: stackSwitcher.depth === 1 ? "settings-configure" : "go-previous"
+-            QtControls.DialogButtonBox.buttonRole: QtControls.DialogButtonBox.HelpRole
+-            enabled: hasAppearance
+-            onClicked: {
+-                if (stackSwitcher.depth === 1) {
+-                    stackSwitcher.push(moreOptions);
+-                } else {
+-                    stackSwitcher.pop();
++                QtControls.StackView {
++                    id: stackSwitcher
++                    initialItem: simpleOptions
++                    implicitHeight: currentItem.implicitHeight
++                    implicitWidth: Kirigami.Units.gridUnit * 30
++                    Component {
++                        id: simpleOptions
++                        SimpleOptions {}
++                    }
++                    Component {
++                        id: moreOptions
++                        MoreOptions {}
++                    }
++                }
++
++                footerLeadingComponent: QtControls.Button {
++                    // ksr: kcm_lookandfeel/Choose-what-to-apply
++                    text: stackSwitcher.depth === 1 ? i18n("Choose what to apply…") : i18n("Show fewer options…")
++                    icon.name: stackSwitcher.depth === 1 ? "settings-configure" : "go-previous"
++                    QtControls.DialogButtonBox.buttonRole: QtControls.DialogButtonBox.HelpRole
++                    enabled: root.hasAppearance
++                    onClicked: {
++                        if (stackSwitcher.depth === 1) {
++                            stackSwitcher.push(moreOptions);
++                        } else {
++                            stackSwitcher.pop();
++                        }
++                        root.resetCheckboxes() //Force a refresh to reset button states
++                    }
++                }
++
++                Component.onCompleted: {
++                    standardButton(Kirigami.Dialog.Apply).enabled = Qt.binding(() => {
++                        return kcm.selectedContents & (Private.LookandFeelManager.AppearanceSettings
++                                                     | Private.LookandFeelManager.LayoutSettings
++                                                     | Private.LookandFeelManager.DesktopLayout);
++                    });
+                 }
+-                resetCheckboxes() //Force a refresh to reset button states
+             }
+         }
++    }
+ 
+-        Component.onCompleted: {
+-            standardButton(Kirigami.Dialog.Apply).enabled = Qt.binding(() => {
+-                return kcm.selectedContents & (Private.LookandFeelManager.AppearanceSettings
+-                                             | Private.LookandFeelManager.LayoutSettings
+-                                             | Private.LookandFeelManager.DesktopLayout);
+-            });
+-        }
++    // Shown only if reading the theme list takes longer than 150 ms; empty only when no theme was found
++    Timer {
++        id: busyDelay
++        interval: 150
++        running: kcm.modelLoading
++    }
++    QtControls.BusyIndicator {
++        anchors.centerIn: parent
++        running: kcm.modelLoading && !busyDelay.running
++        visible: running
++    }
++    Kirigami.PlaceholderMessage {
++        anchors.centerIn: parent
++        width: parent.width - Kirigami.Units.gridUnit * 4
++        visible: !kcm.modelLoading && root.view.count === 0
++        icon.name: "preferences-desktop-theme-global"
++        text: i18nc("@info:placeholder", "No Global Themes found")
++        explanation: i18nc("@info:placeholder", "Use Get New… in the toolbar to download some.")
+     }
+ 
+     PreviewWindow {
+diff --git a/kcms/lookandfeel/ui/main.qml b/kcms/lookandfeel/ui/main.qml
+index 7c7eeaf..dc93995 100644
+--- a/kcms/lookandfeel/ui/main.qml
++++ b/kcms/lookandfeel/ui/main.qml
+@@ -12,6 +12,8 @@ import org.kde.newstuff as NewStuff
+ import org.kde.kcmutils as KCM
+ import org.kde.private.kcms.lookandfeel as Private
+ 
++// Gallery page (StaticLookAndFeel.qml: the theme grid, "Apply <name>?" dialog built on first use) or, while "Switch to
++// Dark Mode at Night" is on, the Day/Night form page. Toolbar: switch, Save Current Theme…, Get New… (top right).
+ KCM.AbstractKCM {
+     id: root
+     framedView: false
+@@ -19,6 +21,7 @@ KCM.AbstractKCM {
+     actions: [
+         Kirigami.Action {
+             id: automaticModeAction
++            // ksr: kcm_lookandfeel/automaticLookAndFeel
+             text: i18nc("@option:check", "Switch to Dark Mode at Night")
+             checkable: true
+             checked: kcm.settings.automaticLookAndFeel
+@@ -36,11 +39,13 @@ KCM.AbstractKCM {
+             }
+         },
+         Kirigami.Action {
++            // ksr: kcm_lookandfeel/SaveCurrentTheme
+             icon.name: "document-save"
+             text: i18nc("@action:button", "Save Current Theme…")
+             onTriggered: kcm.push("LookAndFeelSnapshot.qml")
+         },
+         NewStuff.Action {
++            // ksr: kcm_lookandfeel/GetNew
+             configFile: "lookandfeel.knsrc"
+             text: i18nc("@action:intoolbar", "Get New…")
+             onEntryEvent: function (entry, event) {

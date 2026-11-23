@@ -1,0 +1,397 @@
+From 8ed27cbd035c4adf023f2488776d4236ecca52ab Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 14:32:23 +0500
+Subject: [PATCH] =?UTF-8?q?kcm=5Ffiletypes:=20MIME=20type=20tree=20filled?=
+ =?UTF-8?q?=20in=20batches=20after=20the=20first=20paint,=20"=E2=80=A6"=20?=
+ =?UTF-8?q?ellipsis,=20frameless=20section=20titles?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Page type: QtWidgets list + details, kept in QtWidgets (docs/page-design.md §8; a QML port is not small). Search field
+stays first, the Known Types tree below, details on the right. Config, mimeapps/xml writing and save() are unchanged.
+NOT BUILT YET (owner stopped heavy work); checked statically only.
+
+Changed:
+- Button/placeholder labels use the "…" character: "Add…" (types, patterns, applications), "Edit…", "Apply To…", search
+  placeholder "Search for file type or filename pattern…" (HIG: ellipsis on buttons that open something).
+- The two QGroupBox sections ("Filename Patterns", "Application Preference Order") are flat (title without frame), as §8.
+  Uncertain: how Breeze draws a flat QGroupBox.
+- "Reading file types…" label under the tree, only after 150 ms.
+- Relabel table inventory/relabel/kcm_filetypes.tsv (outer repo); the aliases "File Associations" etc. are already in
+  ia/layout.json. 20 inventory rows kept (ksr markers); inventory_check --kcm kcm_filetypes --strict: 0 lost, full run 0 lost.
+
+Speed (cause found in code, keditfiletype/filetypesview.cpp readFileTypes via load()): load() disabled the widget and built
+the whole tree synchronously: QMimeDatabase::allMimeTypes() (about a thousand types), sort, and per type a TypesListItem
+whose MimeTypeData constructor runs initFromQMimeType(): QStandardPaths::locateAll for the type's XML file, opening and
+parsing it (mimetypedata.cpp:69-125). The KSycoca/KApplicationTrader lookup per type is already lazy (m_bFullInit) and was
+left. Now readFileTypes() returns at once; QTimer::singleShot(0) reads allMimeTypes and readNextBatch() creates the items
+in ~10 ms batches (same sorted order), with a generation counter against a second load(). The search field works while it
+fills: new rows honour the current filter (group items start hidden when a filter is set and show when a child matches).
+After numbers: pending, manager will measure.
+
+Not built yet; uncertain: QMimeType needs <QMimeType> in filetypesview.h (added); the page is enabled during the fill, so a
+very early click on Add or Apply sees only the types read so far (new types are added to m_majorMap as before).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ keditfiletype/filetypedetails.cpp    |  9 ++-
+ keditfiletype/filetypesview.cpp      | 92 +++++++++++++++++++++++-----
+ keditfiletype/filetypesview.h        |  7 +++
+ keditfiletype/kservicelistwidget.cpp | 14 ++++-
+ keditfiletype/newtypedlg.cpp         |  2 +
+ 5 files changed, 103 insertions(+), 21 deletions(-)
+
+diff --git a/keditfiletype/filetypedetails.cpp b/keditfiletype/filetypedetails.cpp
+index b381447..70d0370 100644
+--- a/keditfiletype/filetypedetails.cpp
++++ b/keditfiletype/filetypedetails.cpp
+@@ -32,6 +32,7 @@ FileTypeDetails::FileTypeDetails(QWidget *parent)
+     QVBoxLayout *topLayout = new QVBoxLayout(this);
+     topLayout->setContentsMargins(0, 0, 0, 0);
+ 
++    // ksr: kcm_filetypes/MimeLabel
+     m_mimeTypeLabel = new QLabel(this);
+     m_mimeTypeLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+     topLayout->addWidget(m_mimeTypeLabel, 0, Qt::AlignCenter);
+@@ -41,6 +42,7 @@ FileTypeDetails::FileTypeDetails(QWidget *parent)
+     QHBoxLayout *hBox = new QHBoxLayout();
+     topLayout->addLayout(hBox);
+ 
++    // ksr: kcm_filetypes/Icon
+     iconButton = new KIconButton(this);
+     iconButton->setIconType(KIconLoader::Desktop, KIconLoader::MimeType);
+     connect(iconButton, &KIconButton::iconChanged, this, &FileTypeDetails::updateIcon);
+@@ -51,7 +53,9 @@ FileTypeDetails::FileTypeDetails(QWidget *parent)
+     iconLabel = nullptr;
+     hBox->addWidget(iconButton);
+ 
++    // ksr: kcm_filetypes/Patterns
+     QGroupBox *gb = new QGroupBox(i18n("Filename Patterns"), this);
++    gb->setFlat(true); // section title without a frame (docs/page-design.md §8)
+     hBox->addWidget(gb);
+ 
+     hBox = new QHBoxLayout(gb);
+@@ -71,13 +75,15 @@ FileTypeDetails::FileTypeDetails(QWidget *parent)
+     QVBoxLayout *vbox = new QVBoxLayout();
+     hBox->addLayout(vbox);
+ 
+-    addExtButton = new QPushButton(i18n("Add..."), gb);
++    // ksr: kcm_filetypes/PatternAdd
++    addExtButton = new QPushButton(i18n("Add…"), gb);
+     addExtButton->setIcon(QIcon::fromTheme(QStringLiteral("list-add")));
+     addExtButton->setEnabled(false);
+     connect(addExtButton, &QAbstractButton::clicked, this, &FileTypeDetails::addExtension);
+     vbox->addWidget(addExtButton);
+     addExtButton->setWhatsThis(i18n("Add a new pattern for the selected file type."));
+ 
++    // ksr: kcm_filetypes/PatternRemove
+     removeExtButton = new QPushButton(i18n("Remove"), gb);
+     removeExtButton->setIcon(QIcon::fromTheme(QStringLiteral("list-remove")));
+     removeExtButton->setEnabled(false);
+@@ -89,6 +95,7 @@ FileTypeDetails::FileTypeDetails(QWidget *parent)
+ 
+     gb->setFixedHeight(gb->minimumSizeHint().height());
+ 
++    // ksr: kcm_filetypes/Description
+     description = new KLineEdit(this);
+     description->setClearButtonEnabled(true);
+     connect(description, &QLineEdit::textChanged, this, &FileTypeDetails::updateDescription);
+diff --git a/keditfiletype/filetypesview.cpp b/keditfiletype/filetypesview.cpp
+index 3ae56e3..fbe1cc6 100644
+--- a/keditfiletype/filetypesview.cpp
++++ b/keditfiletype/filetypesview.cpp
+@@ -17,8 +17,10 @@
+ #include <QLabel>
+ #include <QMimeDatabase>
+ #include <QPushButton>
++#include <QElapsedTimer>
+ #include <QStackedWidget>
+ #include <QStandardPaths>
++#include <QTimer>
+ #include <QVBoxLayout>
+ 
+ // KDE
+@@ -48,10 +50,11 @@ FileTypesView::FileTypesView(QObject *parent, const KPluginMetaData &data)
+     QVBoxLayout *leftLayout = new QVBoxLayout();
+     l->addLayout(leftLayout);
+ 
++    // ksr: kcm_filetypes/Search
+     patternFilterLE = new KLineEdit(widget());
+     patternFilterLE->setClearButtonEnabled(true);
+     patternFilterLE->setTrapReturnKey(true);
+-    patternFilterLE->setPlaceholderText(i18n("Search for file type or filename pattern..."));
++    patternFilterLE->setPlaceholderText(i18n("Search for file type or filename pattern…"));
+     leftLayout->addWidget(patternFilterLE);
+ 
+     connect(patternFilterLE, &QLineEdit::textChanged, this, &FileTypesView::slotFilter);
+@@ -63,10 +66,16 @@ FileTypesView::FileTypesView(QObject *parent, const KPluginMetaData &data)
+ 
+     patternFilterLE->setWhatsThis(wtstr);
+ 
++    // ksr: kcm_filetypes/KnownTypes
+     typesLV = new TypesListTreeWidget(widget());
+ 
+     typesLV->setHeaderLabel(i18n("Known Types"));
+     leftLayout->addWidget(typesLV);
++
++    // Shown while the list is read after the first paint (only if that takes over 150 ms), see readFileTypes()
++    m_loadingLabel = new QLabel(i18n("Reading file types…"), widget());
++    m_loadingLabel->setVisible(false);
++    leftLayout->addWidget(m_loadingLabel);
+     connect(typesLV, &QTreeWidget::currentItemChanged, this, &FileTypesView::updateDisplay);
+     connect(typesLV, &QTreeWidget::itemDoubleClicked, this, &FileTypesView::slotDoubleClicked);
+ 
+@@ -80,13 +89,15 @@ FileTypesView::FileTypesView(QObject *parent, const KPluginMetaData &data)
+     QHBoxLayout *btnsLay = new QHBoxLayout();
+     leftLayout->addLayout(btnsLay);
+     btnsLay->addStretch(1);
+-    QPushButton *addTypeB = new QPushButton(i18n("Add..."), widget());
++    // ksr: kcm_filetypes/Add
++    QPushButton *addTypeB = new QPushButton(i18n("Add…"), widget());
+     addTypeB->setIcon(QIcon::fromTheme(QStringLiteral("list-add")));
+     connect(addTypeB, &QAbstractButton::clicked, this, &FileTypesView::addType);
+     btnsLay->addWidget(addTypeB);
+ 
+     addTypeB->setWhatsThis(i18n("Click here to add a new file type."));
+ 
++    // ksr: kcm_filetypes/Remove
+     m_removeTypeB = new QPushButton(i18n("&Remove"), widget());
+     m_removeTypeB->setIcon(QIcon::fromTheme(QStringLiteral("list-remove")));
+     connect(m_removeTypeB, &QAbstractButton::clicked, this, &FileTypesView::removeType);
+@@ -107,6 +118,7 @@ FileTypesView::FileTypesView(QObject *parent, const KPluginMetaData &data)
+     m_widgetStack->insertWidget(1, m_details /*id*/);
+ 
+     // Widget shown on startup
++    // ksr: kcm_filetypes/Empty
+     m_emptyWidget = new QLabel(i18n("Select a file type by name or by extension"), m_widgetStack);
+     m_emptyWidget->setAlignment(Qt::AlignCenter);
+     m_widgetStack->insertWidget(3, m_emptyWidget);
+@@ -134,31 +146,83 @@ static bool mimeTypeLessThan(const QMimeType &m1, const QMimeType &m2)
+ 
+ // Note that this method loses any newly-added (and not saved yet) mimetypes.
+ // So this is really only for load().
++//
++// Before: this ran in load() before the page was shown. QMimeDatabase::allMimeTypes() plus one TypesListItem per MIME
++// type (about a thousand), each constructing a MimeTypeData that locates and parses the type's XML definition
++// (MimeTypeData::initFromQMimeType). Now the list is read from a single-shot after the first paint, in ~10 ms batches
++// (readNextBatch), in the same order; the search field works while it fills (new rows honour the current filter).
+ void FileTypesView::readFileTypes()
+ {
+     typesLV->clear();
+     m_majorMap.clear();
+     m_itemList.clear();
++    m_pendingMimeTypes.clear();
++    m_pendingIndex = 0;
++    const int generation = ++m_loadGeneration;
++    m_loading = true;
++    updateDisplay(nullptr);
++
++    QTimer::singleShot(150, this, [this, generation]() {
++        if (generation == m_loadGeneration && m_loading) {
++            m_loadingLabel->setVisible(true);
++        }
++    });
++    QTimer::singleShot(0, this, [this, generation]() {
++        if (generation != m_loadGeneration) {
++            return;
++        }
++        QMimeDatabase db;
++        m_pendingMimeTypes = db.allMimeTypes();
++        std::sort(m_pendingMimeTypes.begin(), m_pendingMimeTypes.end(), mimeTypeLessThan);
++        readNextBatch(generation);
++    });
++}
++
++void FileTypesView::readNextBatch(int generation)
++{
++    if (generation != m_loadGeneration) {
++        return; // a newer load() has started
++    }
++
++    const QString filter = patternFilterLE->text();
++    QElapsedTimer timer;
++    timer.start();
+ 
+-    QMimeDatabase db;
+-    QList<QMimeType> mimetypes = db.allMimeTypes();
+-    std::sort(mimetypes.begin(), mimetypes.end(), mimeTypeLessThan);
+-    auto it2(mimetypes.constBegin());
+-    for (; it2 != mimetypes.constEnd(); ++it2) {
+-        const QString mimetype = (*it2).name();
++    while (m_pendingIndex < m_pendingMimeTypes.size() && timer.elapsed() < 10) {
++        const QMimeType &mime = m_pendingMimeTypes.at(m_pendingIndex++);
++        const QString mimetype = mime.name();
+         const int index = mimetype.indexOf(QLatin1Char('/'));
+         const QString maj = mimetype.left(index);
+ 
+         TypesListItem *groupItem = m_majorMap.value(maj);
+         if (!groupItem) {
+             groupItem = new TypesListItem(typesLV, maj);
++            groupItem->setHidden(!filter.isEmpty()); // shown below when one of its types matches
+             m_majorMap.insert(maj, groupItem);
+         }
+ 
+-        TypesListItem *item = new TypesListItem(groupItem, (*it2));
++        TypesListItem *item = new TypesListItem(groupItem, mime);
+         m_itemList.append(item);
++        if (!filter.isEmpty()) {
++            if (item->mimeTypeData().matchesFilter(filter)) {
++                groupItem->setHidden(false);
++            } else {
++                item->setHidden(true);
++            }
++        }
+     }
+-    updateDisplay(nullptr);
++
++    if (m_pendingIndex < m_pendingMimeTypes.size()) {
++        QTimer::singleShot(0, this, [this, generation]() {
++            readNextBatch(generation);
++        });
++        return;
++    }
++
++    m_pendingMimeTypes.clear();
++    m_pendingIndex = 0;
++    m_loading = false;
++    m_loadingLabel->setVisible(false);
+ }
+ 
+ void FileTypesView::multiApply()
+@@ -420,14 +484,8 @@ void FileTypesView::save()
+ 
+ void FileTypesView::load()
+ {
+-    widget()->setEnabled(false);
+-    widget()->setCursor(Qt::WaitCursor);
+-
+-    readFileTypes();
+-
+-    widget()->unsetCursor();
++    readFileTypes(); // fills in after the first paint, the page stays usable meanwhile
+     setDirty(false);
+-    widget()->setEnabled(true);
+ }
+ 
+ void FileTypesView::slotDatabaseChanged()
+diff --git a/keditfiletype/filetypesview.h b/keditfiletype/filetypesview.h
+index 13f5cf8..0269250 100644
+--- a/keditfiletype/filetypesview.h
++++ b/keditfiletype/filetypesview.h
+@@ -9,6 +9,7 @@
+ #define FILETYPESVIEW_H
+ 
+ #include <QLabel>
++#include <QMimeType>
+ #include <QList>
+ #include <QMap>
+ #include <QStackedWidget>
+@@ -48,6 +49,7 @@ protected Q_SLOTS:
+ 
+ private:
+     void readFileTypes();
++    void readNextBatch(int generation);
+     void updateRemoveButton(TypesListItem *item);
+ 
+ private:
+@@ -59,6 +61,11 @@ private:
+     QLabel *m_emptyWidget;
+ 
+     KLineEdit *patternFilterLE;
++    QLabel *m_loadingLabel = nullptr;
++    QList<QMimeType> m_pendingMimeTypes;
++    int m_pendingIndex = 0;
++    int m_loadGeneration = 0;
++    bool m_loading = false;
+     QStringList removedList;
+     bool m_dirty;
+     bool m_removeButtonSaysRevert;
+diff --git a/keditfiletype/kservicelistwidget.cpp b/keditfiletype/kservicelistwidget.cpp
+index 4a9962e..0316d53 100644
+--- a/keditfiletype/kservicelistwidget.cpp
++++ b/keditfiletype/kservicelistwidget.cpp
+@@ -43,8 +43,10 @@ KServiceListWidget::KServiceListWidget(QWidget *parent)
+     , m_mimeTypeData(nullptr)
+     , m_allowMultiApply(false)
+ {
++    setFlat(true); // section title without a frame (docs/page-design.md §8)
+     QHBoxLayout *lay = new QHBoxLayout(this);
+ 
++    // ksr: kcm_filetypes/AppOrder
+     servicesLB = new QListWidget(this);
+     connect(servicesLB, &QListWidget::itemSelectionChanged, this, &KServiceListWidget::enableMoveButtons);
+     lay->addWidget(servicesLB);
+@@ -63,6 +65,7 @@ KServiceListWidget::KServiceListWidget(QWidget *parent)
+     QVBoxLayout *btnsLay = new QVBoxLayout();
+     lay->addLayout(btnsLay);
+ 
++    // ksr: kcm_filetypes/AppUp
+     servUpButton = new QPushButton(i18n("Move &Up"), this);
+     servUpButton->setIcon(QIcon::fromTheme(QStringLiteral("arrow-up")));
+     servUpButton->setEnabled(false);
+@@ -75,6 +78,7 @@ KServiceListWidget::KServiceListWidget(QWidget *parent)
+              "only affects the selected application if the file type is\n"
+              "associated with more than one application."));
+ 
++    // ksr: kcm_filetypes/AppDown
+     servDownButton = new QPushButton(i18n("Move &Down"), this);
+     servDownButton->setIcon(QIcon::fromTheme(QStringLiteral("arrow-down")));
+     servDownButton->setEnabled(false);
+@@ -86,20 +90,23 @@ KServiceListWidget::KServiceListWidget(QWidget *parent)
+              "only affects the selected application if the file type is\n"
+              "associated with more than one application."));
+ 
+-    servNewButton = new QPushButton(i18n("Add..."), this);
++    // ksr: kcm_filetypes/AppAdd
++    servNewButton = new QPushButton(i18n("Add…"), this);
+     servNewButton->setIcon(QIcon::fromTheme(QStringLiteral("list-add")));
+     servNewButton->setEnabled(false);
+     connect(servNewButton, &QAbstractButton::clicked, this, &KServiceListWidget::addService);
+     btnsLay->addWidget(servNewButton);
+     servNewButton->setWhatsThis(i18n("Add a new application for this file type."));
+ 
+-    servEditButton = new QPushButton(i18n("Edit..."), this);
++    // ksr: kcm_filetypes/AppEdit
++    servEditButton = new QPushButton(i18n("Edit…"), this);
+     servEditButton->setIcon(QIcon::fromTheme(QStringLiteral("edit-rename")));
+     servEditButton->setEnabled(false);
+     connect(servEditButton, &QAbstractButton::clicked, this, &KServiceListWidget::editService);
+     btnsLay->addWidget(servEditButton);
+     servEditButton->setWhatsThis(i18n("Edit command line of the selected application."));
+ 
++    // ksr: kcm_filetypes/AppRemove
+     servRemoveButton = new QPushButton(i18n("Remove"), this);
+     servRemoveButton->setIcon(QIcon::fromTheme(QStringLiteral("list-remove")));
+     servRemoveButton->setEnabled(false);
+@@ -107,7 +114,8 @@ KServiceListWidget::KServiceListWidget(QWidget *parent)
+     btnsLay->addWidget(servRemoveButton);
+     servRemoveButton->setWhatsThis(i18n("Remove the selected application from the list."));
+ 
+-    servApplyToButton = new QPushButton(i18n("Apply To..."), this);
++    // ksr: kcm_filetypes/AppApplyTo
++    servApplyToButton = new QPushButton(i18n("Apply To…"), this);
+     servApplyToButton->setIcon(QIcon::fromTheme(QStringLiteral("edit-copy")));
+     servApplyToButton->setEnabled(false);
+     connect(servApplyToButton, &QAbstractButton::clicked, this, &KServiceListWidget::applyTo);
+diff --git a/keditfiletype/newtypedlg.cpp b/keditfiletype/newtypedlg.cpp
+index c10493b..9f95522 100644
+--- a/keditfiletype/newtypedlg.cpp
++++ b/keditfiletype/newtypedlg.cpp
+@@ -29,6 +29,7 @@ NewTypeDialog::NewTypeDialog(const QStringList &groups, QWidget *parent)
+ 
+     QLabel *l = new QLabel(i18n("Group:"));
+ 
++    // ksr: kcm_filetypes/NewGroup
+     m_groupCombo = new QComboBox;
+     m_groupCombo->setEditable(true);
+     m_groupCombo->addItems(groups);
+@@ -43,6 +44,7 @@ NewTypeDialog::NewTypeDialog(const QStringList &groups, QWidget *parent)
+ 
+     l = new QLabel(i18n("Type name:"));
+ 
++    // ksr: kcm_filetypes/NewName
+     m_typeEd = new KLineEdit;
+     formLayout->addRow(l, m_typeEd);
+ 

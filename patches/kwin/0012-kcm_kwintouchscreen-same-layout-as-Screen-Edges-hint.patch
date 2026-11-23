@@ -1,0 +1,200 @@
+From 70fe1de87d525eeaa518269b4a575d10dab13792 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 01:33:36 +0500
+Subject: [PATCH 12/12] kcm_kwintouchscreen: same layout as Screen Edges, hint
+ under the preview, scans after the first frame
+
+Page type: Form with a preview (QtWidgets kept, docs/page-design.md 8). kcfg keys (kwinrc TouchEdges/*, effect and script
+TouchBorderActivate lists), actions and D-Bus calls are unchanged. Shares src/kcms/screenedges with kcm_kwinscreenedges and
+now has the same shape: info line, preview, hint, expanding spacer, same minimum width, same widget names (infoLabel,
+monitorHintLabel).
+
+Changed:
+- Info line "Swipe from a screen edge towards the center of the screen to run an action." (same verb-first form as the edges page).
+- New hint under the preview: "Click an edge of the preview to choose its action."
+- Removed the fixed spacer between info line and preview (the edges page has none either).
+- Relabel table: inventory/relabel/kcm_kwintouchscreen.tsv. Markers on the weak rows. Inventory --strict: 19 ok, 0 lost.
+- Config-only keys ScreenEdges/TouchTarget and Wayland/DoubleTapWakeup still have no UI; adding one is a feature, left for the
+  manager to decide (it would belong in a "Touch" section here).
+- Not done: hiding the page when no touch device exists (needs a device check, the shell has no hook for it yet).
+HIG ids: HIG-001/005, HIG-019, HIG-057. Page-design 2, 8.
+
+Speed cause (code): the constructor ran monitorInit() (touch.cpp), listing builtin-effect, effect and script packages with
+KPackage and creating one KConfigSkeleton per effect/script before the first frame. Now in QTimer::singleShot(0) after the
+constructor, followed by load(); save() waits for it. Note: this page lists effects through KPackage "KWin/Script" +
+"kwin/builtin-effects/" while the edges page reads the JSON files directly; left as is, both give the same entries as before.
+After-numbers: pending, manager will measure. Not built yet.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ src/kcms/screenedges/touch.cpp | 24 ++++++++++++++--
+ src/kcms/screenedges/touch.h   |  2 ++
+ src/kcms/screenedges/touch.ui  | 52 +++++++++++++++++++++-------------
+ 3 files changed, 55 insertions(+), 23 deletions(-)
+
+diff --git a/src/kcms/screenedges/touch.cpp b/src/kcms/screenedges/touch.cpp
+index 51d7cd3..2949e7e 100644
+--- a/src/kcms/screenedges/touch.cpp
++++ b/src/kcms/screenedges/touch.cpp
+@@ -18,6 +18,7 @@
+ #include <KPackage/PackageLoader>
+ #include <KPluginFactory>
+ #include <QDBusConnection>
++#include <QTimer>
+ #include <QDBusMessage>
+ #include <QVBoxLayout>
+ 
+@@ -42,7 +43,13 @@ KWinScreenEdgesConfig::KWinScreenEdgesConfig(QObject *parent, const KPluginMetaD
+     QVBoxLayout *layout = new QVBoxLayout(widget());
+     layout->addWidget(m_form);
+ 
+-    monitorInit();
++    // The effect, script and package scans in monitorInit() used to run here, before the first frame (cost grows with
++    // the installed effects and scripts). Run them one event-loop turn later and load the edge actions after that.
++    QTimer::singleShot(0, this, [this] {
++        monitorInit();
++        m_initialized = true;
++        load();
++    });
+ 
+     connect(m_form, &KWinTouchScreenEdgeConfigForm::saveNeededChanged, this, &KWinScreenEdgesConfig::unmanagedWidgetChangeState);
+     connect(m_form, &KWinTouchScreenEdgeConfigForm::defaultChanged, this, &KWinScreenEdgesConfig::unmanagedWidgetDefaultState);
+@@ -63,13 +70,18 @@ void KWinScreenEdgesConfig::load()
+         setting->load();
+     }
+ 
+-    monitorLoadSettings();
+-    monitorLoadDefaultSettings();
++    if (m_initialized) {
++        monitorLoadSettings();
++        monitorLoadDefaultSettings();
++    }
+     m_form->reload();
+ }
+ 
+ void KWinScreenEdgesConfig::save()
+ {
++    if (!m_initialized) {
++        return; // the edge menus are not filled yet, saving now would write "None" for every edge
++    }
+     monitorSaveSettings();
+     m_data->settings()->save();
+     for (KWinTouchScreenScriptSettings *setting : std::as_const(m_scriptSettings)) {
+@@ -125,6 +137,7 @@ void KWinScreenEdgesConfig::monitorInit()
+ 
+     // TODO: Find a better way to get the display name of the present windows,
+     // Maybe install metadata.json files?
++    // ksr: kcm_kwintouchscreen/touch-edge-action-presentwindows
+     const QString presentWindowsName = i18n("Present Windows");
+     m_form->monitorAddItem(i18n("%1 - All Desktops", presentWindowsName));
+     m_form->monitorAddItem(i18n("%1 - Current Desktop", presentWindowsName));
+@@ -237,6 +250,11 @@ void KWinScreenEdgesConfig::monitorLoadDefaultSettings()
+ void KWinScreenEdgesConfig::monitorSaveSettings()
+ {
+     // Save ElectricBorderActions
++    // ksr: kcm_kwintouchscreen/cfg-TouchEdges-Top
++    // ksr: kcm_kwintouchscreen/cfg-TouchEdges-Right
++    // ksr: kcm_kwintouchscreen/cfg-TouchEdges-Bottom
++    // ksr: kcm_kwintouchscreen/cfg-TouchEdges-Left
++    // ksr: kcm_kwintouchscreen/touch-edge-action
+     m_data->settings()->setTop(KWinScreenEdgesConfig::electricBorderActionToString(m_form->selectedEdgeItem(ElectricTop)));
+     m_data->settings()->setRight(KWinScreenEdgesConfig::electricBorderActionToString(m_form->selectedEdgeItem(ElectricRight)));
+     m_data->settings()->setBottom(KWinScreenEdgesConfig::electricBorderActionToString(m_form->selectedEdgeItem(ElectricBottom)));
+diff --git a/src/kcms/screenedges/touch.h b/src/kcms/screenedges/touch.h
+index 8d16f9f..d2b20e0 100644
+--- a/src/kcms/screenedges/touch.h
++++ b/src/kcms/screenedges/touch.h
+@@ -58,6 +58,8 @@ private:
+         EffectCount,
+     };
+ 
++    bool m_initialized = false;
++
+     void monitorInit();
+     void monitorLoadSettings();
+     void monitorLoadDefaultSettings();
+diff --git a/src/kcms/screenedges/touch.ui b/src/kcms/screenedges/touch.ui
+index b30233b..3a5ebd0 100644
+--- a/src/kcms/screenedges/touch.ui
++++ b/src/kcms/screenedges/touch.ui
+@@ -7,36 +7,26 @@
+     <x>0</x>
+     <y>0</y>
+     <width>500</width>
+-    <height>500</height>
++    <height>480</height>
+    </rect>
+   </property>
++  <property name="minimumSize">
++   <size>
++    <width>500</width>
++    <height>0</height>
++   </size>
++  </property>
+   <layout class="QVBoxLayout" name="verticalLayout">
+    <item>
+-    <widget class="QLabel" name="label_1">
++    <widget class="QLabel" name="infoLabel">
+      <property name="text">
+-      <string>You can trigger an action by swiping from the screen edge towards the center of the screen.</string>
++      <string>Swipe from a screen edge towards the center of the screen to run an action.</string>
+      </property>
+      <property name="wordWrap">
+       <bool>true</bool>
+      </property>
+     </widget>
+    </item>
+-   <item>
+-    <spacer name="verticalSpacer_1">
+-     <property name="orientation">
+-      <enum>Qt::Vertical</enum>
+-     </property>
+-     <property name="sizeType">
+-      <enum>QSizePolicy::Minimum</enum>
+-     </property>
+-     <property name="sizeHint" stdset="0">
+-      <size>
+-       <width>20</width>
+-       <height>20</height>
+-      </size>
+-     </property>
+-    </spacer>
+-   </item>
+    <item>
+     <widget class="KWin::Monitor" name="monitor" native="true">
+      <property name="minimumSize">
+@@ -51,10 +41,32 @@
+     </widget>
+    </item>
+    <item>
+-    <spacer name="verticalSpacer_2">
++    <widget class="QLabel" name="monitorHintLabel">
++     <property name="text">
++      <string>Click an edge of the preview to choose its action.</string>
++     </property>
++     <property name="alignment">
++      <set>Qt::AlignHCenter|Qt::AlignTop</set>
++     </property>
++     <property name="wordWrap">
++      <bool>true</bool>
++     </property>
++    </widget>
++   </item>
++   <item>
++    <spacer name="verticalSpacer_3">
+      <property name="orientation">
+       <enum>Qt::Vertical</enum>
+      </property>
++     <property name="sizeType">
++      <enum>QSizePolicy::Expanding</enum>
++     </property>
++     <property name="sizeHint" stdset="0">
++      <size>
++       <width>0</width>
++       <height>0</height>
++      </size>
++     </property>
+     </spacer>
+    </item>
+   </layout>

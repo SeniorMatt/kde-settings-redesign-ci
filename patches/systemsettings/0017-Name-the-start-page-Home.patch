@@ -1,0 +1,36 @@
+From 4d1565a840be1705d11c100d1f32b428cfe5141a Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 09:12:26 +0500
+Subject: [PATCH 17/22] Name the start page Home
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ app/SettingsLayoutTree.cpp | 1 +
+ app/settingslayout_p.h     | 1 +
+ 2 files changed, 2 insertions(+)
+
+diff --git a/app/SettingsLayoutTree.cpp b/app/SettingsLayoutTree.cpp
+index b0bfa39..55274b5 100644
+--- a/app/SettingsLayoutTree.cpp
++++ b/app/SettingsLayoutTree.cpp
+@@ -300,6 +300,7 @@ MenuItem *Builder::build()
+     if (homeModule.isValid()) {
+         home = new MenuItem(false, homeGroup);
+         home->setMetaData(homeModule);
++        home->setNameOverride(SettingsLayout::homeName.toString(), QString());
+         home->setHiddenInSearch(true);
+         m_placed.insert(homeModule.pluginId());
+     }
+diff --git a/app/settingslayout_p.h b/app/settingslayout_p.h
+index 02e3e67..2cba40f 100644
+--- a/app/settingslayout_p.h
++++ b/app/settingslayout_p.h
+@@ -224,6 +224,7 @@ inline constexpr Page detailsPages[] = {
+ };
+ 
+ inline constexpr const char *homePage = "kcm_landingpage";
++inline constexpr KLazyLocalizedString homeName = kli18nc("@title the start page of System Settings", "Home");
+ inline constexpr const char *hiddenButSearchable[] = {"kcm_breezedecoration"};
+ inline constexpr const char *neverShow[] = {"fakekcm", "kcm_testqml"};
+ 

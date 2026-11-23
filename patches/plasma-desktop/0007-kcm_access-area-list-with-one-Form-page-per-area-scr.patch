@@ -1,0 +1,2976 @@
+From 3dada20146cda20da6caa8cb8e962b3c151c6d88 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 14:00:53 +0500
+Subject: [PATCH 07/31] kcm_access: area list with one Form page per area;
+ screen-reader D-Bus calls cached and async
+
+Page type: List (main) + Form (each area), docs/page-design.md. kaccessrc/kwinrc keys, KWin effect calls, kded
+screenreader calls and defaults are unchanged. NOT BUILT YET (owner stopped heavy work); checked statically only.
+
+Moved / renamed:
+- The sidebar + Loader (AbstractKCM) is now a short list (ScrollViewKCM) grouped Seeing / Typing / Pointing / Alerts
+  (HIG-001/005/006: most used first, grouped by what the user is trying to do). Each row shows a one-line description
+  and its current state (On/Off, Full screen zoom...), and keeps the "changed from default" dot. A row opens its area
+  with kcm.push(). Area names are the old sidebar names.
+- Every page is KCM.SimpleKCM + Kirigami.FormLayout (was Kirigami.Form/FormGroup/FormEntry), sections as
+  Kirigami.FormData.isSection, first section untitled, dependent options indented and disabled not hidden (Zoom keeps
+  hiding the options of the mode that is not selected).
+- "Enable" checkboxes now say what they do ("Use sticky keys", "Ignore repeated presses of the same key",
+  "Click when pointer remains still", "Correct colors", "Allow inverting screen colors", "Play a sound when the bell
+  rings", "Signal the bell on the screen") (HIG-057). Spin box labels sentence case ("Delay time:"). Help text moved
+  from the intro paragraph to a small label (Color Blindness) and ContextualHelpButtons next to the checkbox.
+- Text Size: the two buttons got labels and the hint under each; hints wrap at gridUnit*16.
+- Screen Reader page uses kcm.screenReaderInstalled (computed once) instead of a second PATH search; Orca feedback
+  shown as a small label under the button.
+- Relabel table: inventory/relabel/kcm_access.tsv (outer repo); old wording added to the page aliases in ia/layout.json.
+  All 54 inventory rows kept, `inventory_check.py --kcm kcm_access --strict`: 0 lost.
+- Not changed (needs the manager's OK): the embedded KShortcutsDialog buttons that duplicate kcm_keys
+  (ia/duplicates.md); Invert/Color Blindness stay here although kcm_kwin_effects lists the same effects.
+
+Speed (cause found in code, kcms/access/kcmaccess.cpp):
+- load() made a blocking session-bus call to kded6 /modules/screenreader before the first frame (kded may have to start
+  the module). Worse, isSaveNeeded() and screenReaderIsDefaults() each made another blocking call on EVERY evaluation,
+  and screenReaderIsDefaults() is bound by the Screen Reader sidebar row and called through isDefaults() by the shell.
+  Now: load() sends the two calls (enabled, enabledByDefault) asynchronously with QDBusPendingCallWatcher and caches the
+  results; isSaveNeeded()/screenReaderIsDefaults() compare cached values; save() updates the cached saved value.
+- Before, all 11 areas' QML was reachable from one 45x25 gridUnit page and the first area (Zoom & Magnifier, 339 lines,
+  ObjectModel + 2 Repeaters) was always instantiated; now the first frame is a 11-row list and an area is created only
+  when opened.
+- save() still makes synchronous KWin calls (only on Apply, not on open).
+- After numbers: pending, manager will measure (was ~5.9 s ready at 0.5 CPU under load).
+
+Not built yet; API shapes used were grepped in src/master (kirigami ListSectionHeader.label, KCM ScrollViewKCM.view,
+KQuickConfigModule::push, ContextualHelpButton.toolTipText, SettingStateBinding as before).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/access/kcmaccess.cpp                   |  69 ++-
+ kcms/access/kcmaccess.h                     |   3 +
+ kcms/access/ui/Bell.qml                     | 232 ++++-----
+ kcms/access/ui/ColorblindnessCorrection.qml | 201 ++++----
+ kcms/access/ui/DwellClicker.qml             | 193 ++++----
+ kcms/access/ui/Invert.qml                   |  53 +-
+ kcms/access/ui/KeyboardFilters.qml          | 250 +++++-----
+ kcms/access/ui/ModifierKeys.qml             | 150 +++---
+ kcms/access/ui/MouseNavigation.qml          | 196 ++++----
+ kcms/access/ui/ScreenReader.qml             |  72 +--
+ kcms/access/ui/ShakeCursor.qml              |  94 ++--
+ kcms/access/ui/TextSize.qml                 |  48 +-
+ kcms/access/ui/ZoomMagnifier.qml            | 514 ++++++++++----------
+ kcms/access/ui/main.qml                     | 244 ++++++----
+ 14 files changed, 1206 insertions(+), 1113 deletions(-)
+
+diff --git a/kcms/access/kcmaccess.cpp b/kcms/access/kcmaccess.cpp
+index 79d78ac..3656b25 100644
+--- a/kcms/access/kcmaccess.cpp
++++ b/kcms/access/kcmaccess.cpp
+@@ -13,6 +13,9 @@
+ #include <QApplication>
+ #include <QDBusConnection>
+ #include <QDBusMessage>
++#include <QDBusPendingCall>
++#include <QDBusPendingCallWatcher>
++#include <QDBusPendingReply>
+ #include <QDBusReply>
+ #include <QFileDialog>
+ #include <QProcess>
+@@ -263,15 +266,40 @@ void KAccessConfig::load()
+ {
+     KQuickManagedConfigModule::load();
+ 
+-    QDBusMessage screenReaderEnabledMessage =
+-        QDBusMessage::createMethodCall(u"org.kde.kded6"_s, u"/modules/screenreader"_s, u"org.kde.screenreader"_s, u"enabled"_s);
+-    QDBusReply<bool> reply = QDBusConnection::sessionBus().call(screenReaderEnabledMessage);
+-
+-    if (reply.isValid()) {
+-        m_screenReaderEnabled = reply.value();
+-        Q_EMIT screenReaderEnabledChanged();
+-    } else {
+-        qCWarning(KCM_ACCESS) << "Failed to read screenreader enabled" << reply.error().message();
++    // Was two blocking session-bus calls per evaluation (here, then again in isSaveNeeded() and screenReaderIsDefaults(),
++    // which the shell and every sidebar row call repeatedly). Now: ask kded once, off the first frame, and cache.
++    auto *enabledWatcher = new QDBusPendingCallWatcher(QDBusConnection::sessionBus().asyncCall(
++                                                           QDBusMessage::createMethodCall(u"org.kde.kded6"_s, u"/modules/screenreader"_s, u"org.kde.screenreader"_s, u"enabled"_s)),
++                                                       this);
++    connect(enabledWatcher, &QDBusPendingCallWatcher::finished, this, [this](QDBusPendingCallWatcher *watcher) {
++        watcher->deleteLater();
++        QDBusPendingReply<bool> reply = *watcher;
++        if (reply.isValid()) {
++            m_screenReaderSaved = reply.value();
++            m_screenReaderEnabled = reply.value();
++            Q_EMIT screenReaderEnabledChanged();
++            Q_EMIT screenReaderIsDefaultsChanged();
++        } else {
++            qCWarning(KCM_ACCESS) << "Failed to read screenreader enabled" << reply.error().message();
++        }
++    });
++
++    if (!m_screenReaderDefaultKnown) {
++        auto *defaultWatcher = new QDBusPendingCallWatcher(
++            QDBusConnection::sessionBus().asyncCall(
++                QDBusMessage::createMethodCall(u"org.kde.kded6"_s, u"/modules/screenreader"_s, u"org.kde.screenreader"_s, u"enabledByDefault"_s)),
++            this);
++        connect(defaultWatcher, &QDBusPendingCallWatcher::finished, this, [this](QDBusPendingCallWatcher *watcher) {
++            watcher->deleteLater();
++            QDBusPendingReply<bool> reply = *watcher;
++            if (reply.isValid()) {
++                m_screenReaderDefault = reply.value();
++                m_screenReaderDefaultKnown = true;
++                Q_EMIT screenReaderIsDefaultsChanged();
++            } else {
++                qCWarning(KCM_ACCESS) << "Failed to read enabledByDefault" << reply.error().message();
++            }
++        });
+     }
+ }
+ 
+@@ -418,6 +446,8 @@ void KAccessConfig::save()
+ 
+     if (!reply.isValid()) {
+         qCWarning(KCM_ACCESS) << "Failed to send setEnabled" << reply.error().message();
++    } else {
++        m_screenReaderSaved = m_screenReaderEnabled;
+     }
+ }
+ 
+@@ -438,15 +468,8 @@ bool KAccessConfig::isDefaults() const
+ 
+ bool KAccessConfig::isSaveNeeded() const
+ {
+-    QDBusMessage msg = QDBusMessage::createMethodCall(u"org.kde.kded6"_s, u"/modules/screenreader"_s, u"org.kde.screenreader"_s, u"enabled"_s);
+-    QDBusReply<bool> reply = QDBusConnection::sessionBus().call(msg);
+-
+-    if (!reply.isValid()) {
+-        qCWarning(KCM_ACCESS) << "Failed to read isSaveNeeded" << reply.error().message();
+-        return false;
+-    }
+-
+-    return m_screenReaderEnabled != reply.value();
++    // Cached at load()/save(); no D-Bus call here (this is evaluated on every change notification)
++    return m_screenReaderEnabled != m_screenReaderSaved;
+ }
+ 
+ QString KAccessConfig::orcaLaunchFeedback() const
+@@ -534,14 +557,8 @@ bool KAccessConfig::keyboardModifiersIsDefaults() const
+ 
+ bool KAccessConfig::screenReaderIsDefaults() const
+ {
+-    QDBusMessage msg = QDBusMessage::createMethodCall(u"org.kde.kded6"_s, u"/modules/screenreader"_s, u"org.kde.screenreader"_s, u"enabledByDefault"_s);
+-    QDBusReply<bool> reply = QDBusConnection::sessionBus().call(msg);
+-
+-    if (!reply.isValid()) {
+-        qCWarning(KCM_ACCESS) << "Failed to read enabledByDefault" << reply.error().message();
+-    }
+-
+-    return m_screenReaderEnabled == reply.value();
++    // The default is read once in load(); until kded answers it is "off", which is what the old code used on failure too
++    return m_screenReaderEnabled == m_screenReaderDefault;
+ }
+ 
+ bool KAccessConfig::shakeCursorIsDefaults() const
+diff --git a/kcms/access/kcmaccess.h b/kcms/access/kcmaccess.h
+index 8a2cf9a..34542f8 100644
+--- a/kcms/access/kcmaccess.h
++++ b/kcms/access/kcmaccess.h
+@@ -111,4 +111,7 @@ private:
+     QString m_orcaLaunchFeedback;
+     bool m_screenReaderInstalled;
+     bool m_screenReaderEnabled = false;
++    bool m_screenReaderSaved = false;
++    bool m_screenReaderDefault = false;
++    bool m_screenReaderDefaultKnown = false;
+ };
+diff --git a/kcms/access/ui/Bell.qml b/kcms/access/ui/Bell.qml
+index 78f375c..1434064 100644
+--- a/kcms/access/ui/Bell.qml
++++ b/kcms/access/ui/Bell.qml
+@@ -12,7 +12,10 @@ import org.kde.kcmutils as KCMUtils
+ import org.kde.kquickcontrols as KQuickAddons
+ import org.kde.kirigami as Kirigami
+ 
+-Kirigami.Form {
++// Form page: System Bell. Audible bell first (most used), visual bell second. Dependent options are disabled, not hidden.
++KCMUtils.SimpleKCM {
++    title: i18nc("@title", "System Bell")
++
+     Dialogs.FileDialog {
+         id: fileDialog
+         title: i18nc("@title:window dialog","Please choose an audio file")
+@@ -23,110 +26,118 @@ Kirigami.Form {
+         }
+     }
+ 
+-    Kirigami.FormGroup {
+-        Kirigami.FormEntry {
+-            title: i18nc("@label prefix for checkbox", "Audible bell:")
+-            contentItem: QQC2.CheckBox {
+-                id: systemBell
++    Kirigami.FormLayout {
++        QQC2.CheckBox {
++            // ksr: kcm_access/SystemBell
++            Kirigami.FormData.label: i18nc("@label prefix for checkbox", "Audible bell:")
++            text: i18nc("@option:check", "Play a sound when the bell rings")
++            Accessible.name: text
+ 
+-                text: i18nc("Enable the system bell", "Enable")
+-                KCMUtils.SettingStateBinding {
+-                    configObject: kcm.bellSettings
+-                    settingName: "SystemBell"
+-                }
++            KCMUtils.SettingStateBinding {
++                configObject: kcm.bellSettings
++                settingName: "SystemBell"
++            }
+ 
+-                checked: kcm.bellSettings.systemBell
+-                onToggled: kcm.bellSettings.systemBell = checked
++            checked: kcm.bellSettings.systemBell
++            onToggled: kcm.bellSettings.systemBell = checked
++        }
++
++        QQC2.CheckBox {
++            // ksr: kcm_access/CustomBell
++            Layout.leftMargin: Kirigami.Units.gridUnit
++            text: i18nc("Defines if the system will use a sound system bell", "Use a custom sound")
++            Accessible.name: text
++
++            KCMUtils.SettingStateBinding {
++                configObject: kcm.bellSettings
++                settingName: "CustomBell"
++                extraEnabledConditions: kcm.bellSettings.systemBell
+             }
++
++            checked: kcm.bellSettings.customBell
++            onToggled: kcm.bellSettings.customBell = checked
+         }
+ 
+-        Kirigami.FormEntry {
+-            title: i18nc("Defines if the system will use a sound system bell", "Custom sound:")
+-            contentItem: QQC2.CheckBox {
+-                id: customBell
++        RowLayout {
++            // ksr: kcm_access/CustomBellFile
++            Kirigami.FormData.label: i18nc("@label:textbox", "Sound file:")
++            Layout.leftMargin: Kirigami.Units.gridUnit
++            spacing: Kirigami.Units.smallSpacing
++
++            QQC2.TextField {
++                id: textEdit
++                Accessible.name: i18nc("@label accessible name", "Sound file")
++
++                text: kcm.bellSettings.customBellFile
+ 
+                 KCMUtils.SettingStateBinding {
+                     configObject: kcm.bellSettings
+-                    settingName: "CustomBell"
+-                    extraEnabledConditions: kcm.bellSettings.systemBell
++                    settingName: "CustomBellFile"
++                    extraEnabledConditions: kcm.bellSettings.customBell
+                 }
+ 
+-                checked: kcm.bellSettings.customBell
+-                onToggled: kcm.bellSettings.customBell= checked
++                onEditingFinished: kcm.bellSettings.customBellFile = textEdit.text
+             }
+-            trailingItems: [
+-                QQC2.TextField {
+-                    id: textEdit
+-
+-                    text: kcm.bellSettings.customBellFile
+-
+-                    KCMUtils.SettingStateBinding {
+-                        configObject: kcm.bellSettings
+-                        settingName: "CustomBellFile"
+-                        extraEnabledConditions: kcm.bellSettings.customBell
+-                    }
+-
+-                    onEditingFinished: kcm.bellSettings.customBellFile = textEdit.text
+-                },
+-                QQC2.Button {
+-                    icon.name: "folder"
+-                    QQC2.ToolTip.visible: down
+-                    QQC2.ToolTip.text: i18nc("@action:button icononly tooltip", "Choose audio file for the system bell")
+-                    Accessible.name: i18nc("@action button accessible only", "Choose audio file")
+-                    Accessible.description: i18nc("@info:usagetip accessible description for button", "Opens dialog")
+-                    KCMUtils.SettingStateBinding {
+-                        configObject: kcm.bellSettings
+-                        settingName: "CustomBellFile"
+-                        extraEnabledConditions: kcm.bellSettings.customBell
+-                    }
+-
+-                    onClicked: fileDialog.open()
+-                }
+-            ]
+-        }
+-    }
+-
+-    Kirigami.FormGroup {
+-        Kirigami.FormEntry {
+-            title: i18nc("@label prefix for checkbox", "Visual bell:")
+-            contentItem: QQC2.CheckBox {
+-                id: visibleBell
+-
+-                text: i18nc("@option:check Enable visual bell", "Enable")
+-
++            QQC2.Button {
++                icon.name: "document-open"
++                QQC2.ToolTip.visible: hovered
++                QQC2.ToolTip.text: i18nc("@action:button icononly tooltip", "Choose audio file for the system bell")
++                Accessible.name: i18nc("@action button accessible only", "Choose audio file")
++                Accessible.description: i18nc("@info:usagetip accessible description for button", "Opens dialog")
+                 KCMUtils.SettingStateBinding {
+                     configObject: kcm.bellSettings
+-                    settingName: "VisibleBell"
++                    settingName: "CustomBellFile"
++                    extraEnabledConditions: kcm.bellSettings.customBell
+                 }
+ 
+-                checked: kcm.bellSettings.visibleBell
+-                onToggled: kcm.bellSettings.visibleBell = checked
++                onClicked: fileDialog.open()
+             }
+         }
+ 
+-        Kirigami.FormEntry {
+-            contentItem: QQC2.RadioButton {
+-                id: invertScreen
++        Kirigami.Separator {
++            Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18nc("@title:group", "Visual bell")
++        }
+ 
+-                text: i18nc("@option:radio Invert screen colors when a system bell is rung", "Invert screen colors")
++        QQC2.CheckBox {
++            id: visibleBell
++            // ksr: kcm_access/VisibleBell
++            text: i18nc("@option:check", "Signal the bell on the screen")
++            Accessible.name: text
+ 
+-                KCMUtils.SettingStateBinding {
+-                    configObject: kcm.bellSettings
+-                    settingName: "InvertScreen"
+-                    extraEnabledConditions: kcm.bellSettings.visibleBell
+-                }
++            KCMUtils.SettingStateBinding {
++                configObject: kcm.bellSettings
++                settingName: "VisibleBell"
++            }
++
++            checked: kcm.bellSettings.visibleBell
++            onToggled: kcm.bellSettings.visibleBell = checked
++        }
+ 
+-                checked: kcm.bellSettings.invertScreen
+-                onToggled: kcm.bellSettings.invertScreen = checked
++        QQC2.RadioButton {
++            // ksr: kcm_access/InvertScreen
++            Kirigami.FormData.label: i18nc("@label:radio", "Style:")
++            text: i18nc("@option:radio Invert screen colors when a system bell is rung", "Invert screen colors")
++            QQC2.ButtonGroup.group: visualStyleGroup
++
++            KCMUtils.SettingStateBinding {
++                configObject: kcm.bellSettings
++                settingName: "InvertScreen"
++                extraEnabledConditions: kcm.bellSettings.visibleBell
+             }
++
++            checked: kcm.bellSettings.invertScreen
++            onToggled: kcm.bellSettings.invertScreen = checked
+         }
+ 
+-        Kirigami.FormEntry {
++        RowLayout {
+             enabled: kcm.bellSettings.visibleBell
+-            contentItem: QQC2.RadioButton {
+-                id: flashScreen
++            spacing: Kirigami.Units.smallSpacing
+ 
++            QQC2.RadioButton {
++                // ksr: kcm_access/InvertScreen
+                 text: i18nc("@option:radio Flash screen when a system bell is rung", "Flash screen")
++                QQC2.ButtonGroup.group: visualStyleGroup
+ 
+                 KCMUtils.SettingStateBinding {
+                     configObject: kcm.bellSettings
+@@ -136,46 +147,47 @@ Kirigami.Form {
+                 checked: !kcm.bellSettings.invertScreen
+                 onToggled: kcm.bellSettings.invertScreen = !checked
+             }
+-            trailingItems: [
+-                KQuickAddons.ColorButton {
+-                    text: i18nc("Color of the system bell","Color")
+-                    // avoid to show text outside button
+-                    display: QQC2.AbstractButton.IconOnly
+-
+-                    KCMUtils.SettingStateBinding {
+-                        configObject: kcm.bellSettings
+-                        settingName: "VisibleBellColor"
+-                    }
+-
+-                    color: kcm.bellSettings.visibleBellColor
+-                    onAccepted: color => kcm.bellSettings.visibleBellColor = color
++            KQuickAddons.ColorButton {
++                // ksr: kcm_access/VisibleBellColor
++                text: i18nc("Color of the system bell","Flash color")
++                // avoid to show text outside button
++                display: QQC2.AbstractButton.IconOnly
++                Accessible.name: i18nc("@label accessible name", "Flash color")
++
++                KCMUtils.SettingStateBinding {
++                    configObject: kcm.bellSettings
++                    settingName: "VisibleBellColor"
+                 }
+-            ]
++
++                color: kcm.bellSettings.visibleBellColor
++                onAccepted: color => kcm.bellSettings.visibleBellColor = color
++            }
+         }
+ 
+-        Kirigami.FormEntry {
+-            title: i18nc("Duration of the system bell", "Duration:")
+-            contentItem: QQC2.SpinBox {
++        QQC2.ButtonGroup { id: visualStyleGroup }
+ 
+-                from: 100
+-                to: 2000
++        QQC2.SpinBox {
++            // ksr: kcm_access/VisibleBellPause
++            Kirigami.FormData.label: i18nc("Duration of the system bell", "Duration:")
+ 
+-                KCMUtils.SettingStateBinding {
+-                    configObject: kcm.bellSettings
+-                    settingName: "VisibleBellPause"
+-                    extraEnabledConditions: kcm.bellSettings.visibleBell
+-                }
++            from: 100
++            to: 2000
+ 
+-                value: kcm.bellSettings.visibleBellPause
+-                onValueModified: kcm.bellSettings.visibleBellPause = value
++            KCMUtils.SettingStateBinding {
++                configObject: kcm.bellSettings
++                settingName: "VisibleBellPause"
++                extraEnabledConditions: kcm.bellSettings.visibleBell
++            }
+ 
+-                textFromValue: function(value, locale) {
+-                    return i18ncp("@label:valuesuffix %1 is visible bell duration", "%1 ms", "%1 ms", value)
+-                }
++            value: kcm.bellSettings.visibleBellPause
++            onValueModified: kcm.bellSettings.visibleBellPause = value
+ 
+-                valueFromText: (text, locale) => {
+-                    return Number.fromLocaleString(locale, text.replace(i18ncp("@label:valuesuffix short for millisecond(s)", "ms", "ms"), ""))
+-                }
++            textFromValue: function(value, locale) {
++                return i18ncp("@label:valuesuffix %1 is visible bell duration", "%1 ms", "%1 ms", value)
++            }
++
++            valueFromText: (text, locale) => {
++                return Number.fromLocaleString(locale, text.replace(i18ncp("@label:valuesuffix short for millisecond(s)", "ms", "ms"), ""))
+             }
+         }
+     }
+diff --git a/kcms/access/ui/ColorblindnessCorrection.qml b/kcms/access/ui/ColorblindnessCorrection.qml
+index a7d7390..c448c7c 100644
+--- a/kcms/access/ui/ColorblindnessCorrection.qml
++++ b/kcms/access/ui/ColorblindnessCorrection.qml
+@@ -5,136 +5,113 @@
+     SPDX-License-Identifier: GPL-2.0-or-later
+ */
+ 
+-
+ import QtQuick
+ import QtQuick.Layouts
+ import QtQuick.Controls as QQC2
+ import org.kde.kcmutils as KCM
+ import org.kde.kirigami as Kirigami
+ 
+-ColumnLayout {
+-    spacing: Kirigami.Units.gridUnit
++// Form page: Color Blindness Correction. Switch, which colors, how strong; the swatches show the result below.
++KCM.SimpleKCM {
++    title: i18nc("@title Category name in sidebar", "Color Blindness Correction")
+ 
+-    QQC2.Label {
+-        Layout.fillWidth: true
++    Kirigami.FormLayout {
++        QQC2.CheckBox {
++            // ksr: kcm_access/ColorblindnessCorrection
++            text: i18nc("@option check, Enable color blindness correction effect", "Correct colors")
++            Accessible.name: text
+ 
+-        text: i18nc("@info", "If you have trouble with certain colors on the screen, these filters can change them into other colors.")
+-        textFormat: Text.PlainText
+-        wrapMode: Text.WordWrap
+-        horizontalAlignment: Text.AlignHCenter
+-    }
++            KCM.SettingStateBinding {
++                configObject: kcm.colorblindnessCorrectionSettings
++                settingName: "ColorblindnessCorrection"
++            }
+ 
+-    Kirigami.Form {
+-        Layout.fillWidth: true
+-        Kirigami.FormGroup {
+-            Kirigami.FormEntry {
+-                contentItem: QQC2.CheckBox {
+-                    text: i18nc("@option check, Enable color blindness correction effect", "Enable")
++            checked: kcm.colorblindnessCorrectionSettings.colorblindnessCorrection
++            onToggled: kcm.colorblindnessCorrectionSettings.colorblindnessCorrection = checked
++        }
+ 
+-                    KCM.SettingStateBinding {
+-                        configObject: kcm.colorblindnessCorrectionSettings
+-                        settingName: "ColorblindnessCorrection"
+-                    }
++        QQC2.Label {
++            Layout.maximumWidth: Kirigami.Units.gridUnit * 16
++            wrapMode: Text.Wrap
++            font: Kirigami.Theme.smallFont
++            textFormat: Text.PlainText
++            text: i18nc("@info", "If you have trouble with certain colors on the screen, these filters can change them into other colors.")
++        }
+ 
+-                    checked: kcm.colorblindnessCorrectionSettings.colorblindnessCorrection
+-                    onToggled: kcm.colorblindnessCorrectionSettings.colorblindnessCorrection = checked
+-                }
++        QQC2.ComboBox {
++            id: colorComboBox
++            // ksr: kcm_access/Mode
++            Kirigami.FormData.label: i18nc("@label:listbox Difficulty seeing any of the following colors on the screen", "Problematic colors:")
++            Layout.preferredWidth: Kirigami.Units.gridUnit * 15
++
++            currentIndex: kcm.colorblindnessCorrectionSettings.mode
++            textRole: "text"
++            valueRole: "value"
++            model: [
++                { value: 0, text: i18nc("@option", "Red & purple (Protanopia)") },
++                { value: 1, text: i18nc("@option", "Green & purple (Deuteranopia)") },
++                { value: 2, text: i18nc("@option", "Yellow, green & purple (Tritanopia)") },
++                { value: 3, text: i18nc("@option", "All (grayscale mode)") },
++            ]
++
++            KCM.SettingStateBinding {
++                configObject: kcm.colorblindnessCorrectionSettings
++                settingName: "Mode"
++                extraEnabledConditions: kcm.colorblindnessCorrectionSettings.colorblindnessCorrection
+             }
+ 
+-            Kirigami.FormEntry {
+-                title: i18nc("@label:listbox Difficulty seeing any of the following colors on the screen", "Problematic colors:")
+-                contentItem: QQC2.ComboBox {
+-                    id: colorComboBox
+-                    currentIndex: kcm.colorblindnessCorrectionSettings.mode
+-                    textRole: "text"
+-                    valueRole: "value"
+-                    model: [
+-                        { value: 0, text: i18nc("@option", "Red & purple (Protanopia)") },
+-                        { value: 1, text: i18nc("@option", "Green & purple (Deuteranopia)") },
+-                        { value: 2, text: i18nc("@option", "Yellow, green & purple (Tritanopia)") },
+-                        { value: 3, text: i18nc("@option", "All (grayscale mode)") },
+-                    ]
+-
+-                    Layout.preferredWidth: Kirigami.Units.gridUnit * 15
+-
+-                    KCM.SettingStateBinding {
+-                        configObject: kcm.colorblindnessCorrectionSettings
+-                        settingName: "Mode"
+-                        extraEnabledConditions: kcm.colorblindnessCorrectionSettings.colorblindnessCorrection
+-                    }
+-
+-                    onActivated: kcm.colorblindnessCorrectionSettings.mode = currentValue
+-                }
+-            }
++            onActivated: kcm.colorblindnessCorrectionSettings.mode = currentValue
++        }
+ 
+-            Kirigami.FormEntry {
+-                title: i18nc("@label", "Intensity:")
+-                contentItem: ColumnLayout {
+-                    Kirigami.FormData.buddyFor: intensitySlider
+-                    spacing: Kirigami.Units.smallSpacing
++        ColumnLayout {
++            // ksr: kcm_access/Intensity-2
++            Kirigami.FormData.label: i18nc("@label", "Intensity:")
++            Kirigami.FormData.buddyFor: intensitySlider
++            spacing: Kirigami.Units.smallSpacing
+ 
+-                    QQC2.Slider {
+-                        id: intensitySlider
+-                        Layout.preferredWidth: Kirigami.Units.gridUnit * 15
++            QQC2.Slider {
++                id: intensitySlider
++                Layout.preferredWidth: Kirigami.Units.gridUnit * 15
++                Accessible.name: i18nc("@label accessible name", "Intensity")
+ 
+-                        KCM.SettingStateBinding {
+-                            configObject: kcm.colorblindnessCorrectionSettings
+-                            settingName: "Intensity"
+-                            extraEnabledConditions: kcm.colorblindnessCorrectionSettings.colorblindnessCorrection
+-                        }
++                KCM.SettingStateBinding {
++                    configObject: kcm.colorblindnessCorrectionSettings
++                    settingName: "Intensity"
++                    extraEnabledConditions: kcm.colorblindnessCorrectionSettings.colorblindnessCorrection
++                }
+ 
+-                        from: 0.05 // 0.0 just rolls over to 1? hacky
+-                        to: 1.0
+-                        value: kcm.colorblindnessCorrectionSettings.intensity
+-                        onMoved: kcm.colorblindnessCorrectionSettings.intensity = value
+-                    }
++                from: 0.05 // 0.0 just rolls over to 1? hacky
++                to: 1.0
++                value: kcm.colorblindnessCorrectionSettings.intensity
++                onMoved: kcm.colorblindnessCorrectionSettings.intensity = value
++            }
+ 
+-                    RowLayout {
+-                        spacing: 0
+-                        Layout.preferredWidth: intensitySlider.width
++            RowLayout {
++                spacing: 0
++                Layout.preferredWidth: intensitySlider.width
+ 
+-                        QQC2.Label {
+-                            text: i18nc("@label Mild color blindness correction intensity", "Mild")
+-                            textFormat: Text.PlainText
+-                        }
+-                        Item {
+-                            Layout.fillWidth: true
+-                        }
+-                        QQC2.Label {
+-                            text: i18nc("@label Intense color blindness correction intensity", "Intense")
+-                            textFormat: Text.PlainText
+-                        }
+-                    }
++                QQC2.Label {
++                    text: i18nc("@label Mild color blindness correction intensity", "Mild")
++                    textFormat: Text.PlainText
++                }
++                Item {
++                    Layout.fillWidth: true
++                }
++                QQC2.Label {
++                    text: i18nc("@label Intense color blindness correction intensity", "Intense")
++                    textFormat: Text.PlainText
+                 }
+             }
+         }
+-    }
+-
+-    Kirigami.Separator {
+-        Layout.fillWidth: true
+-    }
+-
+-    ColumnLayout {
+-        Layout.fillWidth: true
+-        spacing: Kirigami.Units.smallSpacing
+-
+-        QQC2.Label {
+-            Layout.fillWidth: true
+ 
+-            text: i18nc("@info", "Adjusted colors:")
+-            textFormat: Text.PlainText
+-            wrapMode: Text.WordWrap
+-            horizontalAlignment: Text.AlignHCenter
++        Kirigami.Separator {
++            Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18nc("@title:group", "Adjusted colors")
+         }
+ 
+         RowLayout {
+             id: previewArea
+-            Layout.fillWidth: true
+-            spacing: Kirigami.Units.smallSpacing
+-
+-            Item {
+-                Layout.fillWidth: true
+-            }
++            spacing: Kirigami.Units.largeSpacing
+ 
+             Repeater {
+                 model: [
+@@ -145,27 +122,29 @@ ColumnLayout {
+                 ]
+ 
+                 delegate: Column {
++                    id: swatchColumn
++
++                    required property var modelData
++
+                     spacing: Kirigami.Units.smallSpacing
+ 
+                     QQC2.Label {
+                         anchors.horizontalCenter: parent.horizontalCenter
+-                        text: modelData.name
++                        text: swatchColumn.modelData.name
+                     }
+ 
+                     Repeater {
+-                        model: modelData.colors
++                        model: swatchColumn.modelData.colors
+                         delegate: Rectangle {
+-                            width: Kirigami.Units.gridUnit * 4
+-                            height: Kirigami.Units.gridUnit * 4
++                            required property string modelData
++
++                            width: Kirigami.Units.gridUnit * 3
++                            height: Kirigami.Units.gridUnit * 3
+                             color: modelData
+                         }
+                     }
+                 }
+             }
+-
+-            Item {
+-                Layout.fillWidth: true
+-            }
+         }
+     }
+ }
+diff --git a/kcms/access/ui/DwellClicker.qml b/kcms/access/ui/DwellClicker.qml
+index 17bd01c..d546000 100644
+--- a/kcms/access/ui/DwellClicker.qml
++++ b/kcms/access/ui/DwellClicker.qml
+@@ -11,14 +11,18 @@ import org.kde.kirigami as Kirigami
+ import org.kde.kquickcontrols as KQControls
+ import org.kde.plasma.access.kcm
+ 
+-Kirigami.Form {
+-    id: rootForm
++// Form page: Dwell Clicker. The switch first, its timing and colour below it (disabled while it is off).
++KCMUtils.SimpleKCM {
++    title: i18nc("@title", "Dwell Clicker")
+ 
+-    Kirigami.FormGroup {
+-        Kirigami.FormEntry {
+-            title: i18nc("@label", "Click when pointer remains still:")
+-            contentItem: QQC2.CheckBox {
+-                text: i18nc("@option check, Enable dwell clicker effect", "Enable")
++    Kirigami.FormLayout {
++        RowLayout {
++            // ksr: kcm_access/DwellClicker
++            spacing: Kirigami.Units.smallSpacing
++
++            QQC2.CheckBox {
++                text: i18nc("@option:check", "Click when pointer remains still")
++                Accessible.name: text
+ 
+                 KCMUtils.SettingStateBinding {
+                     configObject: kcm.dwellClickerSettings
+@@ -28,123 +32,122 @@ Kirigami.Form {
+                 checked: kcm.dwellClickerSettings.dwellClicker
+                 onToggled: kcm.dwellClickerSettings.dwellClicker = checked
+             }
+-            trailingItems: [
+-                Kirigami.ContextualHelpButton {
+-                    toolTipText: i18nc("@info:tooltip", "Automatically click when pointer remains still for a set amount of time.")
+-                }
+-            ]
++            Kirigami.ContextualHelpButton {
++                toolTipText: i18nc("@info:tooltip", "Automatically click when pointer remains still for a set amount of time.")
++            }
+         }
+ 
+-        Kirigami.FormEntry {
+-            title: i18nc("@label:spinbox Slow keys Delay", "Motion Threshold:")
+-            contentItem: QQC2.SpinBox {
+-                id: motionThresholdItem
++        Kirigami.Separator {
++            Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18nc("@title:group", "Timing")
++        }
+ 
+-                KCMUtils.SettingStateBinding {
+-                    configObject: kcm.dwellClickerSettings
+-                    settingName: "DwellClickerMotionThreshold"
+-                    extraEnabledConditions: kcm.dwellClickerSettings.dwellClicker
+-                }
++        QQC2.SpinBox {
++            id: motionThresholdItem
++            // ksr: kcm_access/DwellClickerMotionThreshold
++            Kirigami.FormData.label: i18nc("@label:spinbox Slow keys Delay", "Motion threshold:")
+ 
+-                from: 0
+-                to: 100
+-                value: kcm.dwellClickerSettings.dwellClickerMotionThreshold
+-                onValueModified: kcm.dwellClickerSettings.dwellClickerMotionThreshold = value
++            KCMUtils.SettingStateBinding {
++                configObject: kcm.dwellClickerSettings
++                settingName: "DwellClickerMotionThreshold"
++                extraEnabledConditions: kcm.dwellClickerSettings.dwellClicker
++            }
+ 
+-                textFromValue: function(value, locale) {
+-                    return i18ncp("@label:valuesuffix %1 is the motion threshold", "%1 px", "%1 px", value)
+-                }
++            from: 0
++            to: 100
++            value: kcm.dwellClickerSettings.dwellClickerMotionThreshold
++            onValueModified: kcm.dwellClickerSettings.dwellClickerMotionThreshold = value
+ 
+-                validator: IntValidatorWithSuffix {
+-                    bottom: motionThresholdItem.from
+-                    top: motionThresholdItem.to
+-                }
++            textFromValue: function(value, locale) {
++                return i18ncp("@label:valuesuffix %1 is the motion threshold", "%1 px", "%1 px", value)
++            }
+ 
+-                valueFromText: (text, locale) => {
+-                    return Number.fromLocaleString(locale, text.replace(i18ncp("@label:valuesuffix short for pixel(s)", "px", "px"), ""))
+-                }
++            validator: IntValidatorWithSuffix {
++                bottom: motionThresholdItem.from
++                top: motionThresholdItem.to
++            }
++
++            valueFromText: (text, locale) => {
++                return Number.fromLocaleString(locale, text.replace(i18ncp("@label:valuesuffix short for pixel(s)", "px", "px"), ""))
+             }
+         }
+ 
+-        Kirigami.FormEntry {
+-            title: i18nc("@label:spinbox Dwell clicker delay time", "Delay Time:")
+-            contentItem: QQC2.SpinBox {
+-                id: delayTimeItem
++        QQC2.SpinBox {
++            id: delayTimeItem
++            // ksr: kcm_access/DwellClickerDelayTime
++            Kirigami.FormData.label: i18nc("@label:spinbox Dwell clicker delay time", "Delay time:")
+ 
+-                KCMUtils.SettingStateBinding {
+-                    configObject: kcm.dwellClickerSettings
+-                    settingName: "DwellClickerDelayTime"
+-                    extraEnabledConditions: kcm.dwellClickerSettings.dwellClicker
+-                }
++            KCMUtils.SettingStateBinding {
++                configObject: kcm.dwellClickerSettings
++                settingName: "DwellClickerDelayTime"
++                extraEnabledConditions: kcm.dwellClickerSettings.dwellClicker
++            }
+ 
+-                from: 0
+-                to: 30000
+-                value: kcm.dwellClickerSettings.dwellClickerDelayTime
+-                onValueModified: kcm.dwellClickerSettings.dwellClickerDelayTime = value
++            from: 0
++            to: 30000
++            value: kcm.dwellClickerSettings.dwellClickerDelayTime
++            onValueModified: kcm.dwellClickerSettings.dwellClickerDelayTime = value
+ 
+-                textFromValue: function(value, locale) {
+-                    return i18ncp("@label:valuesuffix %1 is the delay time", "%1 ms", "%1 ms", value)
+-                }
++            textFromValue: function(value, locale) {
++                return i18ncp("@label:valuesuffix %1 is the delay time", "%1 ms", "%1 ms", value)
++            }
+ 
+-                validator: IntValidatorWithSuffix {
+-                    bottom: delayTimeItem.from
+-                    top: delayTimeItem.to
+-                }
++            validator: IntValidatorWithSuffix {
++                bottom: delayTimeItem.from
++                top: delayTimeItem.to
++            }
+ 
+-                valueFromText: (text, locale) => {
+-                    return Number.fromLocaleString(locale, text.replace(i18ncp("@label:valuesuffix short for millisecond(s)", "ms", "ms"), ""))
+-                }
++            valueFromText: (text, locale) => {
++                return Number.fromLocaleString(locale, text.replace(i18ncp("@label:valuesuffix short for millisecond(s)", "ms", "ms"), ""))
+             }
+         }
+ 
+-        Kirigami.FormEntry {
+-            title: i18nc("@label:spinbox Dwell clicker dwell time", "Dwell Time:")
+-            contentItem: QQC2.SpinBox {
+-                id: dwellTimeItem
++        QQC2.SpinBox {
++            id: dwellTimeItem
++            // ksr: kcm_access/DwellClickerDwellTime
++            Kirigami.FormData.label: i18nc("@label:spinbox Dwell clicker dwell time", "Dwell time:")
+ 
+-                KCMUtils.SettingStateBinding {
+-                    configObject: kcm.dwellClickerSettings
+-                    settingName: "DwellClickerDwellTime"
+-                    extraEnabledConditions: kcm.dwellClickerSettings.dwellClicker
+-                }
++            KCMUtils.SettingStateBinding {
++                configObject: kcm.dwellClickerSettings
++                settingName: "DwellClickerDwellTime"
++                extraEnabledConditions: kcm.dwellClickerSettings.dwellClicker
++            }
+ 
+-                from: 0
+-                to: 30000
+-                value: kcm.dwellClickerSettings.dwellClickerDwellTime
+-                onValueModified: kcm.dwellClickerSettings.dwellClickerDwellTime = value
++            from: 0
++            to: 30000
++            value: kcm.dwellClickerSettings.dwellClickerDwellTime
++            onValueModified: kcm.dwellClickerSettings.dwellClickerDwellTime = value
+ 
+-                textFromValue: function(value, locale) {
+-                    return i18ncp("@label:valuesuffix %1 is the dwell time", "%1 ms", "%1 ms", value)
+-                }
++            textFromValue: function(value, locale) {
++                return i18ncp("@label:valuesuffix %1 is the dwell time", "%1 ms", "%1 ms", value)
++            }
+ 
+-                validator: IntValidatorWithSuffix {
+-                    bottom: dwellTimeItem.from
+-                    top: dwellTimeItem.to
+-                }
++            validator: IntValidatorWithSuffix {
++                bottom: dwellTimeItem.from
++                top: dwellTimeItem.to
++            }
+ 
+-                valueFromText: (text, locale) => {
+-                    return Number.fromLocaleString(locale, text.replace(i18ncp("@label:valuesuffix short for millisecond(s)", "ms", "ms"), ""))
+-                }
++            valueFromText: (text, locale) => {
++                return Number.fromLocaleString(locale, text.replace(i18ncp("@label:valuesuffix short for millisecond(s)", "ms", "ms"), ""))
+             }
+         }
+ 
+-        Kirigami.FormEntry {
+-            title: i18nc("@label:button Dwell clicker dwell color", "Dwell Color:")
+-            contentItem: KQControls.ColorButton {
+-                id: colorButton
++        KQControls.ColorButton {
++            id: colorButton
++            // ksr: kcm_access/DwellClickerDwellColor
++            Kirigami.FormData.label: i18nc("@label:button Dwell clicker dwell color", "Dwell color:")
++            Accessible.name: i18nc("@label accessible name", "Dwell color")
+ 
+-                color: kcm.dwellClickerSettings.dwellClickerDwellColor
+-                onColorChanged: {
+-                    kcm.dwellClickerSettings.dwellClickerDwellColor = colorButton.color
+-                }
++            color: kcm.dwellClickerSettings.dwellClickerDwellColor
++            onColorChanged: {
++                kcm.dwellClickerSettings.dwellClickerDwellColor = colorButton.color
++            }
+ 
+-                KCMUtils.SettingStateBinding {
+-                    configObject: kcm.dwellClickerSettings
+-                    settingName: "DwellClickerDwellColor"
+-                    extraEnabledConditions: kcm.dwellClickerSettings.dwellClicker
+-                }
++            KCMUtils.SettingStateBinding {
++                configObject: kcm.dwellClickerSettings
++                settingName: "DwellClickerDwellColor"
++                extraEnabledConditions: kcm.dwellClickerSettings.dwellClicker
+             }
+         }
+-
+     }
+ }
+diff --git a/kcms/access/ui/Invert.qml b/kcms/access/ui/Invert.qml
+index c74b4cd..3f08def 100644
+--- a/kcms/access/ui/Invert.qml
++++ b/kcms/access/ui/Invert.qml
+@@ -11,35 +11,38 @@ import QtQuick.Controls as QQC2
+ import org.kde.kcmutils as KCM
+ import org.kde.kirigami as Kirigami
+ 
+-Kirigami.Form {
+-    Kirigami.FormGroup {
+-        Kirigami.FormEntry {
+-            title: i18nc("@label", "Invert:")
+-            subtitle: i18nc("@label Hint for invert effect enable button", "Use shortcuts to toggle inverting display and window colors")
+-            contentItem: QQC2.CheckBox {
+-                id: invertBox
+-                text: i18nc("@option check, Enable invert effect", "Enable")
+-
+-                KCM.SettingStateBinding {
+-                    configObject: kcm.invertSettings
+-                    settingName: "Invert"
+-                }
+-
+-                checked: kcm.invertSettings.invert
+-                onToggled: kcm.invertSettings.invert = checked
++// Form page: Invert. One switch, one hint, one shortcuts button.
++KCM.SimpleKCM {
++    title: i18nc("@title Category name in sidebar, for inverting screen colors", "Invert")
++
++    Kirigami.FormLayout {
++        QQC2.CheckBox {
++            id: invertBox
++            // ksr: kcm_access/Invert-2
++            text: i18nc("@option check, Enable invert effect", "Allow inverting screen colors")
++            Accessible.name: text
++
++            KCM.SettingStateBinding {
++                configObject: kcm.invertSettings
++                settingName: "Invert"
+             }
++
++            checked: kcm.invertSettings.invert
++            onToggled: kcm.invertSettings.invert = checked
+         }
+ 
+-        Kirigami.FormSeparator {}
++        QQC2.Label {
++            Layout.maximumWidth: Kirigami.Units.gridUnit * 16
++            wrapMode: Text.Wrap
++            font: Kirigami.Theme.smallFont
++            text: i18nc("@label Hint for invert effect enable button", "Use shortcuts to toggle inverting display and window colors")
++        }
+ 
+-        Kirigami.FormAction {
+-            enabled: action.enabled
+-            action: QQC2.Action {
+-                enabled: invertBox.checked
+-                text: i18nc("@action:button", "Configure Shortcuts…")
+-                icon.name: "preferences-desktop-keyboard-shortcut"
+-                onTriggered: kcm.configureInvertShortcuts()
+-            }
++        QQC2.Button {
++            enabled: invertBox.checked
++            icon.name: "preferences-desktop-keyboard-shortcut"
++            text: i18nc("@action:button", "Configure Shortcuts…")
++            onClicked: kcm.configureInvertShortcuts()
+         }
+     }
+ }
+diff --git a/kcms/access/ui/KeyboardFilters.qml b/kcms/access/ui/KeyboardFilters.qml
+index dba6c71..2eeacf5 100644
+--- a/kcms/access/ui/KeyboardFilters.qml
++++ b/kcms/access/ui/KeyboardFilters.qml
+@@ -8,17 +8,23 @@ import QtQuick
+ import QtQuick.Layouts
+ import QtQuick.Controls as QQC2
+ import org.kde.kcmutils as KCMUtils
+-
+ import org.kde.kirigami as Kirigami
+ import org.kde.plasma.access.kcm
+ 
+-Kirigami.Form {
+-    Kirigami.FormGroup {
+-        Kirigami.FormEntry {
+-            title: i18nc("@title:group prefix", "Slow keys:")
+-            contentItem: QQC2.CheckBox {
++// Form page: Keyboard Filters. Two parts of the same kind (Slow keys, Bounce keys), each a switch with its delay and
++// bell options indented under it.
++KCMUtils.SimpleKCM {
++    title: i18nc("@title", "Keyboard Filters")
++
++    Kirigami.FormLayout {
++        RowLayout {
++            // ksr: kcm_access/SlowKeys
++            spacing: Kirigami.Units.smallSpacing
++
++            QQC2.CheckBox {
+                 id: slowKeys
+-                text: i18nc("@option:check Enable slow keys", "Enable")
++                text: i18nc("@option:check", "Use slow keys: ignore keys that are not held down long enough")
++                Accessible.name: text
+ 
+                 KCMUtils.SettingStateBinding {
+                     configObject: kcm.keyboardFiltersSettings
+@@ -28,103 +34,105 @@ Kirigami.Form {
+                 checked: kcm.keyboardFiltersSettings.slowKeys
+                 onToggled: kcm.keyboardFiltersSettings.slowKeys = checked
+             }
+-            trailingItems: [
+-                Kirigami.ContextualHelpButton {
+-                    toolTipText: i18nc("@info:tooltip", "For a key to be accepted, it has to be held until the set amount of time. Useful if you accidentally type more than one key at a time or have difficulty pressing the key you want the first time.")
+-                }
+-            ]
++            Kirigami.ContextualHelpButton {
++                toolTipText: i18nc("@info:tooltip", "For a key to be accepted, it has to be held until the set amount of time. Useful if you accidentally type more than one key at a time or have difficulty pressing the key you want the first time.")
++            }
+         }
+ 
+-        Kirigami.FormEntry {
+-            title: i18nc("@label:spinbox Slow keys Delay", "Delay:")
+-            contentItem: QQC2.SpinBox {
+-                id: slowKeyDelay
+-
++        QQC2.SpinBox {
++            id: slowKeyDelay
++            // ksr: kcm_access/SlowKeysDelay
++            Kirigami.FormData.label: i18nc("@label:spinbox Slow keys Delay", "Slow keys delay:")
++            Layout.leftMargin: Kirigami.Units.gridUnit
+ 
+-                KCMUtils.SettingStateBinding {
+-                    configObject: kcm.keyboardFiltersSettings
+-                    settingName: "SlowKeysDelay"
+-                    extraEnabledConditions: kcm.keyboardFiltersSettings.slowKeys
+-                }
++            KCMUtils.SettingStateBinding {
++                configObject: kcm.keyboardFiltersSettings
++                settingName: "SlowKeysDelay"
++                extraEnabledConditions: kcm.keyboardFiltersSettings.slowKeys
++            }
+ 
+-                from: 100
+-                to: 10000
++            from: 100
++            to: 10000
+ 
+-                value: kcm.keyboardFiltersSettings.slowKeysDelay
+-                onValueModified: kcm.keyboardFiltersSettings.slowKeysDelay = value
++            value: kcm.keyboardFiltersSettings.slowKeysDelay
++            onValueModified: kcm.keyboardFiltersSettings.slowKeysDelay = value
+ 
+-                textFromValue: function(value, locale) {
+-                    return i18ncp("@label:valuesuffix %1 is slow keys delay", "%1 ms", "%1 ms", value)
+-                }
++            textFromValue: function(value, locale) {
++                return i18ncp("@label:valuesuffix %1 is slow keys delay", "%1 ms", "%1 ms", value)
++            }
+ 
+-                validator: IntValidatorWithSuffix {
+-                    bottom: slowKeyDelay.from
+-                    top: slowKeyDelay.to
+-                }
++            validator: IntValidatorWithSuffix {
++                bottom: slowKeyDelay.from
++                top: slowKeyDelay.to
++            }
+ 
+-                valueFromText: (text, locale) => {
+-                    return Number.fromLocaleString(locale, text.replace(i18ncp("@label:valuesuffix short for millisecond(s)", "ms", "ms"), ""))
+-                }
++            valueFromText: (text, locale) => {
++                return Number.fromLocaleString(locale, text.replace(i18ncp("@label:valuesuffix short for millisecond(s)", "ms", "ms"), ""))
+             }
+         }
+-        Kirigami.FormSeparator {}
+-        Kirigami.FormEntry {
+-            title: i18nc("@title:group prefix for checkbox group", "Ring system bell:")
+-            contentItem: QQC2.CheckBox {
+-                id: slowKeysPressBeep
+ 
+-                text: i18nc("@option:check Use system bell when a key is pressed", "when any key is &pressed")
++        QQC2.CheckBox {
++            // ksr: kcm_access/SlowKeysPressBeep
++            Kirigami.FormData.label: i18nc("@title:group prefix for checkbox group", "Ring system bell:")
++            Layout.leftMargin: Kirigami.Units.gridUnit
++            text: i18nc("@option:check Use system bell when a key is pressed", "when any key is &pressed")
++            Accessible.name: text
++
++            KCMUtils.SettingStateBinding {
++                configObject: kcm.keyboardFiltersSettings
++                settingName: "SlowKeysPressBeep"
++                extraEnabledConditions: kcm.keyboardFiltersSettings.slowKeys
++            }
+ 
+-                KCMUtils.SettingStateBinding {
+-                    configObject: kcm.keyboardFiltersSettings
+-                    settingName: "SlowKeysPressBeep"
+-                    extraEnabledConditions: kcm.keyboardFiltersSettings.slowKeys
+-                }
++            checked: kcm.keyboardFiltersSettings.slowKeysPressBeep
++            onToggled: kcm.keyboardFiltersSettings.slowKeysPressBeep = checked
++        }
++
++        QQC2.CheckBox {
++            // ksr: kcm_access/SlowKeysAcceptBeep
++            Layout.leftMargin: Kirigami.Units.gridUnit
++            text: i18nc("@option:check Use system bell when a key is accepted", "when any key is &accepted")
++            Accessible.name: text
+ 
+-                checked: kcm.keyboardFiltersSettings.slowKeysPressBeep
+-                onToggled: kcm.keyboardFiltersSettings.slowKeysPressBeep = checked
++            KCMUtils.SettingStateBinding {
++                configObject: kcm.keyboardFiltersSettings
++                settingName: "SlowKeysAcceptBeep"
++                extraEnabledConditions: kcm.keyboardFiltersSettings.slowKeys
+             }
+-        }
+-        Kirigami.FormEntry {
+-            contentItem: QQC2.CheckBox {
+-                id: slowKeysAcceptBeep
+ 
+-                text: i18nc("@option:check Use system bell when a key is accepted", "when any key is &accepted")
++            checked: kcm.keyboardFiltersSettings.slowKeysAcceptBeep
++            onToggled: kcm.keyboardFiltersSettings.slowKeysAcceptBeep = checked
++        }
+ 
+-                KCMUtils.SettingStateBinding {
+-                    configObject: kcm.keyboardFiltersSettings
+-                    settingName: "SlowKeysAcceptBeep"
+-                    extraEnabledConditions: kcm.keyboardFiltersSettings.slowKeys
+-                }
++        QQC2.CheckBox {
++            // ksr: kcm_access/SlowKeysRejectBeep
++            Layout.leftMargin: Kirigami.Units.gridUnit
++            text: i18nc("@option:check Use system bell when a key is rejected", "when any key is &rejected")
++            Accessible.name: text
+ 
+-                checked: kcm.keyboardFiltersSettings.slowKeysAcceptBeep
+-                onToggled: kcm.keyboardFiltersSettings.slowKeysAcceptBeep = checked
++            KCMUtils.SettingStateBinding {
++                configObject: kcm.keyboardFiltersSettings
++                settingName: "SlowKeysRejectBeep"
++                extraEnabledConditions: kcm.keyboardFiltersSettings.slowKeys
+             }
++
++            checked: kcm.keyboardFiltersSettings.slowKeysRejectBeep
++            onToggled: kcm.keyboardFiltersSettings.slowKeysRejectBeep = checked
+         }
+-        Kirigami.FormEntry {
+-            contentItem: QQC2.CheckBox {
+-                id: slowKeysRejectBeep
+ 
+-                text: i18nc("@option:check Use system bell when a key is rejected", "when any key is &rejected")
++        Kirigami.Separator {
++            Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18nc("@title:group", "Bounce keys")
++        }
+ 
+-                KCMUtils.SettingStateBinding {
+-                    configObject: kcm.keyboardFiltersSettings
+-                    settingName: "SlowKeysRejectBeep"
+-                    extraEnabledConditions: kcm.keyboardFiltersSettings.slowKeys
+-                }
++        RowLayout {
++            // ksr: kcm_access/BounceKeys
++            spacing: Kirigami.Units.smallSpacing
+ 
+-                checked: kcm.keyboardFiltersSettings.slowKeysRejectBeep
+-                onToggled: kcm.keyboardFiltersSettings.slowKeysRejectBeep = checked
+-            }
+-        }
+-    }
+-    Kirigami.FormGroup {
+-        Kirigami.FormEntry {
+-            title: i18nc("@title:group prefix", "Bounce keys:")
+-            contentItem: QQC2.CheckBox {
++            QQC2.CheckBox {
+                 id: bounceKeys
+-
+-                text: i18nc("@option:check Bounce keys enable", "Enable");
++                text: i18nc("@option:check", "Ignore repeated presses of the same key")
++                Accessible.name: text
+ 
+                 KCMUtils.SettingStateBinding {
+                     configObject: kcm.keyboardFiltersSettings
+@@ -134,59 +142,55 @@ Kirigami.Form {
+                 checked: kcm.keyboardFiltersSettings.bounceKeys
+                 onToggled: kcm.keyboardFiltersSettings.bounceKeys = checked
+             }
+-            trailingItems: [
+-                Kirigami.ContextualHelpButton {
+-                    toolTipText: i18nc("@info:tooltip", "Ignore rapid, repeated keypresses of the same key. Useful if you have hand tremors that cause you to press a key multiple times when you only intend to press once.")
+-                }
+-            ]
++            Kirigami.ContextualHelpButton {
++                toolTipText: i18nc("@info:tooltip", "Ignore rapid, repeated keypresses of the same key. Useful if you have hand tremors that cause you to press a key multiple times when you only intend to press once.")
++            }
+         }
+ 
+-        Kirigami.FormEntry {
+-            title: i18nc("@label:spinbox Bounce keys delay", "Delay:")
+-            contentItem: QQC2.SpinBox {
+-                id: bounceKeysDelay
++        QQC2.SpinBox {
++            id: bounceKeysDelay
++            // ksr: kcm_access/BounceKeysDelay
++            Kirigami.FormData.label: i18nc("@label:spinbox Bounce keys delay", "Bounce keys delay:")
++            Layout.leftMargin: Kirigami.Units.gridUnit
+ 
++            KCMUtils.SettingStateBinding {
++                configObject: kcm.keyboardFiltersSettings
++                settingName: "BounceKeysDelay"
++                extraEnabledConditions: kcm.keyboardFiltersSettings.bounceKeys
++            }
+ 
+-                KCMUtils.SettingStateBinding {
+-                    configObject: kcm.keyboardFiltersSettings
+-                    settingName: "BounceKeysDelay"
+-                    extraEnabledConditions: kcm.keyboardFiltersSettings.bounceKeys
+-                }
+-
+-                from: 5
+-                to: 10000
++            from: 5
++            to: 10000
+ 
+-                value: kcm.keyboardFiltersSettings.bounceKeysDelay
+-                onValueModified: kcm.keyboardFiltersSettings.bounceKeysDelay = value
++            value: kcm.keyboardFiltersSettings.bounceKeysDelay
++            onValueModified: kcm.keyboardFiltersSettings.bounceKeysDelay = value
+ 
+-                textFromValue: function(value, locale) {
+-                    return i18ncp("@label:valuesuffix %1 is bounce keys delay", "%1 ms", "%1 ms", value)
+-                }
+-                validator: IntValidatorWithSuffix {
+-                    bottom: bounceKeysDelay.from
+-                    top: bounceKeysDelay.to
+-                }
+-                valueFromText: (text, locale) => {
+-                    return Number.fromLocaleString(locale, text.replace(i18ncp("@label:valuesuffix short for millisecond(s)", "ms", "ms"), ""))
+-                }
++            textFromValue: function(value, locale) {
++                return i18ncp("@label:valuesuffix %1 is bounce keys delay", "%1 ms", "%1 ms", value)
++            }
++            validator: IntValidatorWithSuffix {
++                bottom: bounceKeysDelay.from
++                top: bounceKeysDelay.to
++            }
++            valueFromText: (text, locale) => {
++                return Number.fromLocaleString(locale, text.replace(i18ncp("@label:valuesuffix short for millisecond(s)", "ms", "ms"), ""))
+             }
+         }
+ 
+-        Kirigami.FormEntry {
+-            contentItem: QQC2.CheckBox {
+-                id: bounceKeysRejectBeep
++        QQC2.CheckBox {
++            // ksr: kcm_access/BounceKeysRejectBeep
++            Layout.leftMargin: Kirigami.Units.gridUnit
++            text: i18nc("@option:check for bounce keys", "Ring system bell when rejected")
++            Accessible.name: text
+ 
+-                text: i18nc("@option:check for bounce keys", "Ring system bell when rejected")
+-
+-                KCMUtils.SettingStateBinding {
+-                    configObject: kcm.keyboardFiltersSettings
+-                    settingName: "BounceKeysRejectBeep"
+-                    extraEnabledConditions: kcm.keyboardFiltersSettings.bounceKeys
+-                }
+-
+-                checked: kcm.keyboardFiltersSettings.bounceKeysRejectBeep
+-                onToggled: kcm.keyboardFiltersSettings.bounceKeysRejectBeep = checked
++            KCMUtils.SettingStateBinding {
++                configObject: kcm.keyboardFiltersSettings
++                settingName: "BounceKeysRejectBeep"
++                extraEnabledConditions: kcm.keyboardFiltersSettings.bounceKeys
+             }
++
++            checked: kcm.keyboardFiltersSettings.bounceKeysRejectBeep
++            onToggled: kcm.keyboardFiltersSettings.bounceKeysRejectBeep = checked
+         }
+     }
+ }
+diff --git a/kcms/access/ui/ModifierKeys.qml b/kcms/access/ui/ModifierKeys.qml
+index b999483..8ce370a 100644
+--- a/kcms/access/ui/ModifierKeys.qml
++++ b/kcms/access/ui/ModifierKeys.qml
+@@ -8,16 +8,22 @@ import QtQuick
+ import QtQuick.Layouts
+ import QtQuick.Controls as QQC2
+ import org.kde.kcmutils as KCMUtils
+-
+ import org.kde.kirigami as Kirigami
+ 
+-Kirigami.Form {
+-    Kirigami.FormGroup {
+-        Kirigami.FormEntry {
+-            title: i18nc("@option:check", "Sticky keys:")
+-            contentItem: QQC2.CheckBox {
+-                Layout.fillWidth: true
+-                text: i18nc("@option:check Enable sticky keys", "Enable")
++// Form page: Modifier Keys. Sticky keys first, then the feedback options. Options that depend on sticky keys are
++// indented and disabled while it is off.
++KCMUtils.SimpleKCM {
++    title: i18nc("@title", "Modifier Keys")
++
++    Kirigami.FormLayout {
++        RowLayout {
++            // ksr: kcm_access/StickyKeys
++            Kirigami.FormData.label: i18nc("@option:check", "Sticky keys:")
++            spacing: Kirigami.Units.smallSpacing
++
++            QQC2.CheckBox {
++                text: i18nc("@option:check", "Use sticky keys")
++                Accessible.name: text
+ 
+                 KCMUtils.SettingStateBinding {
+                     configObject: kcm.keyboardSettings
+@@ -27,16 +33,19 @@ Kirigami.Form {
+                 checked: kcm.keyboardSettings.stickyKeys
+                 onToggled: kcm.keyboardSettings.stickyKeys = checked
+             }
+-            trailingItems: [
+-                Kirigami.ContextualHelpButton {
+-                    toolTipText: i18nc("@info:tooltip", "Modifier keys like Ctrl, Shift, Alt, and the Meta/Super/Windows key act as though they “stick in place” and no longer need to be held down when typing a keyboard shortcut.")
+-                }
+-            ]
++            Kirigami.ContextualHelpButton {
++                toolTipText: i18nc("@info:tooltip", "Modifier keys like Ctrl, Shift, Alt, and the Meta/Super/Windows key act as though they “stick in place” and no longer need to be held down when typing a keyboard shortcut.")
++            }
+         }
+-        Kirigami.FormEntry {
+-            contentItem: QQC2.CheckBox {
+-                Layout.fillWidth: true
++
++        RowLayout {
++            // ksr: kcm_access/StickyKeysLatch
++            Layout.leftMargin: Kirigami.Units.gridUnit
++            spacing: Kirigami.Units.smallSpacing
++
++            QQC2.CheckBox {
+                 text: i18nc("@option:check", "Lock sticky keys")
++                Accessible.name: text
+ 
+                 KCMUtils.SettingStateBinding {
+                     configObject: kcm.keyboardSettings
+@@ -47,51 +56,55 @@ Kirigami.Form {
+                 checked: kcm.keyboardSettings.stickyKeysLatch
+                 onToggled: kcm.keyboardSettings.stickyKeysLatch = checked
+             }
+-            trailingItems: [
+-                Kirigami.ContextualHelpButton {
+-                    toolTipText: i18nc("@info:tooltip", "Pressing a modifier key twice will keep it in active state until pressed again.")
+-                }
+-            ]
++            Kirigami.ContextualHelpButton {
++                toolTipText: i18nc("@info:tooltip", "Pressing a modifier key twice will keep it in active state until pressed again.")
++            }
+         }
+-        Kirigami.FormEntry {
+-            contentItem: QQC2.CheckBox {
+-                id: stickyKeysAutoOff
+-                Layout.fillWidth: true
+-                text: i18nc("@option:check", "Disable when two keys are held down")
+ 
+-                KCMUtils.SettingStateBinding {
+-                    configObject: kcm.keyboardSettings
+-                    settingName: "StickyKeysAutoOff"
+-                    extraEnabledConditions: kcm.keyboardSettings.stickyKeys
+-                }
++        QQC2.CheckBox {
++            // ksr: kcm_access/StickyKeysAutoOff
++            Layout.leftMargin: Kirigami.Units.gridUnit
++            text: i18nc("@option:check", "Disable when two keys are held down")
++            Accessible.name: text
+ 
+-                checked: kcm.keyboardSettings.stickyKeysAutoOff
+-                onToggled: kcm.keyboardSettings.stickyKeysAutoOff = checked
++            KCMUtils.SettingStateBinding {
++                configObject: kcm.keyboardSettings
++                settingName: "StickyKeysAutoOff"
++                extraEnabledConditions: kcm.keyboardSettings.stickyKeys
+             }
++
++            checked: kcm.keyboardSettings.stickyKeysAutoOff
++            onToggled: kcm.keyboardSettings.stickyKeysAutoOff = checked
+         }
+-        Kirigami.FormEntry {
+-            contentItem: QQC2.CheckBox {
+-                Layout.fillWidth: true
+-                text: i18nc("@option:check", "Ring system bell when modifier keys are used")
+ 
+-                KCMUtils.SettingStateBinding {
+-                    configObject: kcm.keyboardSettings
+-                    settingName: "StickyKeysBeep"
+-                    extraEnabledConditions: kcm.keyboardSettings.stickyKeys
+-                }
++        QQC2.CheckBox {
++            // ksr: kcm_access/StickyKeysBeep
++            Layout.leftMargin: Kirigami.Units.gridUnit
++            text: i18nc("@option:check", "Ring system bell when modifier keys are used")
++            Accessible.name: text
+ 
+-                checked: kcm.keyboardSettings.stickyKeysBeep
+-                onToggled: kcm.keyboardSettings.stickyKeysBeep = checked
++            KCMUtils.SettingStateBinding {
++                configObject: kcm.keyboardSettings
++                settingName: "StickyKeysBeep"
++                extraEnabledConditions: kcm.keyboardSettings.stickyKeys
+             }
++
++            checked: kcm.keyboardSettings.stickyKeysBeep
++            onToggled: kcm.keyboardSettings.stickyKeysBeep = checked
+         }
+ 
+-        Kirigami.FormSeparator {}
++        Kirigami.Separator {
++            Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18nc("@title:group", "Feedback")
++        }
++
++        RowLayout {
++            // ksr: kcm_access/ToggleKeysBeep
++            spacing: Kirigami.Units.smallSpacing
+ 
+-        Kirigami.FormEntry {
+-            title: i18nc("@option:check Feedback options:", "Feedback:")
+-            contentItem: QQC2.CheckBox {
+-                Layout.fillWidth: true
++            QQC2.CheckBox {
+                 text: i18nc("@option:check", "Ring system bell when locking keys are used")
++                Accessible.name: text
+ 
+                 KCMUtils.SettingStateBinding {
+                     configObject: kcm.keyboardSettings
+@@ -101,32 +114,29 @@ Kirigami.Form {
+                 checked: kcm.keyboardSettings.toggleKeysBeep
+                 onToggled: kcm.keyboardSettings.toggleKeysBeep = checked
+             }
+-            trailingItems: [
+-                Kirigami.ContextualHelpButton {
+-                    toolTipText: i18nc("@info:tooltip", "The locking keys are Caps Lock, Num Lock, and Scroll Lock.")
+-                }
+-            ]
++            Kirigami.ContextualHelpButton {
++                toolTipText: i18nc("@info:tooltip", "The locking keys are Caps Lock, Num Lock, and Scroll Lock.")
++            }
+         }
+-        Kirigami.FormEntry {
+-            contentItem: QQC2.CheckBox {
+-                text: i18nc("@option:check", "Show notification when modifier or locking keys are used")
+-                Layout.fillWidth: true
+ 
+-                KCMUtils.SettingStateBinding {
+-                    configObject: kcm.keyboardSettings
+-                    settingName: "KeyboardNotifyModifiers"
+-                }
++        QQC2.CheckBox {
++            // ksr: kcm_access/KeyboardNotifyModifiers
++            text: i18nc("@option:check", "Show notification when modifier or locking keys are used")
++            Accessible.name: text
+ 
+-                checked: kcm.keyboardSettings.keyboardNotifyModifiers
+-                onToggled: kcm.keyboardSettings.keyboardNotifyModifiers = checked
++            KCMUtils.SettingStateBinding {
++                configObject: kcm.keyboardSettings
++                settingName: "KeyboardNotifyModifiers"
+             }
++
++            checked: kcm.keyboardSettings.keyboardNotifyModifiers
++            onToggled: kcm.keyboardSettings.keyboardNotifyModifiers = checked
+         }
+-        Kirigami.FormAction {
+-            action: QQC2.Action {
+-                text: i18nc("@action:button", "Configure Notifications…")
+-                icon.name: "preferences-desktop-notification"
+-                onTriggered: kcm.configureKNotify()
+-            }
++
++        QQC2.Button {
++            icon.name: "preferences-desktop-notification"
++            text: i18nc("@action:button", "Configure Notifications…")
++            onClicked: kcm.configureKNotify()
+         }
+     }
+ }
+diff --git a/kcms/access/ui/MouseNavigation.qml b/kcms/access/ui/MouseNavigation.qml
+index 12033fb..80b8866 100644
+--- a/kcms/access/ui/MouseNavigation.qml
++++ b/kcms/access/ui/MouseNavigation.qml
+@@ -11,12 +11,19 @@ import org.kde.kcmutils as KCMUtils
+ import org.kde.kirigami as Kirigami
+ import org.kde.plasma.access.kcm
+ 
+-Kirigami.Form {
+-    Kirigami.FormGroup {
+-        Kirigami.FormEntry {
+-            title: i18nc("@option:check", "Use number pad to move pointer:")
+-            contentItem: QQC2.CheckBox {
+-                text: i18nc("@option:check Enable mouse navigation", "Enable")
++// Form page: Mouse Navigation (pointer moved with the number pad). The switch first, its tuning below it.
++// The tuning rows stay enabled like before (they only matter once the switch is on, but were never tied to it).
++KCMUtils.SimpleKCM {
++    title: i18nc("@title", "Mouse Navigation")
++
++    Kirigami.FormLayout {
++        RowLayout {
++            // ksr: kcm_access/MouseKeys
++            spacing: Kirigami.Units.smallSpacing
++
++            QQC2.CheckBox {
++                text: i18nc("@option:check", "Use number pad to move pointer")
++                Accessible.name: text
+ 
+                 KCMUtils.SettingStateBinding {
+                     configObject: kcm.mouseSettings
+@@ -26,124 +33,125 @@ Kirigami.Form {
+                 checked: kcm.mouseSettings.mouseKeys
+                 onToggled: kcm.mouseSettings.mouseKeys = checked
+             }
+-            trailingItems: [
+-                Kirigami.ContextualHelpButton {
+-                    toolTipText: xi18nc("@info:tooltip", "The numpad key <shortcut>5</shortcut> functions as a mouse click, toggled by <shortcut>/</shortcut> for middle click, <shortcut>*</shortcut> for right click and <shortcut>NumLock</shortcut> for left click. The keys <shortcut>2</shortcut>, <shortcut>4</shortcut>, <shortcut>6</shortcut>, and <shortcut>8</shortcut> allow for cardinal movement (down, left, right, and up). The keys <shortcut>1</shortcut>, <shortcut>3</shortcut>, <shortcut>7</shortcut>, and <shortcut>9</shortcut> allow for diagonal movement.")
+-                }
+-            ]
++            Kirigami.ContextualHelpButton {
++                toolTipText: xi18nc("@info:tooltip", "The numpad key <shortcut>5</shortcut> functions as a mouse click, toggled by <shortcut>/</shortcut> for middle click, <shortcut>*</shortcut> for right click and <shortcut>NumLock</shortcut> for left click. The keys <shortcut>2</shortcut>, <shortcut>4</shortcut>, <shortcut>6</shortcut>, and <shortcut>8</shortcut> allow for cardinal movement (down, left, right, and up). The keys <shortcut>1</shortcut>, <shortcut>3</shortcut>, <shortcut>7</shortcut>, and <shortcut>9</shortcut> allow for diagonal movement.")
++            }
+         }
+ 
+-        Kirigami.FormEntry {
+-            title: i18nc("@label:spinbox", "Acceleration delay:")
+-            contentItem: QQC2.SpinBox {
+-                id: accelerationDelay
++        Kirigami.Separator {
++            Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18nc("@title:group", "Speed")
++        }
+ 
+-                from: 1
+-                to: 490
++        QQC2.SpinBox {
++            id: accelerationDelay
++            // ksr: kcm_access/AccelerationDelay
++            Kirigami.FormData.label: i18nc("@label:spinbox", "Acceleration delay:")
+ 
+-                KCMUtils.SettingStateBinding {
+-                    configObject: kcm.mouseSettings
+-                    settingName: "AccelerationDelay"
+-                }
++            from: 1
++            to: 490
+ 
+-                value: kcm.mouseSettings.accelerationDelay
+-                onValueChanged: kcm.mouseSettings.accelerationDelay = value
++            KCMUtils.SettingStateBinding {
++                configObject: kcm.mouseSettings
++                settingName: "AccelerationDelay"
++            }
+ 
+-                textFromValue: function(value, locale) {
+-                    return i18ncp("@label:valuesuffix acceleration delay spinbox %1 is value", "%1 ms", "%1 ms", value)
+-                }
+-                validator: IntValidatorWithSuffix {
+-                    bottom: accelerationDelay.from
+-                    top: accelerationDelay.to
+-                }
++            value: kcm.mouseSettings.accelerationDelay
++            onValueChanged: kcm.mouseSettings.accelerationDelay = value
+ 
+-                valueFromText: (text, locale) => {
+-                    return Number.fromLocaleString(locale, text.replace(i18ncp("short for millisecond(s)", "ms", "ms"), ""))
+-                }
++            textFromValue: function(value, locale) {
++                return i18ncp("@label:valuesuffix acceleration delay spinbox %1 is value", "%1 ms", "%1 ms", value)
++            }
++            validator: IntValidatorWithSuffix {
++                bottom: accelerationDelay.from
++                top: accelerationDelay.to
++            }
++
++            valueFromText: (text, locale) => {
++                return Number.fromLocaleString(locale, text.replace(i18ncp("short for millisecond(s)", "ms", "ms"), ""))
+             }
+         }
+-        Kirigami.FormEntry {
+-            title: i18nc("@label:spinbox", "Repeat interval:")
+-            contentItem: QQC2.SpinBox {
+-                id: repeatInterval
+ 
+-                from: 1
+-                to: 130
++        QQC2.SpinBox {
++            id: repeatInterval
++            // ksr: kcm_access/RepetitionInterval
++            Kirigami.FormData.label: i18nc("@label:spinbox", "Repeat interval:")
+ 
+-                KCMUtils.SettingStateBinding {
+-                    configObject: kcm.mouseSettings
+-                    settingName: "RepetitionInterval"
+-                }
++            from: 1
++            to: 130
+ 
+-                value: kcm.mouseSettings.repetitionInterval
+-                onValueChanged: kcm.mouseSettings.repetitionInterval = value
++            KCMUtils.SettingStateBinding {
++                configObject: kcm.mouseSettings
++                settingName: "RepetitionInterval"
++            }
+ 
+-                validator: IntValidatorWithSuffix {
+-                    bottom: repeatInterval.from
+-                    top: repeatInterval.to
+-                }
+-                textFromValue: function(value, locale) {
+-                    return i18ncp("@label:valuesuffix repeat interval spinbox %1 is value", "%1 ms", "%1 ms", value)
+-                }
++            value: kcm.mouseSettings.repetitionInterval
++            onValueChanged: kcm.mouseSettings.repetitionInterval = value
+ 
+-                valueFromText: (text, locale) => {
+-                    return Number.fromLocaleString(locale, text.replace(i18ncp("short for millisecond(s)", "ms", "ms"), ""))
+-                }
++            validator: IntValidatorWithSuffix {
++                bottom: repeatInterval.from
++                top: repeatInterval.to
++            }
++            textFromValue: function(value, locale) {
++                return i18ncp("@label:valuesuffix repeat interval spinbox %1 is value", "%1 ms", "%1 ms", value)
++            }
++
++            valueFromText: (text, locale) => {
++                return Number.fromLocaleString(locale, text.replace(i18ncp("short for millisecond(s)", "ms", "ms"), ""))
+             }
+         }
+-        Kirigami.FormEntry {
+-            title: i18nc("@label:spinbox", "Acceleration time:")
+-            contentItem: QQC2.SpinBox {
+-                id: accelerationTime
+ 
+-                from: 1
+-                to: 100
++        QQC2.SpinBox {
++            id: accelerationTime
++            // ksr: kcm_access/AccelerationTime
++            Kirigami.FormData.label: i18nc("@label:spinbox", "Acceleration time:")
+ 
+-                KCMUtils.SettingStateBinding {
+-                    configObject: kcm.mouseSettings
+-                    settingName: "AccelerationTime"
+-                }
++            from: 1
++            to: 100
+ 
+-                value: kcm.mouseSettings.accelerationTime
+-                onValueChanged: kcm.mouseSettings.accelerationTime = value
+-                validator: IntValidatorWithSuffix {
+-                    bottom: accelerationTime.from
+-                    top: accelerationTime.to
+-                }
++            KCMUtils.SettingStateBinding {
++                configObject: kcm.mouseSettings
++                settingName: "AccelerationTime"
++            }
++
++            value: kcm.mouseSettings.accelerationTime
++            onValueChanged: kcm.mouseSettings.accelerationTime = value
++            validator: IntValidatorWithSuffix {
++                bottom: accelerationTime.from
++                top: accelerationTime.to
+             }
+         }
+-        Kirigami.FormEntry {
+-            title: i18nc("@label:spinbox", "Maximum speed:")
+-            contentItem: QQC2.SpinBox {
+ 
+-                from: 1
+-                to: 100
++        QQC2.SpinBox {
++            // ksr: kcm_access/MaxSpeed
++            Kirigami.FormData.label: i18nc("@label:spinbox", "Maximum speed:")
+ 
+-                KCMUtils.SettingStateBinding {
+-                    configObject: kcm.mouseSettings
+-                    settingName: "MaxSpeed"
+-                }
++            from: 1
++            to: 100
+ 
+-                value: kcm.mouseSettings.maxSpeed
+-                onValueChanged: kcm.mouseSettings.maxSpeed = value
++            KCMUtils.SettingStateBinding {
++                configObject: kcm.mouseSettings
++                settingName: "MaxSpeed"
+             }
+-        }
+-        Kirigami.FormEntry {
+-            title: i18nc("@label:spinbox", "Pointer acceleration:")
+-            contentItem: QQC2.SpinBox {
+ 
+-                from: -1000
+-                to: 5000
++            value: kcm.mouseSettings.maxSpeed
++            onValueChanged: kcm.mouseSettings.maxSpeed = value
++        }
+ 
+-                KCMUtils.SettingStateBinding {
+-                    configObject: kcm.mouseSettings
+-                    settingName: "ProfileCurve"
+-                }
++        QQC2.SpinBox {
++            // ksr: kcm_access/ProfileCurve
++            Kirigami.FormData.label: i18nc("@label:spinbox", "Pointer acceleration:")
+ 
+-                value: kcm.mouseSettings.profileCurve
+-                onValueChanged: kcm.mouseSettings.profileCurve = value
++            from: -1000
++            to: 5000
+ 
++            KCMUtils.SettingStateBinding {
++                configObject: kcm.mouseSettings
++                settingName: "ProfileCurve"
+             }
++
++            value: kcm.mouseSettings.profileCurve
++            onValueChanged: kcm.mouseSettings.profileCurve = value
+         }
+     }
+ }
+diff --git a/kcms/access/ui/ScreenReader.qml b/kcms/access/ui/ScreenReader.qml
+index 0dc83f3..83d0a73 100644
+--- a/kcms/access/ui/ScreenReader.qml
++++ b/kcms/access/ui/ScreenReader.qml
+@@ -10,40 +10,50 @@ import QtQuick.Controls as QQC2
+ import org.kde.kcmutils as KCMUtils
+ import org.kde.kirigami as Kirigami
+ 
++// Form page: Screen Reader. kcm.screenReaderInstalled is computed once in the constructor (no second PATH search here).
++KCMUtils.SimpleKCM {
++    title: i18nc("@title", "Screen Reader")
+ 
+-Loader {
+-    active: kcm.orcaInstalled()
+-    Kirigami.PlaceholderMessage {
+-        anchors.centerIn: parent
+-        width: Math.min(implicitWidth, parent.width)
+-        height: Math.min(implicitHeight, parent.height)
+-        visible: !parent.active
+-        icon.name: "preferences-desktop-text-to-speech"
+-        text: i18nc("@info Placeholder message title", "The Orca Screen Reader is not installed")
+-        explanation: i18nc("@info Placeholder message explanation", "Please install it, then close and reopen this window")
+-    }
+-    sourceComponent: Kirigami.Form {
+-        Kirigami.FormGroup {
+-            Kirigami.FormEntry {
+-                contentItem: QQC2.CheckBox {
+-                    id: enableScreenReader
+-                    text: i18nc("@option:check", "Enable Screen Reader")
+-
+-                    KCMUtils.SettingHighlighter {
+-                        highlight: !kcm.screenReaderIsDefaults
+-                    }
+-
+-                    checked: kcm.screenReaderEnabled
+-                    onToggled: kcm.screenReaderEnabled = checked
++    ColumnLayout {
++        Kirigami.PlaceholderMessage {
++            // ksr: kcm_access/OrcaMissing
++            Layout.fillWidth: true
++            Layout.topMargin: Kirigami.Units.gridUnit * 4
++            visible: !kcm.screenReaderInstalled
++            icon.name: "preferences-desktop-text-to-speech"
++            text: i18nc("@info Placeholder message title", "The Orca Screen Reader is not installed")
++            explanation: i18nc("@info Placeholder message explanation", "Please install it, then close and reopen this window")
++        }
++
++        Kirigami.FormLayout {
++            visible: kcm.screenReaderInstalled
++
++            QQC2.CheckBox {
++                // ksr: kcm_access/screenReaderEnabled
++                text: i18nc("@option:check", "Enable Screen Reader")
++                Accessible.name: text
++
++                KCMUtils.SettingHighlighter {
++                    highlight: !kcm.screenReaderIsDefaults
+                 }
++
++                checked: kcm.screenReaderEnabled
++                onToggled: kcm.screenReaderEnabled = checked
+             }
+-            Kirigami.FormAction {
+-                enabled: action.enabled
+-                subtitle: kcm.orcaLaunchFeedback
+-                action: QQC2.Action {
+-                    text: i18nc("@action:button", "Launch Orca Screen Reader Configuration…")
+-                    onTriggered: kcm.launchOrcaConfiguration()
+-                }
++
++            QQC2.Button {
++                // ksr: kcm_access/LaunchOrcaConfig
++                icon.name: "configure"
++                text: i18nc("@action:button", "Launch Orca Screen Reader Configuration…")
++                onClicked: kcm.launchOrcaConfiguration()
++            }
++
++            QQC2.Label {
++                visible: text.length > 0
++                Layout.maximumWidth: Kirigami.Units.gridUnit * 16
++                wrapMode: Text.Wrap
++                font: Kirigami.Theme.smallFont
++                text: kcm.orcaLaunchFeedback
+             }
+         }
+     }
+diff --git a/kcms/access/ui/ShakeCursor.qml b/kcms/access/ui/ShakeCursor.qml
+index 7d094f8..0d1322b 100644
+--- a/kcms/access/ui/ShakeCursor.qml
++++ b/kcms/access/ui/ShakeCursor.qml
+@@ -10,63 +10,65 @@ import QtQuick.Controls as QQC2
+ import org.kde.kcmutils as KCMUtils
+ import org.kde.kirigami as Kirigami
+ 
+-Kirigami.Form {
+-    Kirigami.FormGroup {
+-        Kirigami.FormEntry {
+-            title: i18nc("@label", "Shake pointer to find it:")
+-            contentItem: QQC2.CheckBox {
+-                text: i18nc("@option check, Enable shake pointer effect", "Enable")
++// Form page: Shake Pointer (Wayland only, hidden from the list otherwise).
++KCMUtils.SimpleKCM {
++    title: i18nc("@title Category name in sidebar, shake pointer to find it", "Shake Pointer")
+ 
+-                KCMUtils.SettingStateBinding {
+-                    configObject: kcm.shakeCursorSettings
+-                    settingName: "ShakeCursor"
+-                }
++    Kirigami.FormLayout {
++        QQC2.CheckBox {
++            // ksr: kcm_access/ShakeCursor
++            text: i18nc("@option:check", "Enlarge the pointer when shaken, to find it")
++            Accessible.name: text
+ 
+-                checked: kcm.shakeCursorSettings.shakeCursor
+-                onToggled: kcm.shakeCursorSettings.shakeCursor = checked
++            KCMUtils.SettingStateBinding {
++                configObject: kcm.shakeCursorSettings
++                settingName: "ShakeCursor"
+             }
+-        }
+ 
+-        Kirigami.FormEntry {
+-            title: i18nc("@label Pointer magnification level", "Magnification:")
+-            contentItem: ColumnLayout {
+-                Kirigami.FormData.buddyFor: magnificationSlider
+-                spacing: Kirigami.Units.smallSpacing
++            checked: kcm.shakeCursorSettings.shakeCursor
++            onToggled: kcm.shakeCursorSettings.shakeCursor = checked
++        }
+ 
+-                QQC2.Slider {
+-                    id: magnificationSlider
++        ColumnLayout {
++            // ksr: kcm_access/ShakeCursorMagnification
++            Kirigami.FormData.label: i18nc("@label Pointer magnification level", "Magnification:")
++            Kirigami.FormData.buddyFor: magnificationSlider
++            spacing: Kirigami.Units.smallSpacing
+ 
+-                    Layout.preferredWidth: Kirigami.Units.gridUnit * 15
++            QQC2.Slider {
++                id: magnificationSlider
+ 
+-                    KCMUtils.SettingStateBinding {
+-                        configObject: kcm.shakeCursorSettings
+-                        settingName: "ShakeCursorMagnification"
+-                        extraEnabledConditions: kcm.shakeCursorSettings.shakeCursor
+-                    }
++                Layout.preferredWidth: Kirigami.Units.gridUnit * 15
++                Accessible.name: i18nc("@label accessible name", "Magnification")
+ 
+-                    from: 2
+-                    to: 10
+-                    stepSize: 1
+-                    Kirigami.StyleHints.tickMarkStepSize: 1
+-                    snapMode: QQC2.Slider.SnapAlways
+-                    value: kcm.shakeCursorSettings.shakeCursorMagnification
+-                    onMoved: kcm.shakeCursorSettings.shakeCursorMagnification = value
++                KCMUtils.SettingStateBinding {
++                    configObject: kcm.shakeCursorSettings
++                    settingName: "ShakeCursorMagnification"
++                    extraEnabledConditions: kcm.shakeCursorSettings.shakeCursor
+                 }
+ 
+-                RowLayout {
+-                    spacing: 0
++                from: 2
++                to: 10
++                stepSize: 1
++                Kirigami.StyleHints.tickMarkStepSize: 1
++                snapMode: QQC2.Slider.SnapAlways
++                value: kcm.shakeCursorSettings.shakeCursorMagnification
++                onMoved: kcm.shakeCursorSettings.shakeCursorMagnification = value
++            }
++
++            RowLayout {
++                spacing: 0
+ 
+-                    QQC2.Label {
+-                        text: i18nc("@label Normal pointer size", "Normal")
+-                        textFormat: Text.PlainText
+-                    }
+-                    Item {
+-                        Layout.fillWidth: true
+-                    }
+-                    QQC2.Label {
+-                        text: i18nc("@label Large pointer size", "Large")
+-                        textFormat: Text.PlainText
+-                    }
++                QQC2.Label {
++                    text: i18nc("@label Normal pointer size", "Normal")
++                    textFormat: Text.PlainText
++                }
++                Item {
++                    Layout.fillWidth: true
++                }
++                QQC2.Label {
++                    text: i18nc("@label Large pointer size", "Large")
++                    textFormat: Text.PlainText
+                 }
+             }
+         }
+diff --git a/kcms/access/ui/TextSize.qml b/kcms/access/ui/TextSize.qml
+index 2e384e1..38f797e 100644
+--- a/kcms/access/ui/TextSize.qml
++++ b/kcms/access/ui/TextSize.qml
+@@ -5,29 +5,45 @@
+ */
+ 
+ import QtQuick
++import QtQuick.Layouts
+ import QtQuick.Controls as QQC2
+ 
+ import org.kde.kcmutils as KCM
+ import org.kde.kirigami as Kirigami
+ 
+-Kirigami.Form {
+-    Kirigami.FormGroup {
+-        Kirigami.FormAction {
+-            subtitle: i18nc("@info", "Recommended in most situations. Makes text and everything else bigger and keeps their proportions; on low-resolution screens, some small graphics may look slightly blurry.")
+-            action: QQC2.Action {
+-                text: i18nc("@action:button", "Configure Display Scale…")
+-                icon.name: "preferences-desktop-display"
+-                onTriggered: KCM.KCMLauncher.openSystemSettings("kcm_kscreen")
+-            }
++// Form page: two links to the pages that own these settings (kcm_kscreen owns scale, kcm_fonts owns font size).
++KCM.SimpleKCM {
++    title: i18nc("@title", "Text Size")
++
++    Kirigami.FormLayout {
++        QQC2.Button {
++            // ksr: kcm_access/ConfigureDisplayScale
++            Kirigami.FormData.label: i18nc("@label", "Make everything bigger:")
++            icon.name: "preferences-desktop-display"
++            text: i18nc("@action:button", "Configure Display Scale…")
++            onClicked: KCM.KCMLauncher.openSystemSettings("kcm_kscreen")
++        }
++
++        QQC2.Label {
++            Layout.maximumWidth: Kirigami.Units.gridUnit * 16
++            wrapMode: Text.Wrap
++            font: Kirigami.Theme.smallFont
++            text: i18nc("@info", "Recommended in most situations. Makes text and everything else bigger and keeps their proportions; on low-resolution screens, some small graphics may look slightly blurry.")
++        }
++
++        QQC2.Button {
++            // ksr: kcm_access/ConfigureFonts
++            Kirigami.FormData.label: i18nc("@label", "Make only text bigger:")
++            icon.name: "preferences-desktop-font"
++            text: i18nc("@action:button", "Configure Fonts…")
++            onClicked: KCM.KCMLauncher.openSystemSettings("kcm_fonts")
+         }
+ 
+-        Kirigami.FormAction {
+-            subtitle: i18nc("@info", "Only suitable for small size changes. Changes the text alone, so large changes can make text no longer fit or look good next to icons and other elements.")
+-            action: QQC2.Action {
+-                text: i18nc("@action:button", "Configure Fonts…")
+-                icon.name: "preferences-desktop-font"
+-                onTriggered: KCM.KCMLauncher.openSystemSettings("kcm_fonts")
+-            }
++        QQC2.Label {
++            Layout.maximumWidth: Kirigami.Units.gridUnit * 16
++            wrapMode: Text.Wrap
++            font: Kirigami.Theme.smallFont
++            text: i18nc("@info", "Only suitable for small size changes. Changes the text alone, so large changes can make text no longer fit or look good next to icons and other elements.")
+         }
+     }
+ }
+diff --git a/kcms/access/ui/ZoomMagnifier.qml b/kcms/access/ui/ZoomMagnifier.qml
+index d46d6f7..787635a 100644
+--- a/kcms/access/ui/ZoomMagnifier.qml
++++ b/kcms/access/ui/ZoomMagnifier.qml
+@@ -11,329 +11,327 @@ import QtQuick.Controls as QQC2
+ import org.kde.kcmutils as KCM
+ import org.kde.kirigami as Kirigami
+ import org.kde.kquickcontrols as KQuickControls
+-import org.kde.kwindowsystem
+-
+-Kirigami.Form {
+-    id: pageLayout
+-
+-    component FullScreenZoomSettingsModel : ObjectModel {
+-        id: objectModel
+-        property bool visible: kcm.zoomMagnifierSettings.zoom
+-        Kirigami.FormEntry {
+-            visible: objectModel.visible
+-            title: i18nc("@label:spinbox", "Show pixel grid at zoom level:")
+-            contentItem: QQC2.SpinBox {
+-                id: zoomPixelGridZoomSpinBox
+-
+-                from: toInt(0)
+-                to: toInt(100)
+-                stepSize: toInt(1)
+-
+-                validator: IntValidator {
+-                    bottom: Math.min(zoomPixelGridZoomSpinBox.from, zoomPixelGridZoomSpinBox.to)
+-                    top: Math.max(zoomPixelGridZoomSpinBox.from, zoomPixelGridZoomSpinBox.to)
+-                }
+ 
+-                textFromValue: (value, locale) => fromInt(value).toLocaleString(locale, 'f', 2)
+-                valueFromText: (text, locale) => Math.round(toInt(Number.fromLocaleString(locale, text)))
++// Form page: Zoom & Magnifier. The mode first (three exclusive short options = radio group), then the zoom factor,
++// then only the options of the chosen mode (the other mode's options are hidden, not disabled: they belong to a mode
++// that is not selected), then shortcuts.
++KCM.SimpleKCM {
++    id: page
+ 
+-                value: toInt(kcm.zoomMagnifierSettings.zoomPixelGridZoom)
+-                onValueModified: kcm.zoomMagnifierSettings.zoomPixelGridZoom = fromInt(value)
++    title: i18nc("@title Category name in sidebar", "Zoom & Magnifier")
+ 
+-                function toInt(value: double) : int {
+-                    return value * 100;
+-                }
++    readonly property bool zoomOn: kcm.zoomMagnifierSettings.zoom
++    readonly property bool magnifierOn: kcm.zoomMagnifierSettings.magnifier
+ 
+-                function fromInt(value: int) : double {
+-                    return value / 100;
+-                }
++    Kirigami.FormLayout {
++        QQC2.ButtonGroup { id: effectGroup }
+ 
+-                KCM.SettingStateBinding {
+-                    configObject: kcm.zoomMagnifierSettings
+-                    settingName: "ZoomPixelGridZoom"
+-                }
+-            }
++        QQC2.RadioButton {
++            id: zoomRadioButton
++            // ksr: kcm_access/zoomMagnifierSettings-zoom
++            Kirigami.FormData.label: i18nc("@label, followed by 'full screen' or 'magnify region'", "Zoom:")
++            QQC2.ButtonGroup.group: effectGroup
++
++            text: i18nc("@option:check, enable zoom effect, following 'Zoom:'", "Full screen")
++            checked: kcm.zoomMagnifierSettings.zoom
++            onToggled: { kcm.zoomMagnifierSettings.zoom = true; kcm.zoomMagnifierSettings.magnifier = false; }
++
++            KCM.SettingHighlighter { highlight: !kcm.zoomMagnifierSettings.zoom }
+         }
+ 
+-        Kirigami.FormEntry {
+-            visible: objectModel.visible
+-            title: i18nc("@label:listbox", "Pointer tracking:")
+-            contentItem: QQC2.ComboBox {
+-                delegate: QQC2.ItemDelegate {
+-                    id: delegate
++        QQC2.RadioButton {
++            id: magnifierRadioButton
++            // ksr: kcm_access/zoomMagnifierSettings-magnifier
++            QQC2.ButtonGroup.group: effectGroup
+ 
+-                    required property string title
+-                    required property string description
++            text: i18nc("@option:check, enable magnify effect, following 'Zoom:'", "Magnify region")
++            checked: kcm.zoomMagnifierSettings.magnifier
++            onToggled: { kcm.zoomMagnifierSettings.zoom = false; kcm.zoomMagnifierSettings.magnifier = true; }
+ 
+-                    width: parent?.width ?? 0
++            KCM.SettingHighlighter { highlight: !kcm.zoomMagnifierSettings.zoom }
++        }
+ 
+-                    text: delegate.title
++        QQC2.RadioButton {
++            id: noneRadioButton
++            QQC2.ButtonGroup.group: effectGroup
+ 
+-                    contentItem: Kirigami.TitleSubtitle {
+-                        title: delegate.title
+-                        subtitle: delegate.description
+-                        font: delegate.font
+-                        selected: delegate.highlighted || delegate.down
+-                        wrapMode: Text.Wrap
+-                    }
+-                }
+-                model: [
+-                    {
+-                        title: i18nc("@item:inlistbox", "Proportional"),
+-                        description: i18nc("@item:inlistbox", "Zoom area moves in sync with pointer"),
+-                        settingIndex: 0
+-                    },
+-                    {
+-                        title: i18nc("@item:inlistbox", "Centered"),
+-                        description: i18nc("@item:inlistbox", "Pointer stays centered on-screen, except near screen edges"),
+-                        settingIndex: 1
+-                    },
+-                    {
+-                        title: i18nc("@item:inlistbox", "Centered (Strict)"),
+-                        description: i18nc("@item:inlistbox", "Pointer stays centered on-screen, even near screen edges"),
+-                        settingIndex: 4
+-                    },
+-                    {
+-                        title: i18nc("@item:inlistbox", "Push"),
+-                        description: i18nc("@item:inlistbox", "Pointer pushes zoom area at screen edges"),
+-                        settingIndex: 2
+-                    },
+-                    {
+-                        title: i18nc("@item:inlistbox", "Disabled"),
+-                        description: i18nc("@item:inlistbox", "Zoom area doesn't follow pointer"),
+-                        settingIndex: 3
+-                    }
+-                ]
+-                textRole: "title"
+-                currentIndex: model.findIndex(m => m.settingIndex === kcm.zoomMagnifierSettings.zoomMouseTracking)
+-                onActivated: index => kcm.zoomMagnifierSettings.zoomMouseTracking = model[index].settingIndex
+-
+-                Layout.preferredWidth: Kirigami.Units.gridUnit * 15
+-
+-                KCM.SettingStateBinding {
+-                    configObject: kcm.zoomMagnifierSettings
+-                    settingName: "ZoomMouseTracking"
+-                }
+-            }
++            text: i18nc("@option:check, disable zoom/magnify effect", "Disabled")
++            checked: !(kcm.zoomMagnifierSettings.zoom || kcm.zoomMagnifierSettings.magnifier)
++            onToggled: { kcm.zoomMagnifierSettings.zoom = false; kcm.zoomMagnifierSettings.magnifier = false; }
++
++            KCM.SettingHighlighter { highlight: !kcm.zoomMagnifierSettings.zoom }
+         }
+ 
+-        Kirigami.FormEntry {
+-            visible: objectModel.visible
+-            contentItem: QQC2.CheckBox {
+-                text: i18nc("@option:check", "Sharpen screen content while zoomed in")
+-                checked: kcm.zoomMagnifierSettings.zoomUsePatternUpscaler
+-                onCheckedChanged: kcm.zoomMagnifierSettings.zoomUsePatternUpscaler = checked
++        QQC2.SpinBox {
++            id: sharedZoomFactorSpinBox
++            // ksr: kcm_access/SharedZoomFactor
++            Kirigami.FormData.label: i18nc("@label:spinbox", "Zoom factor:")
+ 
+-                KCM.SettingStateBinding {
+-                    configObject: kcm.zoomMagnifierSettings
+-                    settingName: "ZoomUsePatternUpscaler"
+-                }
++            from: toInt(1.05)
++            to: toInt(4)
++            stepSize: toInt(0.05)
++
++            validator: IntValidator {
++                bottom: Math.min(sharedZoomFactorSpinBox.from, sharedZoomFactorSpinBox.to)
++                top: Math.max(sharedZoomFactorSpinBox.from, sharedZoomFactorSpinBox.to)
+             }
+-        }
+ 
+-        Kirigami.FormEntry {
+-            visible: objectModel.visible
+-            contentItem: QQC2.CheckBox {
+-                text: i18nc("@option:check", "Enable text caret tracking")
+-                checked: kcm.zoomMagnifierSettings.zoomEnableTextCaretTracking
+-                onCheckedChanged: kcm.zoomMagnifierSettings.zoomEnableTextCaretTracking = checked
++            textFromValue: (value, locale) => fromInt(value).toLocaleString(locale, 'f', 2)
++            valueFromText: (text, locale) => Math.round(toInt(Number.fromLocaleString(locale, text)))
+ 
+-                KCM.SettingStateBinding {
+-                    configObject: kcm.zoomMagnifierSettings
+-                    settingName: "ZoomEnableTextCaretTracking"
+-                }
++            value: toInt(kcm.zoomMagnifierSettings.sharedZoomFactor)
++            onValueModified: kcm.zoomMagnifierSettings.sharedZoomFactor = fromInt(value)
++
++            function toInt(value: double) : int {
++                return value * 20;
++            }
++
++            function fromInt(value: int) : double {
++                return value / 20;
++            }
++
++            KCM.SettingStateBinding {
++                configObject: kcm.zoomMagnifierSettings
++                settingName: "SharedZoomFactor"
++                extraEnabledConditions: page.zoomOn || page.magnifierOn
+             }
+         }
+-    }
+ 
+-    component MagnifierZoomSettingsModel : ObjectModel {
+-        id: objectModel
+-        property bool visible: kcm.zoomMagnifierSettings.magnifier
+-        Kirigami.FormEntry {
+-            visible: objectModel.visible
+-            title: i18nc("@label:spinbox", "Width:")
+-            contentItem: QQC2.SpinBox {
+-                id: magnifierWidthSpinBox
+-
+-                from: 100
+-                to: 2000
+-                stepSize: 10
+-
+-                validator: IntValidator {
+-                    bottom: Math.min(magnifierWidthSpinBox.from, magnifierWidthSpinBox.to)
+-                    top: Math.max(magnifierWidthSpinBox.from, magnifierWidthSpinBox.to)
++        KQuickControls.KeySequenceItem {
++            id: zoomPointerAxisGestureModifiersBox
++            // ksr: kcm_access/ZoomPointerAxisGestureModifiers
++            Kirigami.FormData.label: i18nc("@label", "Scroll gesture modifier keys:")
++            enabled: page.zoomOn || page.magnifierOn
++            keySequence: kcm.zoomMagnifierSettings.zoomPointerAxisGestureModifiers
++            onKeySequenceModified: kcm.zoomMagnifierSettings.zoomPointerAxisGestureModifiers = keySequence
++            patterns: KQuickControls.ShortcutPattern.Modifier
++            multiKeyShortcutsAllowed: false
++
++            Connections {
++                target: kcm.zoomMagnifierSettings
++
++                // We have to do this because keySequence binding is broken
++                function onZoomPointerAxisGestureModifiersChanged() {
++                    zoomPointerAxisGestureModifiersBox.keySequence = kcm.zoomMagnifierSettings.zoomPointerAxisGestureModifiers;
+                 }
++            }
+ 
+-                textFromValue: (value, locale) => { return i18ncp("short for pixel(s)", "%1 px", "%1 px", value); }
+-                valueFromText: (text, locale) => { return Number.fromLocaleString(locale, text.replace(i18nc("short for pixel(s)", "px"), "")); }
++            KCM.SettingStateBinding {
++                configObject: kcm.zoomMagnifierSettings
++                settingName: "ZoomPointerAxisGestureModifiers"
++            }
++        }
+ 
+-                value: kcm.zoomMagnifierSettings.magnifierWidth
+-                onValueModified: kcm.zoomMagnifierSettings.magnifierWidth = value
++        QQC2.Label {
++            Layout.maximumWidth: Kirigami.Units.gridUnit * 16
++            wrapMode: Text.Wrap
++            font: Kirigami.Theme.smallFont
++            text: i18nc("@label Hint for scroll gestures", "Scroll while modifier keys are pressed to zoom")
++        }
+ 
+-                KCM.SettingStateBinding {
+-                    configObject: kcm.zoomMagnifierSettings
+-                    settingName: "MagnifierWidth"
+-                }
+-            }
++        // ---- Full screen options
++        Kirigami.Separator {
++            visible: page.zoomOn
++            Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18nc("@title:group", "Full screen zoom")
+         }
+ 
+-        Kirigami.FormEntry {
+-            visible: objectModel.visible
+-            title: i18nc("@label:spinbox", "Height:")
+-            contentItem: QQC2.SpinBox {
+-                id: magnifierHeightSpinBox
++        QQC2.ComboBox {
++            // ksr: kcm_access/ZoomMouseTracking
++            visible: page.zoomOn
++            Kirigami.FormData.label: i18nc("@label:listbox", "Pointer tracking:")
++            Layout.preferredWidth: Kirigami.Units.gridUnit * 15
+ 
+-                from: 100
+-                to: 2000
+-                stepSize: 10
++            delegate: QQC2.ItemDelegate {
++                id: delegate
+ 
+-                validator: IntValidator {
+-                    bottom: Math.min(magnifierHeightSpinBox.from, magnifierHeightSpinBox.to)
+-                    top: Math.max(magnifierHeightSpinBox.from, magnifierHeightSpinBox.to)
+-                }
++                required property string title
++                required property string description
+ 
+-                textFromValue: (value, locale) => { return i18ncp("short for pixel(s)", "%1 px", "%1 px", value); }
+-                valueFromText: (text, locale) => { return Number.fromLocaleString(locale, text.replace(i18nc("short for pixel(s)", "px"), "")); }
++                width: parent?.width ?? 0
+ 
+-                value: kcm.zoomMagnifierSettings.magnifierHeight
+-                onValueModified: kcm.zoomMagnifierSettings.magnifierHeight = value
++                text: delegate.title
+ 
+-                KCM.SettingStateBinding {
+-                    configObject: kcm.zoomMagnifierSettings
+-                    settingName: "MagnifierHeight"
++                contentItem: Kirigami.TitleSubtitle {
++                    title: delegate.title
++                    subtitle: delegate.description
++                    font: delegate.font
++                    selected: delegate.highlighted || delegate.down
++                    wrapMode: Text.Wrap
++                }
++            }
++            model: [
++                {
++                    title: i18nc("@item:inlistbox", "Proportional"),
++                    description: i18nc("@item:inlistbox", "Zoom area moves in sync with pointer"),
++                    settingIndex: 0
++                },
++                {
++                    title: i18nc("@item:inlistbox", "Centered"),
++                    description: i18nc("@item:inlistbox", "Pointer stays centered on-screen, except near screen edges"),
++                    settingIndex: 1
++                },
++                {
++                    title: i18nc("@item:inlistbox", "Centered (Strict)"),
++                    description: i18nc("@item:inlistbox", "Pointer stays centered on-screen, even near screen edges"),
++                    settingIndex: 4
++                },
++                {
++                    title: i18nc("@item:inlistbox", "Push"),
++                    description: i18nc("@item:inlistbox", "Pointer pushes zoom area at screen edges"),
++                    settingIndex: 2
++                },
++                {
++                    title: i18nc("@item:inlistbox", "Disabled"),
++                    description: i18nc("@item:inlistbox", "Zoom area doesn't follow pointer"),
++                    settingIndex: 3
+                 }
++            ]
++            textRole: "title"
++            currentIndex: model.findIndex(m => m.settingIndex === kcm.zoomMagnifierSettings.zoomMouseTracking)
++            onActivated: index => kcm.zoomMagnifierSettings.zoomMouseTracking = model[index].settingIndex
++
++            KCM.SettingStateBinding {
++                configObject: kcm.zoomMagnifierSettings
++                settingName: "ZoomMouseTracking"
+             }
+         }
+-    }
+ 
+-    Kirigami.FormGroup {
+-        Kirigami.FormEntry {
+-            title: i18nc("@label, followed by 'full screen' or 'magnify region'", "Zoom:")
+-            contentItem: QQC2.RadioButton {
+-                id: zoomRadioButton
+-                QQC2.ButtonGroup.group: effectGroup
+-
+-                text: i18nc("@option:check, enable zoom effect, following 'Zoom:'", "Full screen")
+-                checked: kcm.zoomMagnifierSettings.zoom
+-                onToggled: { kcm.zoomMagnifierSettings.zoom = true; kcm.zoomMagnifierSettings.magnifier = false; }
+-
+-                QQC2.ButtonGroup { id: effectGroup }
++        QQC2.CheckBox {
++            // ksr: kcm_access/ZoomUsePatternUpscaler
++            visible: page.zoomOn
++            text: i18nc("@option:check", "Sharpen screen content while zoomed in")
++            Accessible.name: text
++            checked: kcm.zoomMagnifierSettings.zoomUsePatternUpscaler
++            onCheckedChanged: kcm.zoomMagnifierSettings.zoomUsePatternUpscaler = checked
++
++            KCM.SettingStateBinding {
++                configObject: kcm.zoomMagnifierSettings
++                settingName: "ZoomUsePatternUpscaler"
++            }
++        }
+ 
+-                KCM.SettingHighlighter { highlight: !kcm.zoomMagnifierSettings.zoom }
++        QQC2.CheckBox {
++            // ksr: kcm_access/ZoomEnableTextCaretTracking
++            visible: page.zoomOn
++            text: i18nc("@option:check", "Enable text caret tracking")
++            Accessible.name: text
++            checked: kcm.zoomMagnifierSettings.zoomEnableTextCaretTracking
++            onCheckedChanged: kcm.zoomMagnifierSettings.zoomEnableTextCaretTracking = checked
++
++            KCM.SettingStateBinding {
++                configObject: kcm.zoomMagnifierSettings
++                settingName: "ZoomEnableTextCaretTracking"
+             }
+         }
+ 
+-        Kirigami.FormEntry {
+-            contentItem: QQC2.RadioButton {
+-                id: magnifierRadioButton
+-                QQC2.ButtonGroup.group: effectGroup
++        QQC2.SpinBox {
++            id: zoomPixelGridZoomSpinBox
++            // ksr: kcm_access/ZoomPixelGridZoom
++            visible: page.zoomOn
++            Kirigami.FormData.label: i18nc("@label:spinbox", "Show pixel grid at zoom level:")
+ 
+-                text: i18nc("@option:check, enable magnify effect, following 'Zoom:'", "Magnify region")
+-                checked: kcm.zoomMagnifierSettings.magnifier
+-                onToggled: { kcm.zoomMagnifierSettings.zoom = false; kcm.zoomMagnifierSettings.magnifier = true; }
++            from: toInt(0)
++            to: toInt(100)
++            stepSize: toInt(1)
+ 
+-                KCM.SettingHighlighter { highlight: !kcm.zoomMagnifierSettings.zoom }
++            validator: IntValidator {
++                bottom: Math.min(zoomPixelGridZoomSpinBox.from, zoomPixelGridZoomSpinBox.to)
++                top: Math.max(zoomPixelGridZoomSpinBox.from, zoomPixelGridZoomSpinBox.to)
+             }
+-        }
+ 
+-        Kirigami.FormEntry {
+-            contentItem: QQC2.RadioButton {
+-                id: noneRadioButton
+-                QQC2.ButtonGroup.group: effectGroup
++            textFromValue: (value, locale) => fromInt(value).toLocaleString(locale, 'f', 2)
++            valueFromText: (text, locale) => Math.round(toInt(Number.fromLocaleString(locale, text)))
+ 
+-                text: i18nc("@option:check, disable zoom/magnify effect", "Disabled")
+-                checked: !(kcm.zoomMagnifierSettings.zoom || kcm.zoomMagnifierSettings.magnifier)
+-                onToggled: { kcm.zoomMagnifierSettings.zoom = false; kcm.zoomMagnifierSettings.magnifier = false; }
++            value: toInt(kcm.zoomMagnifierSettings.zoomPixelGridZoom)
++            onValueModified: kcm.zoomMagnifierSettings.zoomPixelGridZoom = fromInt(value)
+ 
+-                KCM.SettingHighlighter { highlight: !kcm.zoomMagnifierSettings.zoom }
++            function toInt(value: double) : int {
++                return value * 100;
+             }
+-        }
+ 
+-        Kirigami.FormSeparator { visible: kcm.zoomMagnifierSettings.zoom || kcm.zoomMagnifierSettings.magnifier}
++            function fromInt(value: int) : double {
++                return value / 100;
++            }
+ 
+-        Repeater {
+-            model: FullScreenZoomSettingsModel {}
++            KCM.SettingStateBinding {
++                configObject: kcm.zoomMagnifierSettings
++                settingName: "ZoomPixelGridZoom"
++            }
+         }
+ 
+-        Repeater {
+-            model: MagnifierZoomSettingsModel {}
++        // ---- Magnify region options
++        Kirigami.Separator {
++            visible: page.magnifierOn
++            Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18nc("@title:group", "Magnify region")
+         }
+ 
+-        Kirigami.FormSeparator {}
++        QQC2.SpinBox {
++            id: magnifierWidthSpinBox
++            // ksr: kcm_access/MagnifierWidth
++            visible: page.magnifierOn
++            Kirigami.FormData.label: i18nc("@label:spinbox", "Width:")
+ 
+-        Kirigami.FormEntry {
+-            title: i18nc("@label:spinbox", "Zoom factor:")
+-            contentItem: QQC2.SpinBox {
+-                id: sharedZoomFactorSpinBox
++            from: 100
++            to: 2000
++            stepSize: 10
+ 
+-                from: toInt(1.05)
+-                to: toInt(4)
+-                stepSize: toInt(0.05)
++            validator: IntValidator {
++                bottom: Math.min(magnifierWidthSpinBox.from, magnifierWidthSpinBox.to)
++                top: Math.max(magnifierWidthSpinBox.from, magnifierWidthSpinBox.to)
++            }
+ 
+-                validator: IntValidator {
+-                    bottom: Math.min(sharedZoomFactorSpinBox.from, sharedZoomFactorSpinBox.to)
+-                    top: Math.max(sharedZoomFactorSpinBox.from, sharedZoomFactorSpinBox.to)
+-                }
++            textFromValue: (value, locale) => { return i18ncp("short for pixel(s)", "%1 px", "%1 px", value); }
++            valueFromText: (text, locale) => { return Number.fromLocaleString(locale, text.replace(i18nc("short for pixel(s)", "px"), "")); }
+ 
+-                textFromValue: (value, locale) => fromInt(value).toLocaleString(locale, 'f', 2)
+-                valueFromText: (text, locale) => Math.round(toInt(Number.fromLocaleString(locale, text)))
++            value: kcm.zoomMagnifierSettings.magnifierWidth
++            onValueModified: kcm.zoomMagnifierSettings.magnifierWidth = value
+ 
+-                value: toInt(kcm.zoomMagnifierSettings.sharedZoomFactor)
+-                onValueModified: kcm.zoomMagnifierSettings.sharedZoomFactor = fromInt(value)
++            KCM.SettingStateBinding {
++                configObject: kcm.zoomMagnifierSettings
++                settingName: "MagnifierWidth"
++            }
++        }
+ 
+-                function toInt(value: double) : int {
+-                    return value * 20;
+-                }
++        QQC2.SpinBox {
++            id: magnifierHeightSpinBox
++            // ksr: kcm_access/MagnifierHeight
++            visible: page.magnifierOn
++            Kirigami.FormData.label: i18nc("@label:spinbox", "Height:")
+ 
+-                function fromInt(value: int) : double {
+-                    return value / 20;
+-                }
++            from: 100
++            to: 2000
++            stepSize: 10
+ 
+-                KCM.SettingStateBinding {
+-                    configObject: kcm.zoomMagnifierSettings
+-                    settingName: "SharedZoomFactor"
+-                    extraEnabledConditions: kcm.zoomMagnifierSettings.zoom || kcm.zoomMagnifierSettings.magnifier
+-                }
++            validator: IntValidator {
++                bottom: Math.min(magnifierHeightSpinBox.from, magnifierHeightSpinBox.to)
++                top: Math.max(magnifierHeightSpinBox.from, magnifierHeightSpinBox.to)
+             }
+-        }
+-    }
+ 
+-    Kirigami.FormGroup {
+-        Kirigami.FormEntry {
+-            title: i18nc("@label", "Scroll gesture modifier keys:")
+-            subtitle: i18nc("@label Hint for scroll gestures", "Scroll while modifier keys are pressed to zoom")
+-            contentItem: KQuickControls.KeySequenceItem {
+-                id: zoomPointerAxisGestureModifiersBox
+-                enabled: kcm.zoomMagnifierSettings.zoom || kcm.zoomMagnifierSettings.magnifier
+-                keySequence: kcm.zoomMagnifierSettings.zoomPointerAxisGestureModifiers
+-                onKeySequenceModified: kcm.zoomMagnifierSettings.zoomPointerAxisGestureModifiers = keySequence
+-                patterns: KQuickControls.ShortcutPattern.Modifier
+-                multiKeyShortcutsAllowed: false
+-
+-                Connections {
+-                    target: kcm.zoomMagnifierSettings
+-
+-                    // We have to do this because keySequence binding is broken
+-                    function onZoomPointerAxisGestureModifiersChanged() {
+-                        zoomPointerAxisGestureModifiersBox.keySequence = kcm.zoomMagnifierSettings.zoomPointerAxisGestureModifiers;
+-                    }
+-                }
++            textFromValue: (value, locale) => { return i18ncp("short for pixel(s)", "%1 px", "%1 px", value); }
++            valueFromText: (text, locale) => { return Number.fromLocaleString(locale, text.replace(i18nc("short for pixel(s)", "px"), "")); }
+ 
+-                KCM.SettingStateBinding {
+-                    configObject: kcm.zoomMagnifierSettings
+-                    settingName: "ZoomPointerAxisGestureModifiers"
+-                }
++            value: kcm.zoomMagnifierSettings.magnifierHeight
++            onValueModified: kcm.zoomMagnifierSettings.magnifierHeight = value
++
++            KCM.SettingStateBinding {
++                configObject: kcm.zoomMagnifierSettings
++                settingName: "MagnifierHeight"
+             }
+         }
+-        Kirigami.FormSeparator {}
+-        Kirigami.FormAction {
+-            enabled: action.enabled
+-            action: QQC2.Action {
+-                enabled: (kcm.zoomMagnifierSettings.zoom || kcm.zoomMagnifierSettings.magnifier)
+-                text: i18nc("@action:button", "Configure Shortcuts…")
+-                icon.name: "preferences-desktop-keyboard-shortcut"
+-                onTriggered: kcm.configureZoomMagnifyShortcuts()
+-            }
++
++        // ---- Shortcuts (opens a dialog; kcm_keys owns the same actions, see ia/duplicates.md)
++        Kirigami.Separator {
++            Kirigami.FormData.isSection: true
++        }
++
++        QQC2.Button {
++            // ksr: kcm_access/ConfigureZoomShortcuts
++            enabled: page.zoomOn || page.magnifierOn
++            icon.name: "preferences-desktop-keyboard-shortcut"
++            text: i18nc("@action:button", "Configure Shortcuts…")
++            onClicked: kcm.configureZoomMagnifyShortcuts()
+         }
+     }
+ }
+diff --git a/kcms/access/ui/main.qml b/kcms/access/ui/main.qml
+index 05c0daa..0009abe 100644
+--- a/kcms/access/ui/main.qml
++++ b/kcms/access/ui/main.qml
+@@ -7,174 +7,202 @@ pragma ComponentBehavior: Bound
+ 
+ import QtQuick
+ import QtQuick.Layouts
+-import QtQuick.Window
+ import QtQuick.Controls as QQC2
+ import org.kde.kirigami as Kirigami
+ import org.kde.kirigami.delegates as KD
+ import org.kde.kcmutils as KCMUtils
+ import org.kde.kwindowsystem
+ 
+-KCMUtils.AbstractKCM {
++// List page (docs/page-design.md): one row per accessibility area, grouped by what the user is trying to do, each row
++// showing its current state. A row opens that area's Form page with kcm.push(). Nothing of an area is created until
++// its row is clicked (before: one sidebar and one Loader, now one short list and a pushed page per area).
++KCMUtils.ScrollViewKCM {
+     id: root
+ 
+-    implicitWidth: Kirigami.Units.gridUnit * 45
++    implicitWidth: Kirigami.Units.gridUnit * 30
+     implicitHeight: Kirigami.Units.gridUnit * 25
+ 
+-    framedView: false
++    readonly property string stateOn: i18nc("@info:status state of an accessibility feature", "On")
++    readonly property string stateOff: i18nc("@info:status state of an accessibility feature", "Off")
+ 
+-    property var elements: [
++    function onOff(value: bool): string {
++        return value ? stateOn : stateOff;
++    }
++
++    // Each entry: group, icon, title (the old sidebar title, unchanged), what: one line of what it does,
++    // state(): current state (re-evaluated when the settings it reads change), defaultnessKey, url.
++    readonly property var allElements: [
+         {
++            group: i18nc("@title:group list section for vision aids", "Seeing"),
+             icon: "zoom-in",
+             title: i18nc("@title Category name in sidebar", "Zoom & Magnifier"),
++            what: i18nc("@info", "Enlarge the whole screen or an area around the pointer"),
++            state: () => kcm.zoomMagnifierSettings.zoom ? i18nc("@info:status", "Full screen zoom")
++                : kcm.zoomMagnifierSettings.magnifier ? i18nc("@info:status", "Magnify region") : root.stateOff,
+             defaultnessKey: "zoomMagnifierIsDefaults",
+-            componentUrl: Qt.resolvedUrl("ZoomMagnifier.qml")
++            componentUrl: "ZoomMagnifier.qml"
+         },
+         {
++            group: i18nc("@title:group list section for vision aids", "Seeing"),
+             icon: "preferences-desktop-font",
+             title: i18nc("@title Category name in sidebar", "Text Size"),
+-            componentUrl: Qt.resolvedUrl("TextSize.qml")
++            what: i18nc("@info", "Make text and the interface bigger"),
++            state: () => "",
++            componentUrl: "TextSize.qml"
+         },
+         {
+-            icon: "notifications",
+-            title: i18nc("@title Category name in sidebar", "System Bell"),
+-            defaultnessKey: "bellIsDefaults",
+-            componentUrl: Qt.resolvedUrl("Bell.qml")
++            group: i18nc("@title:group list section for vision aids", "Seeing"),
++            icon: "view-visible",
++            title: i18nc("@title Category name in sidebar", "Color Blindness Correction"),
++            what: i18nc("@info", "Change colors that are hard to tell apart"),
++            state: () => root.onOff(kcm.colorblindnessCorrectionSettings.colorblindnessCorrection),
++            defaultnessKey: "colorblindnessCorrectionIsDefaults",
++            componentUrl: "ColorblindnessCorrection.qml"
+         },
+         {
++            group: i18nc("@title:group list section for vision aids", "Seeing"),
++            icon: "image-invert-symbolic",
++            title: i18nc("@title Category name in sidebar, for inverting screen colors", "Invert"),
++            what: i18nc("@info", "Invert screen and window colors with a shortcut"),
++            state: () => root.onOff(kcm.invertSettings.invert),
++            defaultnessKey: "invertIsDefaults",
++            componentUrl: "Invert.qml"
++        },
++        {
++            group: i18nc("@title:group list section for vision aids", "Seeing"),
++            icon: "cursor-arrow",
++            title: i18nc("@title Category name in sidebar, shake pointer to find it", "Shake Pointer"),
++            what: i18nc("@info", "Enlarge the pointer when you shake it"),
++            state: () => root.onOff(kcm.shakeCursorSettings.shakeCursor),
++            defaultnessKey: "shakeCursorIsDefaults",
++            available: KWindowSystem.isPlatformWayland,
++            componentUrl: "ShakeCursor.qml"
++        },
++        {
++            group: i18nc("@title:group list section for vision aids", "Seeing"),
++            icon: "text-speak",
++            title: i18nc("@title Category name in sidebar", "Screen Reader"),
++            what: i18nc("@info", "Read the screen aloud with Orca"),
++            state: () => kcm.screenReaderInstalled ? root.onOff(kcm.screenReaderEnabled) : i18nc("@info:status", "Not installed"),
++            defaultnessKey: "screenReaderIsDefaults",
++            componentUrl: "ScreenReader.qml"
++        },
++        {
++            group: i18nc("@title:group list section for keyboard aids", "Typing"),
+             icon: "input-keyboard",
+             title: i18nc("@title Category name in sidebar", "Modifier Keys"),
++            what: i18nc("@info", "Sticky keys, and feedback for modifier and locking keys"),
++            state: () => root.onOff(kcm.keyboardSettings.stickyKeys),
+             defaultnessKey: "keyboardModifiersIsDefaults",
+-            componentUrl: Qt.resolvedUrl("ModifierKeys.qml")
++            componentUrl: "ModifierKeys.qml"
+         },
+         {
++            group: i18nc("@title:group list section for keyboard aids", "Typing"),
+             icon: "view-filter",
+             title: i18nc("@title Category name in sidebar", "Keyboard Filters"),
++            what: i18nc("@info", "Slow keys and bounce keys"),
++            state: () => (kcm.keyboardFiltersSettings.slowKeys || kcm.keyboardFiltersSettings.bounceKeys) ? root.stateOn : root.stateOff,
+             defaultnessKey: "keyboardFiltersIsDefaults",
+-            componentUrl: Qt.resolvedUrl("KeyboardFilters.qml")
++            componentUrl: "KeyboardFilters.qml"
+         },
+         {
++            group: i18nc("@title:group list section for pointer aids", "Pointing"),
+             icon: "input-mouse",
+             title: i18nc("@title Category name in sidebar", "Mouse Navigation"),
++            what: i18nc("@info", "Move the pointer with the number pad"),
++            state: () => root.onOff(kcm.mouseSettings.mouseKeys),
+             defaultnessKey: "mouseIsDefaults",
+-            componentUrl: Qt.resolvedUrl("MouseNavigation.qml")
++            componentUrl: "MouseNavigation.qml"
+         },
+         {
++            group: i18nc("@title:group list section for pointer aids", "Pointing"),
+             icon: "input-mouse-click-left",
+             title: i18nc("@title Category name in sidebar", "Dwell Clicker"),
++            what: i18nc("@info", "Click automatically when the pointer stays still"),
++            state: () => root.onOff(kcm.dwellClickerSettings.dwellClicker),
+             defaultnessKey: "dwellClickerIsDefaults",
+-            componentUrl: Qt.resolvedUrl("DwellClicker.qml")
+-        },
+-        {
+-            icon: "text-speak",
+-            title: i18nc("@title Category name in sidebar", "Screen Reader"),
+-            defaultnessKey: "screenReaderIsDefaults",
+-            componentUrl: Qt.resolvedUrl("ScreenReader.qml")
+-        },
+-        {
+-            icon: "view-visible",
+-            title: i18nc("@title Category name in sidebar", "Color Blindness Correction"),
+-            defaultnessKey: "colorblindnessCorrectionIsDefaults",
+-            componentUrl: Qt.resolvedUrl("ColorblindnessCorrection.qml")
++            componentUrl: "DwellClicker.qml"
+         },
+         {
+-            icon: "image-invert-symbolic",
+-            title: i18nc("@title Category name in sidebar, for inverting screen colors", "Invert"),
+-            defaultnessKey: "invertIsDefaults",
+-            componentUrl: Qt.resolvedUrl("Invert.qml")
+-        },
+-        {
+-            icon: "cursor-arrow",
+-            title: i18nc("@title Category name in sidebar, shake pointer to find it", "Shake Pointer"),
+-            defaultnessKey: "shakeCursorIsDefaults",
+-            available: KWindowSystem.isPlatformWayland,
+-            componentUrl: Qt.resolvedUrl("ShakeCursor.qml")
++            group: i18nc("@title:group list section for the system bell", "Alerts"),
++            icon: "notifications",
++            title: i18nc("@title Category name in sidebar", "System Bell"),
++            what: i18nc("@info", "Play a sound or flash the screen when the bell rings"),
++            state: () => (kcm.bellSettings.systemBell || kcm.bellSettings.visibleBell) ? root.stateOn : root.stateOff,
++            defaultnessKey: "bellIsDefaults",
++            componentUrl: "Bell.qml"
+         }
+     ]
++    readonly property var elements: allElements.filter(e => e.available === undefined || e.available)
+ 
+-    RowLayout {
+-        id: mainLayout
+-        anchors.fill: parent
+-        spacing: 0
++    view: ListView {
++        id: listView
++        activeFocusOnTab: true
++        keyNavigationEnabled: true
++        clip: true
++        model: root.elements
+ 
+-        QQC2.ScrollView {
+-            id: leftSidePaneBackground
+-            Layout.fillHeight: true
+-            Layout.minimumWidth: Kirigami.Units.gridUnit * 13
++        delegate: ColumnLayout {
++            id: row
+ 
+-            Kirigami.Theme.colorSet: Kirigami.Theme.View
+-            Kirigami.Theme.inherit: false
++            required property int index
++            required property var modelData
+ 
+-            ListView {
+-                id: listView
+-                activeFocusOnTab: true
+-                clip: true
+-                keyNavigationEnabled: true
+-                model: root.elements
++            readonly property bool firstInGroup: index === 0 || root.elements[index - 1].group !== modelData.group
+ 
+-                delegate: QQC2.ItemDelegate {
+-                    id: baseDelegate
++            width: listView.width
++            spacing: 0
+ 
+-                    required property int index
+-                    required property var modelData
++            Kirigami.ListSectionHeader {
++                Layout.fillWidth: true
++                visible: row.firstInGroup
++                label: row.modelData.group
++            }
+ 
+-                    width: listView.width
++            QQC2.ItemDelegate {
++                id: baseDelegate
+ 
+-                    highlighted: listView.currentIndex === index
++                Layout.fillWidth: true
++                icon.name: row.modelData.icon
++                text: row.modelData.title
++                Accessible.name: text
+ 
+-                    icon.name: modelData.icon
+-                    text: modelData.title
+-                    visible: modelData.available === undefined || modelData.available
++                onClicked: {
++                    listView.currentIndex = row.index;
++                    kcm.push(row.modelData.componentUrl);
++                }
+ 
+-                    onClicked: {
+-                        listView.currentIndex = index
+-                        listView.forceActiveFocus()
++                contentItem: RowLayout {
++                    spacing: Kirigami.Units.smallSpacing
++
++                    KD.IconTitleSubtitle {
++                        Layout.fillWidth: true
++                        icon.name: baseDelegate.icon.name
++                        title: baseDelegate.text
++                        subtitle: row.modelData.what
++                        selected: baseDelegate.highlighted || baseDelegate.down
+                     }
+ 
+-                    contentItem: RowLayout {
+-                        spacing: Kirigami.Units.smallSpacing
+-
+-                        KD.IconTitleSubtitle {
+-                            Layout.fillWidth: true
+-                            icon.name: baseDelegate.icon.name
+-                            title: baseDelegate.text
+-                            selected: baseDelegate.highlighted || baseDelegate.down
+-                        }
+-
+-                        Rectangle {
+-                            radius: width * 0.5
+-                            implicitWidth: Kirigami.Units.largeSpacing
+-                            implicitHeight: Kirigami.Units.largeSpacing
+-                            visible: kcm.defaultsIndicatorsVisible && baseDelegate.modelData.defaultnessKey !== undefined
+-                            opacity: !kcm[modelData.defaultnessKey]
+-                            color: Kirigami.Theme.neutralTextColor
+-                        }
++                    QQC2.Label {
++                        text: row.modelData.state()
++                        textFormat: Text.PlainText
++                        visible: text.length > 0
+                     }
+-                }
+-            }
+-        }
+ 
+-        Kirigami.Separator {
+-            Layout.fillHeight: true
+-        }
++                    // Same "changed from default" dot the sidebar had
++                    Rectangle {
++                        radius: width * 0.5
++                        implicitWidth: Kirigami.Units.largeSpacing
++                        implicitHeight: Kirigami.Units.largeSpacing
++                        visible: kcm.defaultsIndicatorsVisible && row.modelData.defaultnessKey !== undefined
++                        opacity: !kcm[row.modelData.defaultnessKey]
++                        color: Kirigami.Theme.neutralTextColor
++                    }
+ 
+-        Rectangle {
+-            Layout.fillWidth: true
+-            Layout.fillHeight: true
+-            Kirigami.Theme.colorSet: Kirigami.Theme.Window
+-            Kirigami.Theme.inherit: false
+-            color: Kirigami.Theme.backgroundColor
+-
+-            QQC2.ScrollView {
+-                id: scrollView
+-                anchors.fill: parent
+-                contentWidth: availableWidth
+-                contentHeight: pageLoader.implicitHeight > 0 ? undefined : availableHeight
+-                Kirigami.Padding {
+-                    anchors.fill: parent
+-                    padding: Kirigami.Units.gridUnit
+-                    contentItem: Loader {
+-                        id: pageLoader
+-                        source: listView.currentItem?.modelData?.componentUrl ?? ""
++                    Kirigami.Icon {
++                        source: "go-next-symbolic"
++                        implicitWidth: Kirigami.Units.iconSizes.small
++                        implicitHeight: Kirigami.Units.iconSizes.small
+                     }
+                 }
+             }

@@ -1,0 +1,663 @@
+From 040d23df39a6d0f92f5a0fed092f69085a4e669a Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 14:32:40 +0500
+Subject: [PATCH] kcm_printer_manager: Device list that waits for CUPS before
+ it says anything
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Page type: Device (docs/page-design.md): list of printers and groups, each opens its own page (kcm.push), page
+actions at the top right. The existing structure already matched, so only these changes; CUPS calls, the
+command-line arguments (add-printer, add-group, configure-printer) and the printer pages are unchanged.
+
+Moved / renamed:
+- "Add…" -> "Add Printer…" (kcm_printer_manager/AddPrinter), now the real visible label, not only the accessible name.
+- Empty state "No printers are currently set up" gets an "Add Printer…" button and no longer appears before CUPS has
+  answered (kcm_printer_manager/NoPrinters); a spinner shows only after 150 ms.
+- Markers only (labels unchanged) on 46 rows in the sub-pages (printer page, driver chooser, find printer,
+  server settings, install dialog) so --strict can prove them: 54 rows, 0 lost.
+- inventory/relabel/kcm_printer_manager.tsv (outer repo).
+
+Speed (read from code):
+- The CUPS list is already asynchronous (PrinterModel::update uses KCupsRequest, a worker thread); the first frame was
+  held by main.qml's `visible: !kcm.isSCPAvailable()`, which called ListActivatableNames (every activatable bus name)
+  synchronously during page creation. Now PrinterManager::scpMissing is filled by an async call in the constructor
+  (isSCPAvailable() stays for SCPInstaller).
+- Before the first CUPS reply the model state is Unknown, but the empty-state Loader treated "count == 0" as "no
+  printers": it flashed the wrong message. Now it waits for the state.
+- FindPrinter device discovery and the PPD list are only started on their sub-pages (checked: not created by main.qml).
+After: pending, manager will measure.
+
+HIG: HIG-001, HIG-005, HIG-006, HIG-020 (empty state with action).
+
+Not built yet. Uncertain: the banner for the missing helper now appears after the reply, not at creation.
+Sub-page labels (printer page "Queue Name:" etc.) were not reworded in this commit.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ src/kcm/printermanager.cpp           | 20 +++++++++++++
+ src/kcm/printermanager.h             |  7 +++++
+ src/kcm/ui/FindPrinter.qml           |  3 ++
+ src/kcm/ui/Global.qml                |  7 +++++
+ src/kcm/ui/InstallDialog.qml         |  1 +
+ src/kcm/ui/MakeModel.qml             |  4 +++
+ src/kcm/ui/PrinterSettings.qml       | 18 ++++++++++++
+ src/kcm/ui/components/BaseDevice.qml |  1 +
+ src/kcm/ui/components/Drivers.qml    |  2 ++
+ src/kcm/ui/components/Lpd.qml        |  2 ++
+ src/kcm/ui/components/ManualUri.qml  |  3 ++
+ src/kcm/ui/components/Smb.qml        |  3 ++
+ src/kcm/ui/components/Socket.qml     |  1 +
+ src/kcm/ui/main.qml                  | 42 ++++++++++++++++++++++++----
+ 14 files changed, 108 insertions(+), 6 deletions(-)
+
+diff --git a/src/kcm/printermanager.cpp b/src/kcm/printermanager.cpp
+index 8df6126..27ed21f 100644
+--- a/src/kcm/printermanager.cpp
++++ b/src/kcm/printermanager.cpp
+@@ -16,6 +16,7 @@
+ #include <QCommandLineParser>
+ #include <QDBusConnection>
+ #include <QDBusConnectionInterface>
++#include <QDBusMessage>
+ #include <QDBusMetaType>
+ #include <QDBusPendingCallWatcher>
+ #include <QDBusPendingReply>
+@@ -84,6 +85,20 @@ PrinterManager::PrinterManager(QObject *parent, const KPluginMetaData &metaData,
+     qmlRegisterType<SCPInstaller>("org.kde.plasma.printmanager", 1, 0, "SCPInstaller");
+ #endif
+ 
++    // Is the printer setup helper installed? ListActivatableNames returns every activatable name on the bus,
++    // so it is asked without blocking: the banner appears when the answer is "missing".
++    QDBusMessage activatable = QDBusMessage::createMethodCall(u"org.freedesktop.DBus"_s, u"/org/freedesktop/DBus"_s, u"org.freedesktop.DBus"_s, u"ListActivatableNames"_s);
++    auto scpWatcher = new QDBusPendingCallWatcher(QDBusConnection::sessionBus().asyncCall(activatable), this);
++    connect(scpWatcher, &QDBusPendingCallWatcher::finished, this, [this](QDBusPendingCallWatcher *w) {
++        QDBusPendingReply<QStringList> reply = *w;
++        w->deleteLater();
++        const bool missing = reply.isValid() && !reply.value().contains("org.fedoraproject.Config.Printing"_L1);
++        if (m_scpMissing != missing) {
++            m_scpMissing = missing;
++            Q_EMIT scpMissingChanged();
++        }
++    });
++
+     // If activation requested, set command line args and notify
+     connect(this, &PrinterManager::activationRequested, this, &PrinterManager::processCmdLine);
+     // Handle command line args
+@@ -198,6 +213,11 @@ void PrinterManager::clearRecommendedDrivers()
+     m_recommendedDrivers.clear();
+ }
+ 
++bool PrinterManager::scpMissing() const
++{
++    return m_scpMissing;
++}
++
+ bool PrinterManager::isSCPAvailable()
+ {
+     // The service is activatable, so check the list
+diff --git a/src/kcm/printermanager.h b/src/kcm/printermanager.h
+index ff56fd4..8863a14 100644
+--- a/src/kcm/printermanager.h
++++ b/src/kcm/printermanager.h
+@@ -23,6 +23,9 @@ class PrinterManager : public KQuickConfigModule
+ {
+     Q_OBJECT
+ 
++    // false until the (asynchronous) check for the printer setup helper says it is not available
++    Q_PROPERTY(bool scpMissing READ scpMissing NOTIFY scpMissingChanged)
++
+     Q_PROPERTY(QVariantList remotePrinters READ remotePrinters NOTIFY remotePrintersLoaded)
+ 
+     Q_PROPERTY(QVariantList recommendedDrivers READ recommendedDrivers NOTIFY recommendedDriversLoaded)
+@@ -45,6 +48,8 @@ public:
+     Q_INVOKABLE static bool isIPPCapable(const QString &uri);
+     Q_INVOKABLE static bool isSCPAvailable();
+ 
++    bool scpMissing() const;
++
+     bool shareConnectedPrinters() const;
+     bool allowPrintingFromInternet() const;
+     bool allowRemoteAdmin() const;
+@@ -61,6 +66,7 @@ public Q_SLOTS:
+     void clearRecommendedDrivers();
+ 
+ Q_SIGNALS:
++    void scpMissingChanged();
+     void requestError(const QString &errorMessage);
+     void serverSettingsChanged();
+     void serverStopped();
+@@ -80,6 +86,7 @@ private:
+ 
+     QVariantMap m_serverSettings;
+     bool m_serverSettingsLoaded = false;
++    bool m_scpMissing = false;
+     QVariantList m_remotePrinters;
+     QVariantList m_recommendedDrivers;
+     void processCmdLine(const QVariantList &args);
+diff --git a/src/kcm/ui/FindPrinter.qml b/src/kcm/ui/FindPrinter.qml
+index e44e4f8..febc93f 100644
+--- a/src/kcm/ui/FindPrinter.qml
++++ b/src/kcm/ui/FindPrinter.qml
+@@ -129,6 +129,7 @@ KCM.AbstractKCM {
+ 
+     actions: [
+         Kirigami.Action {
++            // ksr: kcm_printer_manager/RefreshDevices
+             text: i18nc("@action:button", "Refresh")
+             enabled: !root.loading
+             icon.name: "view-refresh-symbolic"
+@@ -139,6 +140,7 @@ KCM.AbstractKCM {
+         },
+         Kirigami.Action {
+             text: root.showingManual
++                  // ksr: kcm_printer_manager/ShowManualOptions
+                   ? i18nc("@action:button", "Show Detected Devices")
+                   : i18nc("@action:button", "Show Manual Options")
+             icon.name: root.showingManual
+@@ -278,6 +280,7 @@ KCM.AbstractKCM {
+                     }
+                 }
+ 
++                // ksr: kcm_printer_manager/Internet-Printing-Protocol
+                 delegate: Kirigami.SubtitleDelegate {
+ 
+                     required property int index
+diff --git a/src/kcm/ui/Global.qml b/src/kcm/ui/Global.qml
+index 7d96dc5..effe97c 100644
+--- a/src/kcm/ui/Global.qml
++++ b/src/kcm/ui/Global.qml
+@@ -20,6 +20,7 @@ Kirigami.Dialog {
+ 
+     standardButtons: Kirigami.Dialog.NoButton
+ 
++    // ksr: kcm_printer_manager/CUPS-Print-Server-Admin
+     footerLeadingComponent: Kirigami.UrlButton {
+         text: i18nc("@action:button", "CUPS Print Server Admin")
+         url: "http://localhost:631/admin"
+@@ -28,12 +29,14 @@ Kirigami.Dialog {
+ 
+     customFooterActions: [
+         Kirigami.Action {
++            // ksr: kcm_printer_manager/ServerReset
+             text: i18nc("@action:button Reset to current settings", "Reset")
+             icon.name: "edit-reset-symbolic"
+             enabled: settings.hasPending
+             onTriggered: settings.reset()
+         },
+         Kirigami.Action {
++            // ksr: kcm_printer_manager/ServerApply
+             text: i18nc("@action:button Apply new settings", "Apply")
+             icon.name: "dialog-ok-apply"
+             enabled: settings.hasPending
+@@ -121,6 +124,7 @@ Kirigami.Dialog {
+             ColumnLayout {
+                 spacing: Kirigami.Units.smallSpacing
+ 
++                // ksr: kcm_printer_manager/Share-printers-connected-to-this-system
+                 SettingCheckBox {
+                     id: share
+                     objectName: "_share_printers"
+@@ -133,6 +137,7 @@ Kirigami.Dialog {
+                     }
+                 }
+ 
++                // ksr: kcm_printer_manager/Allow-printing-from-the-Internet
+                 SettingCheckBox {
+                     id: netPrint
+                     objectName: "_remote_any"
+@@ -140,11 +145,13 @@ Kirigami.Dialog {
+                     enabled: share.checked
+                 }
+ 
++                // ksr: kcm_printer_manager/Allow-remote-administration
+                 SettingCheckBox {
+                     objectName: "_remote_admin"
+                     text: i18nc("@option:check", "Allow remote administration")
+                 }
+ 
++                // ksr: kcm_printer_manager/Allow-users-to-cancel-any-job-not-just-their-own
+                 SettingCheckBox {
+                     objectName: "_user_cancel_any"
+                     text: i18nc("@option:check", "Allow users to cancel any job (not just their own)")
+diff --git a/src/kcm/ui/InstallDialog.qml b/src/kcm/ui/InstallDialog.qml
+index 06d97f4..197373d 100644
+--- a/src/kcm/ui/InstallDialog.qml
++++ b/src/kcm/ui/InstallDialog.qml
+@@ -85,6 +85,7 @@ Kirigami.Dialog {
+                 visible: installer.installing
+             }
+ 
++            // ksr: kcm_printer_manager/Report-this-issue-to-1
+             Kirigami.UrlButton {
+                 Layout.topMargin: Kirigami.Units.largeSpacing
+                 visible: installer.failed
+diff --git a/src/kcm/ui/MakeModel.qml b/src/kcm/ui/MakeModel.qml
+index 35ccb88..85f0da1 100644
+--- a/src/kcm/ui/MakeModel.qml
++++ b/src/kcm/ui/MakeModel.qml
+@@ -225,6 +225,7 @@ Kirigami.Dialog {
+             spacing: Kirigami.Units.smallSpacing
+             Layout.margins: Kirigami.Units.smallSpacing
+ 
++            // ksr: kcm_printer_manager/Select-Make-and-Model
+             QQC2.RadioButton {
+                 id: rbMake
+                 text: i18nc("@option:radio", "Select Make and Model:")
+@@ -237,6 +238,7 @@ Kirigami.Dialog {
+                 QQC2.ButtonGroup.group: buttonGroup
+             }
+ 
++            // ksr: kcm_printer_manager/Filter-Models
+             Kirigami.SearchField {
+                 enabled: rbMake.checked && makesList.count > 0
+                 placeholderText: i18nc("@info:placeholder", "Filter Models")
+@@ -331,6 +333,7 @@ Kirigami.Dialog {
+             spacing: Kirigami.Units.smallSpacing
+             Layout.margins: Kirigami.Units.smallSpacing
+ 
++            // ksr: kcm_printer_manager/PPD-file
+             QQC2.RadioButton {
+                 id: rbFile
+                 text: i18nc("@option:radio", "PPD file:")
+@@ -350,6 +353,7 @@ Kirigami.Dialog {
+                 Layout.fillWidth: true
+             }
+ 
++            // ksr: kcm_printer_manager/Select-PPD-File
+             QQC2.Button {
+                 id: fileButton
+                 text: i18nc("@action:button", "Select PPD File…")
+diff --git a/src/kcm/ui/PrinterSettings.qml b/src/kcm/ui/PrinterSettings.qml
+index 8a05226..6d987aa 100644
+--- a/src/kcm/ui/PrinterSettings.qml
++++ b/src/kcm/ui/PrinterSettings.qml
+@@ -55,11 +55,13 @@ KCM.AbstractKCM {
+ 
+     actions: [
+         Kirigami.Action {
++            // ksr: kcm_printer_manager/ConfigurePrinter
+             text: i18n("Configure…")
+             icon.name: "configure-symbolic"
+             visible: !root.addMode
+             onTriggered: PM.ProcessRunner.configurePrinter(root.modelData.printerName)
+         }, Kirigami.Action {
++            // ksr: kcm_printer_manager/RemovePrinter
+             text: i18n("Remove")
+             icon.name: "edit-delete-remove-symbolic"
+             visible: !root.addMode
+@@ -76,12 +78,14 @@ KCM.AbstractKCM {
+         Layout.margins: Kirigami.Units.largeSpacing
+         spacing: Kirigami.Units.largeSpacing
+ 
++        // ksr: kcm_printer_manager/CUPS-Printers-Overview-Help
+         Kirigami.UrlButton {
+             text: i18nc("@action:button", "CUPS Printers Overview Help")
+             url: "http://localhost:631/help/overview.html"
+             padding: Kirigami.Units.largeSpacing
+         }
+ 
++        // ksr: kcm_printer_manager/Printer-Device-Admin-Page
+         Kirigami.UrlButton {
+             text: i18nc("@action:button", "Printer/Device Admin Page")
+             visible: !root.modelData.isClass && url !== ""
+@@ -101,6 +105,7 @@ KCM.AbstractKCM {
+ 
+         QQC2.Button {
+             text: root.addMode
++                  // ksr: kcm_printer_manager/ApplyPrinter
+                   ? i18nc("@action:button Add printer", "Add")
+                   : i18nc("@action:button Apply changes", "Apply")
+             icon.name: "dialog-ok-apply"
+@@ -354,6 +359,7 @@ KCM.AbstractKCM {
+ 
+                     PrinterOption {
+                         objectName: "isDefault"
++                        // ksr: kcm_printer_manager/DefaultPrinter
+                         text: i18nc("@action:check Set default printer", "Default printer")
+                         orig: root.modelData.isDefault
+                         visible: root.addMode || root.printerModel.rowCount() > 1
+@@ -378,6 +384,7 @@ KCM.AbstractKCM {
+                 PrinterOption {
+                     objectName: "printer-is-shared"
+                     text: root.modelData.isClass
++                          // ksr: kcm_printer_manager/SharePrinter
+                           ? i18nc("@action:check", "Share this group")
+                           : i18nc("@action:check", "Share this printer")
+                     enabled: kcm.shareConnectedPrinters
+@@ -386,6 +393,7 @@ KCM.AbstractKCM {
+ 
+                 PrinterOption {
+                     objectName: "printer-is-accepting-jobs"
++                    // ksr: kcm_printer_manager/AcceptingJobs
+                     text: i18nc("@action:check", "Accepting print jobs")
+                     orig: root.modelData.isAcceptingJobs
+                 }
+@@ -433,12 +441,14 @@ KCM.AbstractKCM {
+             visible: !root.addMode
+             Layout.topMargin: Kirigami.Units.largeSpacing
+ 
++            // ksr: kcm_printer_manager/Print-Test-Page
+             QQC2.Button {
+                 text: i18nc("@action:button", "Print Test Page")
+                 icon.name: "document-print-preview-symbolic"
+                 onClicked: PM.PrinterCommands.printTestPage(root.modelData.printerName, root.modelData.isClass)
+             }
+ 
++            // ksr: kcm_printer_manager/Print-Self-Test-Page
+             QQC2.Button {
+                 text: i18nc("@action:button", "Print Self-Test Page")
+                 icon.name: "document-print-preview-symbolic"
+@@ -446,6 +456,7 @@ KCM.AbstractKCM {
+                 onClicked: PM.PrinterCommands.printSelfTestPage(root.modelData.printerName)
+             }
+ 
++            // ksr: kcm_printer_manager/Clean-Print-Heads
+             QQC2.Button {
+                 text: i18nc("@action:button", "Clean Print Heads")
+                 icon.name: "edit-clear-all-symbolic"
+@@ -465,6 +476,7 @@ KCM.AbstractKCM {
+             columnSpacing: Kirigami.Units.gridUnit
+ 
+             QQC2.Label {
++                // ksr: kcm_printer_manager/QueueName
+                 text: i18nc("@label:textbox", "Queue Name:")
+                 Layout.alignment: Qt.AlignRight
+             }
+@@ -490,6 +502,7 @@ KCM.AbstractKCM {
+ 
+ 
+             QQC2.Label {
++                // ksr: kcm_printer_manager/Description
+                 text: i18nc("@label:textbox", "Description:")
+                 Layout.alignment: Qt.AlignRight
+             }
+@@ -502,6 +515,7 @@ KCM.AbstractKCM {
+             }
+ 
+             QQC2.Label {
++                // ksr: kcm_printer_manager/Location
+                 text: i18nc("@label:textbox", "Location:")
+                 Layout.alignment: Qt.AlignRight
+             }
+@@ -514,6 +528,7 @@ KCM.AbstractKCM {
+             }
+ 
+             QQC2.Label {
++                // ksr: kcm_printer_manager/Connection
+                 text: i18nc("@label:textbox", "Connection:")
+                 Layout.alignment: Qt.AlignRight
+                 visible: !root.modelData.isClass
+@@ -528,6 +543,7 @@ KCM.AbstractKCM {
+             }
+ 
+             QQC2.Label {
++                // ksr: kcm_printer_manager/MemberPrinters
+                 text: i18nc("@label:listbox", "Member Printers:")
+                 Layout.alignment: Qt.AlignRight | Qt.AlignTop
+                 visible: root.modelData.isClass
+@@ -664,6 +680,7 @@ KCM.AbstractKCM {
+             }
+ 
+             QQC2.Label {
++                // ksr: kcm_printer_manager/MakeModel
+                 text: i18nc("@label:textbox", "Make/Model:")
+                 Layout.alignment: Qt.AlignRight
+                 visible: !root.modelData.isClass
+@@ -677,6 +694,7 @@ KCM.AbstractKCM {
+                     text: root.modelData.kind ?? ""
+                 }
+ 
++                // ksr: kcm_printer_manager/Select
+                 QQC2.Button {
+                     id: driverSelect
+                     text: i18nc("@action:button Select printer make/model", "Select…")
+diff --git a/src/kcm/ui/components/BaseDevice.qml b/src/kcm/ui/components/BaseDevice.qml
+index ab5f903..2ba189b 100644
+--- a/src/kcm/ui/components/BaseDevice.qml
++++ b/src/kcm/ui/components/BaseDevice.qml
+@@ -116,6 +116,7 @@ ColumnLayout {
+             text: i18nc("@label:textbox", "Address:")
+         }
+ 
++        // ksr: kcm_printer_manager/Enter-device-address
+         Kirigami.SearchField {
+             id: connSearch
+             Layout.fillWidth: true
+diff --git a/src/kcm/ui/components/Drivers.qml b/src/kcm/ui/components/Drivers.qml
+index cf11d7e..72aca6e 100644
+--- a/src/kcm/ui/components/Drivers.qml
++++ b/src/kcm/ui/components/Drivers.qml
+@@ -105,6 +105,7 @@ ColumnLayout {
+                     }
+ 
+                     actions: Kirigami.Action {
++                        // ksr: kcm_printer_manager/SelectDriver
+                         text: i18nc("@action:button", "Select Driver…")
+                         icon.name: "dialog-ok-symbolic"
+                         tooltip: i18nc("@info:tooltip", "Select this driver for the printing device")
+@@ -116,6 +117,7 @@ ColumnLayout {
+         }
+     }
+ 
++    // ksr: kcm_printer_manager/Manual-Driver-Search
+     QQC2.Button {
+         text: i18nc("@action:button", "Manual Driver Search…")
+         icon.name: "search-symbolic"
+diff --git a/src/kcm/ui/components/Lpd.qml b/src/kcm/ui/components/Lpd.qml
+index d4bb32d..5d95dde 100644
+--- a/src/kcm/ui/components/Lpd.qml
++++ b/src/kcm/ui/components/Lpd.qml
+@@ -63,6 +63,7 @@ BaseDevice {
+                 text: i18nc("@label:textbox", "Queue:")
+             }
+ 
++            // ksr: kcm_printer_manager/LPD-queue-name
+             QQC2.TextField {
+                 id: queue
+                 placeholderText: i18nc("@info:placeholder The LPD device queue name", "LPD queue name")
+@@ -71,6 +72,7 @@ BaseDevice {
+             }
+         }
+ 
++        // ksr: kcm_printer_manager/Continue-with-Address
+         QQC2.Button {
+             text: i18nc("@action:button", "Continue with Address…")
+             icon.name: "dialog-ok-symbolic"
+diff --git a/src/kcm/ui/components/ManualUri.qml b/src/kcm/ui/components/ManualUri.qml
+index 6f063e6..0331696 100644
+--- a/src/kcm/ui/components/ManualUri.qml
++++ b/src/kcm/ui/components/ManualUri.qml
+@@ -68,6 +68,7 @@ BaseDevice {
+             spacing: Kirigami.Units.smallSpacing
+             Layout.alignment: Qt.AlignHCenter
+ 
++            // ksr: kcm_printer_manager/remotePrinters-length
+             QQC2.Button {
+                 text: i18nc("@action:button", "Select Printer…")
+                 visible: kcm.remotePrinters.length > 0
+@@ -78,6 +79,7 @@ BaseDevice {
+                 }
+             }
+ 
++            // ksr: kcm_printer_manager/Continue-with-Address-2
+             QQC2.Button {
+                 text: i18nc("@action:button", "Continue with Address…")
+                 icon.name: "dialog-ok-symbolic"
+@@ -119,6 +121,7 @@ BaseDevice {
+                     event.accepted = false
+                 }
+ 
++                // ksr: kcm_printer_manager/printer-info
+                 delegate: Kirigami.SubtitleDelegate {
+                     width: ListView.view.width
+                     text: modelData["printer-info"]
+diff --git a/src/kcm/ui/components/Smb.qml b/src/kcm/ui/components/Smb.qml
+index 1fa731a..76f7153 100644
+--- a/src/kcm/ui/components/Smb.qml
++++ b/src/kcm/ui/components/Smb.qml
+@@ -40,16 +40,19 @@ BaseDevice {
+             }
+         }
+ 
++        // ksr: kcm_printer_manager/x
+         QQC2.TextField {
+             id: username
+             Kirigami.FormData.label: i18nc("@label:textbox Authentication user name", "Username:")
+         }
+ 
++        // ksr: kcm_printer_manager/x-2
+         Kirigami.PasswordField {
+             id: password
+             Kirigami.FormData.label: i18nc("@label:textbox Authentication password", "Password:")
+         }
+ 
++        // ksr: kcm_printer_manager/Save-Printer
+         QQC2.Button {
+             text: i18nc("@action:button Accept current values and continue", "Save Printer…")
+             icon.name: "dialog-ok-symbolic"
+diff --git a/src/kcm/ui/components/Socket.qml b/src/kcm/ui/components/Socket.qml
+index 49c9c79..3f343df 100644
+--- a/src/kcm/ui/components/Socket.qml
++++ b/src/kcm/ui/components/Socket.qml
+@@ -45,6 +45,7 @@ BaseDevice {
+             }
+         }
+ 
++        // ksr: kcm_printer_manager/Continue-with-Address-3
+         QQC2.Button {
+             text: i18nc("@action:button", "Continue with Address…")
+             icon.name: "dialog-ok-symbolic"
+diff --git a/src/kcm/ui/main.qml b/src/kcm/ui/main.qml
+index 9cb3728..aa6bb35 100644
+--- a/src/kcm/ui/main.qml
++++ b/src/kcm/ui/main.qml
+@@ -81,7 +81,8 @@ KCM.ScrollViewKCM {
+         showCloseButton: true
+         type: Kirigami.MessageType.Warning
+         position: Kirigami.InlineMessage.Position.Header
+-        visible: !kcm.isSCPAvailable()
++        // answered asynchronously by the KCM (the old binding blocked on a D-Bus call while the page was built)
++        visible: kcm.scpMissing
+         text: {
+             if (PM.SCPInstaller === undefined) {
+                 xi18nc("@info:usagetip", "A printer support package that provides convenience features does not appear to be installed.<nl/><nl/>Because this distro does not include PackageKit, we cannot provide an install option. Please use your package manager to install the <command>system-config-printer</command> package manually.")
+@@ -92,6 +93,7 @@ KCM.ScrollViewKCM {
+ 
+         actions: [
+             Kirigami.Action {
++                // ksr: kcm_printer_manager/InstallHelper
+                 text: i18nc("@action:button Install printer setup helper package", "Install It")
+                 icon.name: "install-symbolic"
+                 visible: PM.SCPInstaller !== undefined
+@@ -123,19 +125,21 @@ KCM.ScrollViewKCM {
+ 
+     actions: [
+         Kirigami.Action {
+-            text: i18nc("@action:button The thing being added is a printer", "Add…")
+-            Accessible.name: i18nc("@action:button", "Add Printer…")
++            // ksr: kcm_printer_manager/AddPrinter
++            text: i18nc("@action:button The thing being added is a printer", "Add Printer…")
+             icon.name: "list-add-symbolic"
+             displayHint: Kirigami.DisplayHint.KeepVisible
+             onTriggered: root.addPrinter(true)
+         }
+         , Kirigami.Action {
++            // ksr: kcm_printer_manager/AddGroup
+             text: i18nc("@action:button", "Add Group…")
+             icon.name: "folder-print-symbolic"
+             visible: list.count > 1
+             onTriggered: root.addPrinter(false)
+         }
+         , Kirigami.Action {
++            // ksr: kcm_printer_manager/ConfigurePrintServer
+             text: i18nc("@action:button", "Configure Print Server…")
+             icon.name: "configure-symbolic"
+             onTriggered: {
+@@ -263,8 +267,14 @@ KCM.ScrollViewKCM {
+ 
+             Kirigami.PlaceholderMessage {
+                 icon.name: "printer"
++                // ksr: kcm_printer_manager/NoPrinters
+                 text: i18nc("@info:status", "No printers are currently set up")
+-                explanation: xi18nc("@info:usagetip", "Click <interface>Add…</interface> to set up a new printer on this computer")
++                explanation: xi18nc("@info:usagetip", "Click <interface>Add Printer…</interface> to set up a new printer on this computer")
++                helpfulAction: Kirigami.Action {
++                    text: i18nc("@action:button", "Add Printer…")
++                    icon.name: "list-add-symbolic"
++                    onTriggered: root.addPrinter(true)
++                }
+             }
+         }
+ 
+@@ -276,6 +286,7 @@ KCM.ScrollViewKCM {
+                 text: i18nc("@info:status", "Printing services not available")
+                 explanation: xi18nc("@info:usagetip", "Click <interface>Configure Print Server…</interface> to check settings, or verify that the CUPS system service is active.")
+                 helpfulAction: Kirigami.Action {
++                    // ksr: kcm_printer_manager/RefreshServices
+                     text: i18nc("@action:button", "Refresh")
+                     icon.name: "view-refresh"
+                     onTriggered: pmModel.update()
+@@ -287,11 +298,14 @@ KCM.ScrollViewKCM {
+             anchors.centerIn: parent
+             width: parent.width - (Kirigami.Units.gridUnit * 4)
+ 
++            // Nothing is said about "no printers" until CUPS has answered the first (asynchronous) request
++            readonly property bool answered: pmModel.serverState !== PM.ServerState.Unknown
++
+             active: {
+                 let ret = false
+                 if (pmModel.serverState === PM.ServerState.Unavailable) {
+                     ret = true
+-                } else if (list.count === 0) {
++                } else if (answered && list.count === 0) {
+                     ret = true
+                 }
+                 return ret
+@@ -301,13 +315,27 @@ KCM.ScrollViewKCM {
+                 let ret = null
+                 if (pmModel.serverState === PM.ServerState.Unavailable) {
+                     ret = noServiceMsgComp
+-                } else if (list.count === 0) {
++                } else if (answered && list.count === 0) {
+                     ret = noDevicesMsgComp
+                 }
+                 return ret
+             }
+         }
+ 
++        // The printer list is read from CUPS after the first frame; a spinner shows only if that takes more than 150 ms
++        QQC2.BusyIndicator {
++            anchors.centerIn: parent
++            running: visible
++            visible: pmModel.serverState === PM.ServerState.Unknown && busyDelay.elapsed
++        }
++        Timer {
++            id: busyDelay
++            property bool elapsed: false
++            interval: 150
++            running: pmModel.serverState === PM.ServerState.Unknown
++            onTriggered: elapsed = true
++        }
++
+         Component {
+             id: sectionComp
+ 
+@@ -330,6 +358,7 @@ KCM.ScrollViewKCM {
+             sortRoleName: "isClass"
+         }
+ 
++        // ksr: kcm_printer_manager/PrinterListEntry
+         delegate: QQC2.ItemDelegate {
+             id: deviceDelegate
+             width: ListView.view.width
+@@ -380,6 +409,7 @@ KCM.ScrollViewKCM {
+                             ? i18nc("@info:tooltip", "Resume printing")
+                             : i18nc("@info:tooltip", "Pause printing")
+ 
++                        // ksr: kcm_printer_manager/PausePrinter
+                         icon.name: deviceDelegate.isPaused
+                                    ? "media-playback-start-symbolic"
+                                    : "media-playback-pause-symbolic"

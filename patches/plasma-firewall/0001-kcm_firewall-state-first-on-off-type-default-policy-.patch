@@ -1,0 +1,831 @@
+From 17e3b24cd449f946d9e16767ccac5ddd8037e4f8 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 14:31:33 +0500
+Subject: [PATCH] kcm_firewall: state first (on/off, type), default policy
+ section, backend found after the first frame
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Page type: List (rules) with a state header (docs/page-design.md). KAuth actions, ufw/firewalld calls and rule
+handling are unchanged.
+
+Moved / renamed:
+- The enable switch moved from the toolbar to the first row of the page ("Firewall:" Enabled/Disabled),
+  kcm_firewall/client-enabled. Toolbar keeps only "Add Rule…", "View Connections…", "View Logs…" (now with the
+  ellipsis because they open something; kcm_firewall/AddRule, ViewConnections, ViewLogs).
+- "Firewall type:" row stays; section "Default policy" holds "Incoming connections:" / "Outgoing connections:"
+  (was "Default Incoming/Outgoing Policy:", kcm_firewall/client-enabled-2). The rules table gets a "Rules" heading.
+- The rule editor no longer reaches into main.qml by id for the default policies: they go through two root properties.
+- Markers only (labels unchanged) on rule-policy, rule-ipv6, client-name-2, Blacklist-Connection, Create for --strict.
+- inventory/relabel/kcm_firewall.tsv (outer repo); 26 rows, 0 lost with --strict.
+
+Speed (read from code):
+- KCMFirewall's constructor called FirewallClient::setBackend(): plugin discovery + dlopen, then a blocking
+  "systemctl status ufw|firewalld" QProcess::waitForFinished per backend, all before the first frame.
+- main.qml called kcm.client.version() in a binding: another blocking QProcess ("ufw --version").
+Now: FirewallClient::detectBackend() (new) loads the plugins on mainUiReady (queued) and runs the systemctl probes
+with asynchronous QProcess, same order and fallback to the installed executable as setBackend(); "detecting" and
+backendChanged signals let the page fill in (spinner after 150 ms). The version is read on a worker thread
+(requestVersion/versionText). rulesModel/logsModel/name/supportsRuleUpdate changed from CONSTANT to
+NOTIFY backendChanged. The Apply button is set when detection ends (capabilities). No polkit prompt at open: the
+status query (KAuth) still runs, as before, once the backend is known.
+After: pending, manager will measure.
+
+HIG: HIG-001, HIG-005, HIG-006, HIG-019, HIG-020.
+
+Not built yet. Uncertain: setButtons(Help|Apply) after the UI is up; KQuickConfigModule::mainUiReady exists in
+src/master/kcmutils but not in src/v6.8.3 (no kcmutils there to compare); a missing "systemctl" is now treated as
+"not loaded" (before: exit code 0 = loaded). The rules TableView is kept (7 columns of the RuleListModel); a
+ItemDelegate list would need a model role change. The rule editor "Advanced" switch keeps its name.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcm/core/firewallclient.cpp | 164 +++++++++++++++++++++--
+ kcm/core/firewallclient.h   |  44 ++++++-
+ kcm/kcm.cpp                 |  24 +++-
+ kcm/ui/AdvancedRuleEdit.qml |   8 +-
+ kcm/ui/SimpleRuleEdit.qml   |   1 +
+ kcm/ui/ViewBase.qml         |   1 +
+ kcm/ui/main.qml             | 255 ++++++++++++++++++++++--------------
+ 7 files changed, 379 insertions(+), 118 deletions(-)
+
+diff --git a/kcm/core/firewallclient.cpp b/kcm/core/firewallclient.cpp
+index 5fe7318..f69eb9c 100644
+--- a/kcm/core/firewallclient.cpp
++++ b/kcm/core/firewallclient.cpp
+@@ -18,7 +18,11 @@
+ #include <KPluginMetaData>
+ 
+ #include <QList>
++#include <cstdlib>
+ #include <QNetworkInterface>
++#include <QPointer>
++#include <QProcess>
++#include <QThread>
+ #include <QStringList>
+ #include <QtGlobal>
+ 
+@@ -33,6 +37,9 @@ FirewallClient::FirewallClient(QObject *parent)
+ 
+ FirewallClient::~FirewallClient() noexcept
+ {
++    if (m_versionThread) {
++        m_versionThread->wait();
++    }
+     if (m_currentBackend) {
+         m_currentBackend->deleteLater();
+         m_currentBackend = nullptr;
+@@ -291,13 +298,17 @@ bool FirewallClient::hasExecutable() const
+     return m_currentBackend->hasExecutable();
+ }
+ 
+-void FirewallClient::setBackend(const QStringList &backendList)
++void FirewallClient::dropBackend()
+ {
+     if (m_currentBackend) {
+         Q_EMIT enabledChanged(false);
+         delete m_currentBackend;
+         m_currentBackend = nullptr;
+     }
++}
++
++QList<KPluginFactory *> FirewallClient::loadFactories(const QStringList &backendList) const
++{
+     // cppcheck-suppress unknownMacro
+     const auto plugins = KPluginMetaData::findPlugins(QStringLiteral("kf6/plasma_firewall"));
+ 
+@@ -313,6 +324,24 @@ void FirewallClient::setBackend(const QStringList &backendList)
+         }
+         factories.append(factory);
+     }
++    return factories;
++}
++
++void FirewallClient::adoptBackend(IFirewallClientBackend *backend)
++{
++    m_currentBackend = backend;
++    connect(m_currentBackend, &IFirewallClientBackend::enabledChanged, this, &FirewallClient::enabledChanged);
++    connect(m_currentBackend, &IFirewallClientBackend::defaultIncomingPolicyChanged, this, &FirewallClient::defaultIncomingPolicyChanged);
++    connect(m_currentBackend, &IFirewallClientBackend::defaultOutgoingPolicyChanged, this, &FirewallClient::defaultOutgoingPolicyChanged);
++    connect(m_currentBackend, &IFirewallClientBackend::logsAutoRefreshChanged, this, &FirewallClient::logsAutoRefreshChanged);
++    connect(m_currentBackend, &IFirewallClientBackend::hasExecutableChanged, this, &FirewallClient::hasExecutableChanged);
++    connect(m_currentBackend, &IFirewallClientBackend::showErrorMessage, this, &FirewallClient::showErrorMessage);
++}
++
++void FirewallClient::setBackend(const QStringList &backendList)
++{
++    dropBackend();
++    const QList<KPluginFactory *> factories = loadFactories(backendList);
+ 
+     // lambdas
+     auto systemCheck = [this](const QList<KPluginFactory *> &factories) -> IFirewallClientBackend * {
+@@ -337,22 +366,135 @@ void FirewallClient::setBackend(const QStringList &backendList)
+         return nullptr;
+     };
+ 
+-    m_currentBackend = systemCheck(factories);
+-    if (!m_currentBackend) {
+-        m_currentBackend = loadFromBinary(factories);
++    IFirewallClientBackend *found = systemCheck(factories);
++    if (!found) {
++        found = loadFromBinary(factories);
+     }
+ 
+-    if (!m_currentBackend) {
++    m_detecting = false;
++    if (!found) {
+         qCDebug(FirewallClientDebug) << "Could not find any of the specified backends" << backendList;
+         return;
+     }
+ 
+-    connect(m_currentBackend, &IFirewallClientBackend::enabledChanged, this, &FirewallClient::enabledChanged);
+-    connect(m_currentBackend, &IFirewallClientBackend::defaultIncomingPolicyChanged, this, &FirewallClient::defaultIncomingPolicyChanged);
+-    connect(m_currentBackend, &IFirewallClientBackend::defaultOutgoingPolicyChanged, this, &FirewallClient::defaultOutgoingPolicyChanged);
+-    connect(m_currentBackend, &IFirewallClientBackend::logsAutoRefreshChanged, this, &FirewallClient::logsAutoRefreshChanged);
+-    connect(m_currentBackend, &IFirewallClientBackend::hasExecutableChanged, this, &FirewallClient::hasExecutableChanged);
+-    connect(m_currentBackend, &IFirewallClientBackend::showErrorMessage, this, &FirewallClient::showErrorMessage);
++    adoptBackend(found);
++}
++
++void FirewallClient::detectBackend(const QStringList &backendList)
++{
++    dropBackend();
++    if (!m_detecting) {
++        m_detecting = true;
++        Q_EMIT detectingChanged();
++    }
++    m_detectFactories = loadFactories(backendList);
++    m_detectIndex = 0;
++    m_detectPass = 0;
++    probeNextBackend();
++}
++
++void FirewallClient::probeNextBackend()
++{
++    // Same order as setBackend(): first a backend whose service is loaded (systemctl status exits with 0),
++    // then the first one whose executable is installed. Only the systemctl calls are asynchronous.
++    while (true) {
++        if (m_detectIndex >= m_detectFactories.size()) {
++            if (m_detectPass == 0) {
++                m_detectPass = 1;
++                m_detectIndex = 0;
++                continue;
++            }
++            finishDetection(nullptr);
++            return;
++        }
++
++        KPluginFactory *factory = m_detectFactories.at(m_detectIndex++);
++        auto candidate = factory->create<IFirewallClientBackend>(this, QVariantList());
++        if (!candidate) {
++            continue;
++        }
++
++        if (m_detectPass == 1) {
++            if (candidate->hasExecutable()) {
++                finishDetection(candidate);
++                return;
++            }
++            candidate->deleteLater();
++            continue;
++        }
++
++        auto process = new QProcess(this);
++        connect(process, &QProcess::finished, this, [this, process, candidate](int exitCode, QProcess::ExitStatus status) {
++            process->deleteLater();
++            if (status == QProcess::NormalExit && exitCode == EXIT_SUCCESS) {
++                finishDetection(candidate);
++            } else {
++                candidate->deleteLater();
++                probeNextBackend();
++            }
++        });
++        connect(process, &QProcess::errorOccurred, this, [this, process, candidate](QProcess::ProcessError error) {
++            if (error == QProcess::FailedToStart) {
++                process->deleteLater();
++                candidate->deleteLater();
++                probeNextBackend();
++            }
++        });
++        process->start(QStringLiteral("systemctl"), {QStringLiteral("status"), candidate->name()});
++        return;
++    }
++}
++
++void FirewallClient::finishDetection(IFirewallClientBackend *backend)
++{
++    m_detectFactories.clear();
++    if (backend) {
++        adoptBackend(backend);
++    } else {
++        qCDebug(FirewallClientDebug) << "Could not find any of the specified backends";
++    }
++    m_detecting = false;
++    Q_EMIT detectingChanged();
++    Q_EMIT backendChanged(this->backend());
++    Q_EMIT capabilitiesChanged(capabilities());
++}
++
++bool FirewallClient::detecting() const
++{
++    return m_detecting;
++}
++
++QString FirewallClient::versionText() const
++{
++    return m_versionText;
++}
++
++void FirewallClient::requestVersion()
++{
++    if (m_versionRequested || !m_currentBackend) {
++        return;
++    }
++    m_versionRequested = true;
++
++    // version() starts "ufw --version" / "firewall-cmd --version" and waits for it: do that off the GUI thread.
++    IFirewallClientBackend *backend = m_currentBackend;
++    QPointer<FirewallClient> self(this);
++    m_versionThread = QThread::create([backend, self] {
++        const QString version = backend->version().trimmed();
++        if (self) {
++            QMetaObject::invokeMethod(
++                self.data(),
++                [self, version] {
++                    if (self) {
++                        self->m_versionText = version;
++                        Q_EMIT self->versionTextChanged();
++                    }
++                },
++                Qt::QueuedConnection);
++        }
++    });
++    m_versionThread->setParent(this);
++    m_versionThread->start();
+ }
+ 
+ QString FirewallClient::backend() const
+diff --git a/kcm/core/firewallclient.h b/kcm/core/firewallclient.h
+index 3f57aa5..eaa4ecd 100644
+--- a/kcm/core/firewallclient.h
++++ b/kcm/core/firewallclient.h
+@@ -11,6 +11,7 @@
+ #include <kcm_firewall_core_export.h>
+ 
+ #include <QFlags>
++#include <QList>
+ #include <QObject>
+ #include <QTimer>
+ 
+@@ -19,6 +20,8 @@
+ Q_DECLARE_LOGGING_CATEGORY(FirewallClientDebug)
+ 
+ class KJob;
++class KPluginFactory;
++class QThread;
+ class RuleListModel;
+ class LogListModel;
+ class IFirewallClientBackend;
+@@ -41,13 +44,23 @@ class KCM_FIREWALL_CORE_EXPORT FirewallClient : public QObject
+     Q_PROPERTY(bool enabled READ enabled NOTIFY enabledChanged)
+     Q_PROPERTY(QString defaultIncomingPolicy READ defaultIncomingPolicy NOTIFY defaultIncomingPolicyChanged)
+     Q_PROPERTY(QString defaultOutgoingPolicy READ defaultOutgoingPolicy NOTIFY defaultOutgoingPolicyChanged)
+-    Q_PROPERTY(RuleListModel *rulesModel READ rulesModel CONSTANT)
+-    Q_PROPERTY(LogListModel *logsModel READ logsModel CONSTANT)
++    // rulesModel, logsModel, name and supportsRuleUpdate depend on the backend, which is found asynchronously
++    // (detectBackend()), so they change with backendChanged instead of being constant.
++    Q_PROPERTY(RuleListModel *rulesModel READ rulesModel NOTIFY backendChanged)
++    Q_PROPERTY(LogListModel *logsModel READ logsModel NOTIFY backendChanged)
+     Q_PROPERTY(bool logsAutoRefresh READ logsAutoRefresh WRITE setLogsAutoRefresh NOTIFY logsAutoRefreshChanged)
+     Q_PROPERTY(bool hasExecutable READ hasExecutable NOTIFY hasExecutableChanged)
+     Q_PROPERTY(Capabilities capabilities READ capabilities NOTIFY capabilitiesChanged)
+-    Q_PROPERTY(QString name READ name CONSTANT)
+-    Q_PROPERTY(bool supportsRuleUpdate READ supportsRuleUpdate CONSTANT)
++    Q_PROPERTY(QString name READ name NOTIFY backendChanged)
++    Q_PROPERTY(bool supportsRuleUpdate READ supportsRuleUpdate NOTIFY backendChanged)
++    /**
++     * True until the backend (ufw / firewalld) has been looked for; the page shows its state first and fills in after.
++     */
++    Q_PROPERTY(bool detecting READ detecting NOTIFY detectingChanged)
++    /**
++     * Version text of the backend, read on a worker thread after requestVersion(); empty until then.
++     */
++    Q_PROPERTY(QString versionText READ versionText NOTIFY versionTextChanged)
+ 
+ public:
+     enum DefaultDataBehavior { DontReadDefaults, ReadDefaults };
+@@ -56,6 +69,14 @@ public:
+     ~FirewallClient() override;
+ 
+     void setBackend(const QStringList &backendList);
++    /**
++     * Same result as setBackend(), but the "is the service running" probes (systemctl) run without blocking the
++     * event loop. detecting() is true until it is done; backendChanged() is emitted at the end.
++     */
++    void detectBackend(const QStringList &backendList);
++    bool detecting() const;
++    QString versionText() const;
++    Q_INVOKABLE void requestVersion();
+ 
+     Q_INVOKABLE static QStringList knownProtocols();
+     Q_INVOKABLE static QStringList knownInterfaces();
+@@ -116,6 +137,8 @@ Q_SIGNALS:
+     void logsAutoRefreshChanged(bool logsAutoRefresh);
+     void backendChanged(const QString &backend);
+     void hasExecutableChanged(bool changed);
++    void detectingChanged();
++    void versionTextChanged();
+     void capabilitiesChanged(const FirewallClient::Capabilities &capabilities);
+     /**
+      * Emitted when an error message should be displayed.
+@@ -128,7 +151,20 @@ private:
+     void setLogsAutoRefresh(bool logsAutoRefresh);
+     void queryStatus(DefaultDataBehavior defaultDataBehavior = ReadDefaults, ProfilesBehavior ProfilesBehavior = ListenProfiles);
+ 
++    void dropBackend();
++    void adoptBackend(IFirewallClientBackend *backend);
++    QList<KPluginFactory *> loadFactories(const QStringList &backendList) const;
++    void probeNextBackend();
++    void finishDetection(IFirewallClientBackend *backend);
++
+     static IFirewallClientBackend *m_currentBackend;
++    bool m_detecting = true;
++    QList<KPluginFactory *> m_detectFactories;
++    int m_detectIndex = 0;
++    int m_detectPass = 0; // 0: look for a running service, 1: look for an installed executable
++    QString m_versionText;
++    bool m_versionRequested = false;
++    QThread *m_versionThread = nullptr;
+ };
+ 
+ Q_DECLARE_OPERATORS_FOR_FLAGS(FirewallClient::Capabilities)
+diff --git a/kcm/kcm.cpp b/kcm/kcm.cpp
+index 069bf14..2d8ca7b 100644
+--- a/kcm/kcm.cpp
++++ b/kcm/kcm.cpp
+@@ -37,14 +37,24 @@ KCMFirewall::KCMFirewall(QObject *parent, const KPluginMetaData &metaData)
+     qmlRegisterUncreatableType<ConnectionsModel>("org.kcm.firewall", 1, 0, "ConnectionsModel", "Use the NetstatClient");
+     qmlRegisterType<IPValidator>("org.kcm.firewall", 1, 0, "IPValidator");
+ 
+-    // TODO: Make this configurable.
+-    m_client->setBackend({"ufw", "firewalld"});
++    setButtons(Help);
+ 
+-    if (m_client->capabilities() & FirewallClient::SaveCapability) {
+-        setButtons(Help | Apply);
+-    } else {
+-        setButtons(Help);
+-    }
++    // The backend is looked up after the page is on screen (plugin loading and the systemctl probes used to run
++    // here, before the first frame). The Apply button depends on what the backend can do, so it is set afterwards.
++    connect(m_client, &FirewallClient::detectingChanged, this, [this] {
++        if (!m_client->detecting() && (m_client->capabilities() & FirewallClient::SaveCapability)) {
++            setButtons(Help | Apply);
++        }
++    });
++    connect(
++        this,
++        &KQuickConfigModule::mainUiReady,
++        this,
++        [this] {
++            // TODO: Make this configurable.
++            m_client->detectBackend({"ufw", "firewalld"});
++        },
++        Qt::QueuedConnection);
+ }
+ 
+ KCMFirewall::~KCMFirewall()
+diff --git a/kcm/ui/AdvancedRuleEdit.qml b/kcm/ui/AdvancedRuleEdit.qml
+index 38a3db5..ceb2ead 100644
+--- a/kcm/ui/AdvancedRuleEdit.qml
++++ b/kcm/ui/AdvancedRuleEdit.qml
+@@ -28,6 +28,7 @@ Kirigami.FormLayout {
+ 
+     QQC2.ComboBox {
+         id: policy
++        // ksr: kcm_firewall/rule-policy
+         Kirigami.FormData.label: i18n("Policy:")
+         Layout.preferredWidth: root.maxComboboxWidth
+         model: policyChoices
+@@ -56,6 +57,7 @@ Kirigami.FormLayout {
+     }
+ 
+     RowLayout {
++        // ksr: kcm_firewall/rule-ipv6
+         Kirigami.FormData.label: i18n("IP Version:")
+ 
+         QQC2.RadioButton {
+@@ -113,7 +115,11 @@ Kirigami.FormLayout {
+ 
+         Kirigami.FormData.label: i18n("Protocol:")
+         Layout.preferredWidth: root.maxComboboxWidth
+-        model: ruleEdit.client.knownProtocols()
++        // the backend is found after the page opens: re-read when its name becomes known
++        model: {
++            ruleEdit.client.name;
++            return ruleEdit.client.knownProtocols();
++        }
+         currentIndex: rule.protocol
+         onActivated: index => {
+             rule.protocol = index;
+diff --git a/kcm/ui/SimpleRuleEdit.qml b/kcm/ui/SimpleRuleEdit.qml
+index bb18c3a..06c9d02 100644
+--- a/kcm/ui/SimpleRuleEdit.qml
++++ b/kcm/ui/SimpleRuleEdit.qml
+@@ -26,6 +26,7 @@ i18n("Allow connections for:") : i18n("Application:")
+ 
+     QQC2.ComboBox {
+         id: policy
++        // ksr: kcm_firewall/client-name-2
+         Kirigami.FormData.label: i18n("Policy:")
+         model: policyChoices
+         textRole: "text"
+diff --git a/kcm/ui/ViewBase.qml b/kcm/ui/ViewBase.qml
+index c5d739c..5b7c758 100644
+--- a/kcm/ui/ViewBase.qml
++++ b/kcm/ui/ViewBase.qml
+@@ -264,6 +264,7 @@ KCMUtils.AbstractKCM {
+         }
+ 
+         QQC2.Button {
++            // ksr: kcm_firewall/Blacklist-Connection
+             text: i18n("Blacklist Connection")
+             icon.name: "network-disconnect"
+             // HACK TableView lets us select a fake zero index when view is empty...
+diff --git a/kcm/ui/main.qml b/kcm/ui/main.qml
+index e45bb0c..8b746e4 100644
+--- a/kcm/ui/main.qml
++++ b/kcm/ui/main.qml
+@@ -29,9 +29,17 @@ KCMUtils.AbstractKCM {
+         {text: i18n("Reject"), data: "reject", tooltip: i18n("Produces an immediate and very informative 'Connection refused' message")}
+     ]
+ 
++    // Backend values pushed into the rule editor (it hides the policy hint when it equals the default)
++    property string defaultIncomingPolicy: ""
++    property string defaultOutgoingPolicy: ""
++
++    // The enable switch lives on the page (first row), not in the toolbar; the toolbar only has things that open.
++    readonly property bool backendReady: !kcm.client.detecting && kcm.client.name !== ""
++
+     actions: [
+         Kirigami.Action {
+-            visible: !kcm.client.busy && kcm.client.enabled
++            // ksr: kcm_firewall/AddRule
++            visible: root.backendReady && kcm.client.enabled
+             displayHint: Kirigami.DisplayHint.KeepVisible
+             icon.name: "list-add"
+             text: i18n("Add Rule…")
+@@ -41,97 +49,18 @@ KCMUtils.AbstractKCM {
+             }
+         },
+         Kirigami.Action {
+-            visible: !kcm.client.busy && kcm.client.enabled
+-            text: i18nc("'view' is being used as a verb here", "View Connections")
++            // ksr: kcm_firewall/ViewConnections
++            visible: root.backendReady && kcm.client.enabled
++            text: i18nc("'view' is being used as a verb here", "View Connections…")
+             icon.name: "network-connect"
+             onTriggered: kcm.push("ConnectionsView.qml")
+         },
+         Kirigami.Action {
+-            visible: !kcm.client.busy && kcm.client.enabled
+-            text: i18nc("'view' is being used as a verb here", "View Logs")
++            // ksr: kcm_firewall/ViewLogs
++            visible: root.backendReady && kcm.client.enabled
++            text: i18nc("'view' is being used as a verb here", "View Logs…")
+             icon.name: "viewlog"
+             onTriggered: kcm.push("LogsView.qml")
+-        },
+-        Kirigami.Action {
+-            text: enabledCheckBox.text
+-            checkable: true
+-            enabled: enabledCheckBox.enabled
+-            checked: enabledCheckBox.checked
+-            onTriggered: {
+-                enabledCheckBox.toggle()
+-            }
+-            displayComponent: QQC2.Switch {
+-                id: enabledCheckBox
+-                property QtObject activeJob: null
+-                text: {
+-                    if (kcm.client.enabled) {
+-                        return activeJob ? i18n("Disabling…") : i18n("Enabled")
+-                    } else {
+-                        return activeJob ? i18n("Enabling…") : i18n("Disabled")
+-                    }
+-                }
+-                enabled: kcm.client.name !== "" && !activeJob && !connectEnableTimer.running
+-
+-                function bindCurrent() {
+-                    checked = Qt.binding(function() {
+-                        return kcm.client.enabled;
+-                    });
+-                }
+-                Component.onCompleted: bindCurrent()
+-
+-                // FirewallD has a delay after the request to disable, to accept
+-                // enable actions, but the delay does not return with the job result
+-                // this is an ugly hack.
+-                Timer {
+-                    id: connectEnableTimer
+-                    interval: 4000
+-                    repeat: false
+-                }
+-                onToggled: {
+-                    const enable = checked; // store the state on job begin, not when it finished
+-
+-                    const job = kcm.client.setEnabled(checked);
+-                    if (job === null) {
+-                        firewallInlineErrorMessage.text = i18n("The firewall application, please install %1", kcm.client.name);
+-                        firewallInlineErrorMessage.visible = true;
+-                        return;
+-                    }
+-                    enabledCheckBox.activeJob = job;
+-                    job.result.connect(function () {
+-                        enabledCheckBox.activeJob = null; // need to explicitly unset since gc will clear it non-deterministic
+-                        bindCurrent();
+-
+-                        if (job.error && job.error !== 4) {
+-                            console.log(job.errorString);
+-                            var errorString = job.errorString;
+-                            // Firewalld is sending a typo to us.
+-                            if (errorString.indexOf("Permission denied") !== -1) {
+-                                errorString = i18n("Permission denied");
+-                            }
+-
+-                            if (errorString.indexOf("unable to initialize table") !== -1) {
+-                                firewallInlineErrorMessage.text = i18n("You recently updated your kernel. Iptables is failing to initialize, please reboot.")
+-                            } else {
+-                                firewallInlineErrorMessage.text = enabled
+-                                ? i18n("Error enabling firewall: %1", errorString)
+-                                : i18n("Error disabling firewall: %1", errorString)
+-                            }
+-                            firewallInlineErrorMessage.visible = true;
+-                        }
+-                        if (!enable && !job.error) {
+-                            connectEnableTimer.start();
+-                        }
+-                    });
+-                    job.start();
+-                }
+-
+-                InlineBusyIndicator {
+-                    anchors.centerIn: parent.indicator
+-                    z: 999
+-                    horizontalAlignment: Qt.AlignHCenter
+-                    running: enabledCheckBox.activeJob !== null || connectEnableTimer.running
+-                }
+-            }
+         }
+     ]
+ 
+@@ -163,6 +92,8 @@ KCMUtils.AbstractKCM {
+             RuleEdit {
+                 id: ruleEdit
+                 client: kcm.client
++                defaultIncomingPolicyRule: root.defaultIncomingPolicy
++                defaultOutgoingPolicyRule: root.defaultOutgoingPolicy
+                 height: childrenRect.height
+                 implicitWidth: 30 * Kirigami.Units.gridUnit
+ 
+@@ -213,6 +144,7 @@ KCMUtils.AbstractKCM {
+             enabled: ruleEdit.ready
+ 
+             QQC2.Button {
++                // ksr: kcm_firewall/Create
+                 text: ruleEdit.newRule ? i18n("Create") : i18n("Save")
+                 icon.name: ruleEdit.newRule ? "document-new" : "document-save"
+                 QQC2.DialogButtonBox.buttonRole: QQC2.DialogButtonBox.AcceptRole
+@@ -236,10 +168,88 @@ KCMUtils.AbstractKCM {
+             type: Kirigami.MessageType.Error
+         }
+         Kirigami.FormLayout {
++            // State first: is the firewall on, and which one is it
++            // ksr: kcm_firewall/client-enabled
++            QQC2.Switch {
++                id: enabledCheckBox
++                Kirigami.FormData.label: i18n("Firewall:")
++                property QtObject activeJob: null
++                text: {
++                    if (kcm.client.enabled) {
++                        return activeJob ? i18n("Disabling…") : i18n("Enabled")
++                    } else {
++                        return activeJob ? i18n("Enabling…") : i18n("Disabled")
++                    }
++                }
++                enabled: root.backendReady && !activeJob && !connectEnableTimer.running
++
++                function bindCurrent() {
++                    checked = Qt.binding(function() {
++                        return kcm.client.enabled;
++                    });
++                }
++                Component.onCompleted: bindCurrent()
++
++                // FirewallD has a delay after the request to disable, to accept
++                // enable actions, but the delay does not return with the job result
++                // this is an ugly hack.
++                Timer {
++                    id: connectEnableTimer
++                    interval: 4000
++                    repeat: false
++                }
++                onToggled: {
++                    const enable = checked; // store the state on job begin, not when it finished
++
++                    const job = kcm.client.setEnabled(checked);
++                    if (job === null) {
++                        firewallInlineErrorMessage.text = i18n("The firewall application, please install %1", kcm.client.name);
++                        firewallInlineErrorMessage.visible = true;
++                        return;
++                    }
++                    enabledCheckBox.activeJob = job;
++                    job.result.connect(function () {
++                        enabledCheckBox.activeJob = null; // need to explicitly unset since gc will clear it non-deterministic
++                        bindCurrent();
++
++                        if (job.error && job.error !== 4) {
++                            console.log(job.errorString);
++                            var errorString = job.errorString;
++                            // Firewalld is sending a typo to us.
++                            if (errorString.indexOf("Permission denied") !== -1) {
++                                errorString = i18n("Permission denied");
++                            }
++
++                            if (errorString.indexOf("unable to initialize table") !== -1) {
++                                firewallInlineErrorMessage.text = i18n("You recently updated your kernel. Iptables is failing to initialize, please reboot.")
++                            } else {
++                                firewallInlineErrorMessage.text = enabled
++                                ? i18n("Error enabling firewall: %1", errorString)
++                                : i18n("Error disabling firewall: %1", errorString)
++                            }
++                            firewallInlineErrorMessage.visible = true;
++                        }
++                        if (!enable && !job.error) {
++                            connectEnableTimer.start();
++                        }
++                    });
++                    job.start();
++                }
++
++                InlineBusyIndicator {
++                    anchors.centerIn: parent.indicator
++                    z: 999
++                    horizontalAlignment: Qt.AlignHCenter
++                    running: enabledCheckBox.activeJob !== null || connectEnableTimer.running
++                }
++            }
++
+             RowLayout {
+                 spacing: Kirigami.Units.smallSpacing
+                 implicitHeight: versionButton.implicitHeight
++                visible: kcm.client.name !== ""
+ 
++                // ksr: kcm_firewall/client-version
+                 Kirigami.FormData.label: i18n("Firewall type:")
+                 Kirigami.SelectableLabel {
+                     Layout.fillWidth: true
+@@ -248,37 +258,46 @@ KCMUtils.AbstractKCM {
+                 }
+                 Kirigami.ContextualHelpButton {
+                     id: versionButton
+-                    toolTipText: i18nc("@info", "Firewall version: %1", kcm.client.version().trim())
++                    // The version comes from running "ufw --version" / "firewall-cmd --version": read on a worker thread
++                    toolTipText: kcm.client.versionText !== "" ? i18nc("@info", "Firewall version: %1", kcm.client.versionText) : i18nc("@info", "Reading the firewall version…")
+                 }
+             }
+ 
++            Kirigami.Separator {
++                Kirigami.FormData.isSection: true
++                Kirigami.FormData.label: i18n("Default policy")
++                visible: kcm.client.name !== ""
++            }
++
++            // ksr: kcm_firewall/client-enabled-2
+             Repeater {
+                 model: [
+-                    {label: i18n("Default Incoming Policy:"), key: "Incoming"},
+-                    {label: i18n("Default Outgoing Policy:"), key: "Outgoing"}
++                    {label: i18n("Incoming connections:"), key: "Incoming"},
++                    {label: i18n("Outgoing connections:"), key: "Outgoing"}
+                 ]
+ 
+                 RowLayout {
+                     Kirigami.FormData.label: modelData.label
++                    visible: kcm.client.name !== ""
+ 
+                     QQC2.ComboBox {
+                         id: policyCombo
+ 
+                         property QtObject activeJob: null
+                         // TODO currentValue
+-                        readonly property string currentPolicy: policyChoices[currentIndex].data
++                        readonly property string currentPolicy: currentIndex >= 0 ? policyChoices[currentIndex].data : ""
+ 
+                         model: policyChoices
+                         textRole: "text"
+                         enabled: !activeJob && kcm.client.enabled
+-                        QQC2.ToolTip.text: policyChoices[currentIndex].tooltip
++                        QQC2.ToolTip.text: currentIndex >= 0 ? policyChoices[currentIndex].tooltip : ""
+                         QQC2.ToolTip.delay: 1000
+                         QQC2.ToolTip.timeout: 5000
+                         QQC2.ToolTip.visible: hovered
+ 
+                         Binding { // :(
+-                            target: ruleEdit
+-                            property: "default" + modelData.key + "PolicyRule"
++                            target: root
++                            property: "default" + modelData.key + "Policy"
+                             value: policyCombo.currentPolicy
+                         }
+ 
+@@ -324,6 +343,14 @@ KCMUtils.AbstractKCM {
+         anchors.fill: parent
+         spacing: 0
+ 
++        Kirigami.Heading {
++            level: 3
++            text: i18n("Rules")
++            visible: root.backendReady
++            Layout.fillWidth: true
++            Layout.margins: Kirigami.Units.largeSpacing
++        }
++
+         QQC2.HorizontalHeaderView {
+             id: horizontalHeader
+             Layout.fillWidth: true
+@@ -382,6 +409,12 @@ KCMUtils.AbstractKCM {
+                 }
+ 
+                 model: kcm.client.rulesModel
++                Connections {
++                    target: kcm.client
++                    function onBackendChanged() {
++                        tableView.forceLayout()
++                    }
++                }
+                 columnWidthProvider: (column) => {
+                     if (column === RuleListModel.CommentColumn && kcm.client.name !== "ufw") {
+                         return 0
+@@ -473,11 +506,26 @@ KCMUtils.AbstractKCM {
+                     }
+                 }
+ 
++                // The backend is looked up after the first frame; a spinner shows only if that takes more than 150 ms
++                QQC2.BusyIndicator {
++                    parent: tableView.parent
++                    anchors.centerIn: parent
++                    running: visible
++                    visible: kcm.client.detecting && detectingDelay.elapsed
++                }
++                Timer {
++                    id: detectingDelay
++                    property bool elapsed: false
++                    interval: 150
++                    running: kcm.client.detecting
++                    onTriggered: elapsed = true
++                }
++
+                 Kirigami.PlaceholderMessage {
+                     parent: tableView.parent
+                     anchors.centerIn: parent
+                     width: tableView.width - (Kirigami.Units.largeSpacing * 12)
+-                    visible: tableView.rows === 0
++                    visible: root.backendReady && tableView.rows === 0
+                     icon.name: kcm.client.enabled ? "edit-none" : "security-low"
+                     text: !kcm.client.enabled ? i18n("Firewall is disabled") : i18n("No firewall rules have been added")
+                     explanation: kcm.client.enabled ?
+@@ -488,13 +536,30 @@ KCMUtils.AbstractKCM {
+         }
+     }
+ 
+-    Component.onCompleted: {
++    // Runs once the backend has been found (it is looked up after the page is shown, see KCMFirewall)
++    function backendFound() {
+         if (kcm.client.name === "") {
+             firewallInlineErrorMessage.text = i18n("Please install a firewall, such as ufw or firewalld");
+             firewallInlineErrorMessage.visible = true;
+         } else {
+             // Initialize the client's status.
+             kcm.client.refresh();
++            kcm.client.requestVersion();
++        }
++    }
++
++    Connections {
++        target: kcm.client
++        function onDetectingChanged() {
++            if (!kcm.client.detecting) {
++                root.backendFound();
++            }
++        }
++    }
++
++    Component.onCompleted: {
++        if (!kcm.client.detecting) {
++            backendFound();
+         }
+     }
+ }

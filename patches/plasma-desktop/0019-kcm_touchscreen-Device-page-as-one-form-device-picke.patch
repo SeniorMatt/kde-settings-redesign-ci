@@ -1,0 +1,105 @@
+From 81ca7ef8d12ee8fd5207d434aaa5b8ba35276d5a Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 02:19:48 +0500
+Subject: [PATCH 19/31] kcm_touchscreen: Device page as one form, device picker
+ only when there is a choice, display mapping explained
+
+Page type: Device with a single device in practice, kept as one Form (docs/page-design.md). Kcm API, KWinDevices model,
+save()/load() and the stored properties (enabled, outputName) unchanged. Not built yet.
+
+Moved / renamed:
+- "Device:" combo is shown only with 2+ touchscreens (was a disabled combo); with one, the name is shown as a plain
+  label (kcm_touchscreen/touchscreensModel).
+- "Enabled:" checkbox became the sentence-case checkbox "Use this touchscreen" (no colon label, HIG: checkbox text
+  without colon) (kcm_touchscreen/root-device-enabled).
+- "Target display:" became "Show touch on:" with a small help line under it; the line also says why the combo is
+  disabled when one display is connected (kcm_touchscreen/x). Old wording kept as aliases in ia/layout.json.
+- Empty state placeholder unchanged (kcm_touchscreen/NoTouchscreen).
+HIG ids: HIG-001/005 (order by use), checkbox and label capitalisation rules; help text as a small label with maximumWidth
+gridUnit*16 so FormLayout stays wide.
+
+Speed cause: none found in the code (no process/D-Bus work in kcmtouchscreen.cpp, the device list comes from the in-process
+KWinDevices model). After numbers: pending, manager will measure.
+
+Unconfirmed: the Layout.maximumWidth on a Label inside FormLayout (same pattern as 56095d1); not compiled.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/touchscreen/ui/main.qml | 29 ++++++++++++++++++++++++++---
+ 1 file changed, 26 insertions(+), 3 deletions(-)
+
+diff --git a/kcms/touchscreen/ui/main.qml b/kcms/touchscreen/ui/main.qml
+index 0890851..a2db005 100644
+--- a/kcms/touchscreen/ui/main.qml
++++ b/kcms/touchscreen/ui/main.qml
+@@ -25,6 +25,7 @@ KCMUtils.SimpleKCM {
+     implicitHeight: Kirigami.Units.gridUnit * 35
+ 
+     Kirigami.PlaceholderMessage {
++        // ksr: kcm_touchscreen/NoTouchscreen
+         icon.name: "input-touchscreen"
+         text: i18nc("@info:status placeholdermessage text", "No touchscreens found")
+         explanation: i18nc("@info:usagetip placeholdermessage explanation", "Connect an external touchscreen")
+@@ -37,12 +38,14 @@ KCMUtils.SimpleKCM {
+ 
+         visible: combo.count > 0
+ 
++        // Only worth showing when there is a choice between touchscreens.
+         QQC2.ComboBox {
++            // ksr: kcm_touchscreen/touchscreensModel
+             id: combo
+             model: kcm.touchscreensModel
+             textRole: "display"
+ 
+-            enabled: count > 1 //It's only interesting when there's more than 1 touchscreen
++            visible: count > 1
+ 
+             Kirigami.FormData.label: i18nc("@label:listbox The device we are configuring", "Device:")
+ 
+@@ -55,17 +58,27 @@ KCMUtils.SimpleKCM {
+             }
+         }
+ 
++        QQC2.Label {
++            // The single touchscreen's name when there is no choice to make.
++            visible: combo.count === 1
++            text: combo.currentText
++            elide: Text.ElideRight
++            Layout.maximumWidth: Kirigami.Units.gridUnit * 20
++            Kirigami.FormData.label: i18nc("@label The device we are configuring", "Device:")
++        }
+ 
+         QQC2.CheckBox {
+-            Kirigami.FormData.label: i18nc("@option:check prefix touchscreen device is enabled", "Enabled:")
++            // ksr: kcm_touchscreen/root-device-enabled
++            text: i18nc("@option:check", "Use this touchscreen")
+ 
+             checked: root.device?.enabled ?? false
+             onToggled: root.device.enabled = checked
+         }
+ 
+         QQC2.ComboBox {
++            // ksr: kcm_touchscreen/x
+             id: outputsCombo
+-            Kirigami.FormData.label: i18nc("@label:listbox this is a compound noun", "Target display:")
++            Kirigami.FormData.label: i18nc("@label:listbox this is a compound noun", "Show touch on:")
+             model: TouchScreenKCM.OutputsModel {
+                 id: outputsModel
+             }
+@@ -84,5 +97,15 @@ KCMUtils.SimpleKCM {
+                 }
+             }
+         }
++
++        QQC2.Label {
++            Layout.fillWidth: true
++            Layout.maximumWidth: Kirigami.Units.gridUnit * 16
++            text: outputsCombo.enabled
++                ? i18nc("@info", "Choose the display this touchscreen is built into or placed over. Automatic lets the system decide.")
++                : i18nc("@info", "Only one display is connected, so there is nothing to choose.")
++            font: Kirigami.Theme.smallFont
++            wrapMode: Text.Wrap
++        }
+     }
+ }

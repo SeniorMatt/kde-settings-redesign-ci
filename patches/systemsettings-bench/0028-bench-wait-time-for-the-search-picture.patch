@@ -1,0 +1,22 @@
+From 376a1642c3850116a540375020aaea4ed35c4da4 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 09:03:41 +0500
+Subject: [PATCH 28/34] bench: wait time for the search picture
+
+---
+ app/SidebarMode.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/app/SidebarMode.cpp b/app/SidebarMode.cpp
+index d374526..0943042 100644
+--- a/app/SidebarMode.cpp
++++ b/app/SidebarMode.cpp
+@@ -223,7 +223,7 @@ SidebarMode::SidebarMode(QObject *parent,
+             if (field) {
+                 field->setProperty("text", qEnvironmentVariable("KSR_SEARCH"));
+             }
+-            QTimer::singleShot(1500, this, [this] {
++            QTimer::singleShot(qEnvironmentVariableIntValue("KSR_SEARCH_WAIT") > 0 ? qEnvironmentVariableIntValue("KSR_SEARCH_WAIT") : 1500, this, [this] {
+                 const QString dir = qEnvironmentVariable("KSR_SHOT_DIR", QStringLiteral("/tmp"));
+                 d->mainWidget->window()->grab().save(dir + QStringLiteral("/search.png"));
+                 if (qEnvironmentVariableIsSet("KSR_SEARCH_OPEN")) {

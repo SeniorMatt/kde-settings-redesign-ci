@@ -1,0 +1,54 @@
+From f0fcb5de989340de22fecbcf9bcf448ddfc68442 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 08:53:34 +0500
+Subject: [PATCH 07/34] SettingsLayoutTree: read the old category files once
+ for unlisted pages
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ app/SettingsLayoutTree.cpp | 14 ++++++++------
+ 1 file changed, 8 insertions(+), 6 deletions(-)
+
+diff --git a/app/SettingsLayoutTree.cpp b/app/SettingsLayoutTree.cpp
+index 683a63f..b0bfa39 100644
+--- a/app/SettingsLayoutTree.cpp
++++ b/app/SettingsLayoutTree.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include "../systemsettings_app_debug.h"
+ 
++#include <utility>
+ #include <KConfigGroup>
+ #include <KDesktopFile>
+ #include <KLocalizedString>
+@@ -106,10 +107,11 @@ private:
+     void addListedPages();
+     void addTechnicalDetails();
+     void addUnlistedPages();
+-    QString fallbackCategory(const KPluginMetaData &module) const;
++    QString fallbackCategory(const KPluginMetaData &module);
+ 
+     MenuItem *const m_root;
+-    const QStringList m_categoryFiles;
++    QStringList m_categoryFiles; // emptied once read into m_oldCategoryParents
++    QHash<QString, QString> m_oldCategoryParents;
+     QHash<QString, KPluginMetaData> m_modules;
+     QSet<QString> m_placed;
+     QHash<QString, MenuItem *> m_groups;
+@@ -227,11 +229,11 @@ void Builder::addTechnicalDetails()
+     }
+ }
+ 
+-QString Builder::fallbackCategory(const KPluginMetaData &module) const
++QString Builder::fallbackCategory(const KPluginMetaData &module)
+ {
+-    // The parent of each old category, to walk up when the page's own category is not in the table
+-    QHash<QString, QString> parentOf;
+-    for (const QString &file : m_categoryFiles) {
++    // The parent of each old category, to walk up when the page's own category is not in the table (read once)
++    QHash<QString, QString> &parentOf = m_oldCategoryParents;
++    for (const QString &file : std::exchange(m_categoryFiles, {})) {
+         const KDesktopFile desktopFile(file);
+         const KConfigGroup group = desktopFile.desktopGroup();
+         QString parent = group.readEntry("X-KDE-System-Settings-Parent-Category-V2");

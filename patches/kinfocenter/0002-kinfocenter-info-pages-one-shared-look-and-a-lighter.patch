@@ -1,0 +1,328 @@
+From 7d308c50800ec247038bb00e30e623d237700e37 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 01:29:33 +0500
+Subject: [PATCH 2/9] kinfocenter info pages: one shared look and a lighter
+ first frame (CommandOutputContext, CommandOutputKCM)
+
+Base of 17 read-only information pages (cpu, edid, egl, glx, vulkan, opencl, vaapi, wayland, xserver, kwinsupportinfo,
+pci, usb, network, interrupts, sensors, audio_information, block_devices, firmware_security); memory moves onto it in a
+later commit. Page type: "Info" (a Form/List variant in docs/page-design.md: the output is the page, toolbar on top).
+
+Look (docs/page-design.md 2, 3, 7; HIG-001/005):
+- The text uses Kirigami.Theme.fixedWidthFont like every other mono text in Plasma (was the literal family "monospace",
+  and kcm_memory used the theme font: now all pages the same).
+- Busy indicator after 150 ms (was 500), as the design says for every page.
+- Filter applies while typing (150 ms pause, Enter at once); before only Enter did anything.
+- New toolbar action "Refresh" (F5) on snapshot pages (those without auto refresh); it also retries after an error.
+  Copy to Clipboard, Filter (Ctrl+I) and Pause/Resume Refreshing are unchanged.
+- "Report to <distribution>" only for a missing or crashing tool (errorReportable) and only when the distribution has a
+  bug report URL; the button used to be offered for every error.
+
+Speed (cause found in code): CommandOutputContext's constructor called load() directly (QMetaObject::invokeMethod on the
+same thread is a direct call), so inside page creation it ran executable lookup (QStandardPaths on PATH plus sbin dirs),
+KOSRelease() (parses /etc/os-release, once more in the constructor for the bug URL) and started the process. Now load() is
+queued (starts after the page exists), and bugReportUrl is read lazily when the button is used. A tool that cannot be
+started (errorOccurred FailedToStart) used to leave the page on the busy indicator forever; it now reports the error. A
+second run while one is still going (1 s auto refresh with a slow tool, double Refresh) is skipped.
+New manual mode (CommandOutputContext(QObject*), setOutput/setFailure, refreshRequested) for pages whose data does not
+come from a process (memory, via KAuth).
+After numbers: pending, manager will measure.
+
+Not built yet (heavy work stopped); checked statically. Uncertain: StandardKey.Refresh as Kirigami.Action.shortcut (same pattern in bluedevil ForgetDeviceDialog.qml:65 and
+about-distro main.qml:151, but not confirmed for Refresh).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ src/CommandOutputContext.cpp | 89 ++++++++++++++++++++++++++++++------
+ src/CommandOutputContext.h   | 20 +++++++-
+ src/qml/CommandOutputKCM.qml | 28 ++++++++++--
+ 3 files changed, 117 insertions(+), 20 deletions(-)
+
+diff --git a/src/CommandOutputContext.cpp b/src/CommandOutputContext.cpp
+index 6dc0830..c74fd43 100644
+--- a/src/CommandOutputContext.cpp
++++ b/src/CommandOutputContext.cpp
+@@ -26,7 +26,6 @@ CommandOutputContext::CommandOutputContext(const QStringList &findExecutables,
+     , m_executableName(executable)
+     , m_executablePath(QStandardPaths::findExecutable(m_executableName))
+     , m_arguments(arguments)
+-    , m_bugReportUrl(KOSRelease().bugReportUrl())
+     , m_format(format)
+     , m_newlineIdentifier([format] {
+         switch (format) {
+@@ -54,7 +53,9 @@ CommandOutputContext::CommandOutputContext(const QStringList &findExecutables,
+     m_autoRefreshTimer = new QTimer(this);
+     connect(m_autoRefreshTimer, &QTimer::timeout, this, &CommandOutputContext::refresh);
+ 
+-    metaObject()->invokeMethod(this, &CommandOutputContext::load);
++    // Queued: the constructor runs while the page is being created. The tool starts from the event loop, after the
++    // first frame has been requested. (A direct invoke ran load() inside the constructor.)
++    metaObject()->invokeMethod(this, &CommandOutputContext::load, Qt::QueuedConnection);
+ }
+ 
+ CommandOutputContext::CommandOutputContext(const QStringList &findExecutables, const QString &executable, const QStringList &arguments, QObject *parent)
+@@ -67,6 +68,35 @@ CommandOutputContext::CommandOutputContext(const QString &executable, const QStr
+ {
+ }
+ 
++CommandOutputContext::CommandOutputContext(QObject *parent)
++    : CommandOutputContext({}, QString(), {}, Qt::TextFormat::PlainText, parent)
++{
++    // The delegated constructor only queued load(); it checks this flag when it runs.
++    m_manual = true;
++    m_foundExecutablePaths.clear();
++}
++
++QUrl CommandOutputContext::bugReportUrl() const
++{
++    if (!m_bugReportUrlRead) {
++        m_bugReportUrl = KOSRelease().bugReportUrl();
++        m_bugReportUrlRead = true;
++    }
++    return m_bugReportUrl;
++}
++
++void CommandOutputContext::setOutput(const QString &text)
++{
++    setResultText(text);
++    setReady();
++}
++
++void CommandOutputContext::setFailure(const QString &message, const QString &explanation, bool reportable)
++{
++    m_errorReportable = reportable;
++    setError(message, explanation);
++}
++
+ QString CommandOutputContext::executableName() const
+ {
+     return m_executableName;
+@@ -106,6 +136,7 @@ void CommandOutputContext::reset()
+     m_ready = false;
+     m_error.clear();
+     m_explanation.clear();
++    m_errorReportable = true;
+     m_text.clear();
+     m_filter.clear();
+     Q_EMIT readyChanged();
+@@ -122,6 +153,11 @@ void CommandOutputContext::load()
+ {
+     reset();
+ 
++    if (m_manual) {
++        Q_EMIT refreshRequested();
++        return;
++    }
++
+     for (auto it = m_foundExecutablePaths.cbegin(); it != m_foundExecutablePaths.cend(); ++it) {
+         if (it.value().isEmpty()) {
+             setError(xi18nc("@info", "Could not load page content"),
+@@ -139,10 +175,16 @@ void CommandOutputContext::load()
+ 
+ void CommandOutputContext::runProcess()
+ {
++    if (m_running) {
++        return; // a slow tool with automatic refreshing, or a double click on Refresh
++    }
++    m_running = true;
++
+     auto proc = new QProcess(this);
+     proc->setProcessChannelMode(QProcess::MergedChannels);
+     connect(proc, &QProcess::finished, this, [this, proc](int /* exitCode */, QProcess::ExitStatus exitStatus) {
+         proc->deleteLater();
++        m_running = false;
+ 
+         switch (exitStatus) {
+         case QProcess::CrashExit:
+@@ -152,28 +194,49 @@ void CommandOutputContext::runProcess()
+             break;
+         }
+ 
+-        m_text = QString::fromLocal8Bit(proc->readAllStandardOutput());
+-        if (m_trimAllowed) {
+-            m_text = m_text.trimmed();
+-        }
+-        m_originalLines = m_text.split('\n');
+-        if (!m_filter.isEmpty()) {
+-            // re-apply filter on new text
+-            setFilter(m_filter);
+-        }
+-
+-        Q_EMIT textChanged();
++        setResultText(QString::fromLocal8Bit(proc->readAllStandardOutput()));
+         setReady();
+     });
++    // finished() is not emitted when the process cannot be started at all; without this the page waited forever
++    connect(proc, &QProcess::errorOccurred, this, [this, proc](QProcess::ProcessError error) {
++        if (error != QProcess::FailedToStart) {
++            return;
++        }
++        proc->deleteLater();
++        m_running = false;
++        setError(xi18nc("@info", "Could not load page content"),
++                 xi18nc("@info", "Technical details: the <command>%1</command> tool could not be started.", m_executableName));
++    });
+     proc->start(m_executablePath, m_arguments);
+ }
+ 
++void CommandOutputContext::setResultText(const QString &text)
++{
++    m_text = text;
++    if (m_trimAllowed) {
++        m_text = m_text.trimmed();
++    }
++    m_originalLines = m_text.split('\n');
++    if (!m_filter.isEmpty()) {
++        // re-apply filter on new text
++        setFilter(m_filter);
++    }
++
++    Q_EMIT textChanged();
++}
++
+ void CommandOutputContext::refresh()
+ {
+     if (!m_ready) {
+         return;
+     }
+ 
++    // Manual mode, and a failed start (tool missing, crashed): go through load() again
++    if (m_manual || !m_error.isEmpty()) {
++        metaObject()->invokeMethod(this, &CommandOutputContext::load, Qt::QueuedConnection);
++        return;
++    }
++
+     metaObject()->invokeMethod(
+         this,
+         [this] {
+diff --git a/src/CommandOutputContext.h b/src/CommandOutputContext.h
+index d9e5b94..c49f0a6 100644
+--- a/src/CommandOutputContext.h
++++ b/src/CommandOutputContext.h
+@@ -32,7 +32,10 @@ class CommandOutputContext : public QObject
+     // Extra explanatory text for error conditions. Empty when no explanatory text has been specified.
+     Q_PROPERTY(QString explanation MEMBER m_explanation NOTIFY explanationChanged)
+     // URL where the user can report a bug when there is an error. Empty when there is no error, or no applicable place to report a bug
+-    Q_PROPERTY(QUrl bugReportUrl MEMBER m_bugReportUrl CONSTANT)
++    Q_PROPERTY(QUrl bugReportUrl READ bugReportUrl CONSTANT)
++    // Whether an error is worth reporting to the distribution (a missing or crashing tool). False for errors the user
++    // caused or can fix (e.g. a refused authorization).
++    Q_PROPERTY(bool errorReportable MEMBER m_errorReportable NOTIFY errorChanged)
+     // Text styling, which matters for filtering purposes.
+     Q_PROPERTY(Qt::TextFormat textFormat MEMBER m_format CONSTANT)
+     // Interval in milliseconds at which to automatically refresh the output. 0 means no refreshing.
+@@ -47,6 +50,13 @@ public:
+                          QObject *parent = nullptr);
+     CommandOutputContext(const QStringList &findExecutables, const QString &executable, const QStringList &arguments, QObject *parent = nullptr);
+     CommandOutputContext(const QString &executable, const QStringList &arguments, QObject *parent = nullptr);
++    // Manual mode: no process. The owner fills the page by connecting refreshRequested() (emitted once after
++    // construction, from the event loop, and on every refresh) and answering with setOutput() or setFailure().
++    explicit CommandOutputContext(QObject *parent);
++
++    QUrl bugReportUrl() const;
++    void setOutput(const QString &text);
++    void setFailure(const QString &message, const QString &explanation = QString(), bool reportable = false);
+ 
+     QString executableName() const;
+     QStringList arguments() const;
+@@ -71,6 +81,7 @@ Q_SIGNALS:
+     void readyChanged();
+     void errorChanged();
+     void explanationChanged();
++    void refreshRequested();
+ 
+ private:
+     void reset();
+@@ -78,12 +89,17 @@ private:
+     void runProcess();
+     void setError(const QString &message, const QString &explanation);
+     void setReady();
++    void setResultText(const QString &text);
+ 
+     const QString m_executableName;
+     QString m_executablePath;
+     QMap<QString, QString> m_foundExecutablePaths;
+     const QStringList m_arguments;
+-    const QUrl m_bugReportUrl;
++    mutable QUrl m_bugReportUrl; // read lazily: KOSRelease parses /etc/os-release
++    mutable bool m_bugReportUrlRead = false;
++    bool m_manual = false;
++    bool m_running = false;
++    bool m_errorReportable = true;
+ 
+     QStringList m_originalLines;
+ 
+diff --git a/src/qml/CommandOutputKCM.qml b/src/qml/CommandOutputKCM.qml
+index b705860..45b13fd 100644
+--- a/src/qml/CommandOutputKCM.qml
++++ b/src/qml/CommandOutputKCM.qml
+@@ -55,7 +55,7 @@ KCM.SimpleKCM {
+                     padding: Kirigami.Units.largeSpacing
+                     width: scrollView.width - leftPadding - rightPadding
+                     text: root.output.text
+-                    font.family: "monospace"
++                    font: Kirigami.Theme.fixedWidthFont
+                     wrapMode: root.wrapMode
+                     textFormat: root.textFormat
+                     onLinkActivated: link => Qt.openUrlExternally(link)
+@@ -77,12 +77,12 @@ KCM.SimpleKCM {
+                 anchors.centerIn: parent
+ 
+                 running: false
+-                // only show the indicator after a brief timeout otherwise we can have a situation where loading takes a couple
+-                // milliseconds during which time the indicator flashes up for no good reason
++                // only show the indicator after 150 ms (docs/page-design.md, "Busy") otherwise we can have a situation where
++                // loading takes a couple milliseconds during which time the indicator flashes up for no good reason
+                 Timer {
+                     running: true
+                     repeat: false
+-                    interval: 500
++                    interval: 150
+                     onTriggered: indicator.running = true
+                 }
+             }
+@@ -121,7 +121,8 @@ KCM.SimpleKCM {
+                 icon.name: errorNotFilter ? "action-unavailable-symbolic" : "edit-none"
+ 
+                 helpfulAction: Kirigami.Action {
+-                    enabled: placeholder.errorNotFilter
++                    // only for a missing or crashing tool; a refused authorization is not a packaging bug
++                    enabled: placeholder.errorNotFilter && root.output.errorReportable && root.output.bugReportUrl.toString() !== ""
+                     icon.name: "tools-report-bug"
+                     text: KI18n.i18n("Report to %1", KCoreAddons.KOSRelease.name)
+                     onTriggered: {
+@@ -194,9 +195,18 @@ KCM.SimpleKCM {
+                     Accessible.name: KI18n.i18ndc("kinfocenter", "accessible name for filter input", "Filter")
+                     Accessible.searchEdit: true
+ 
++                    // filter while typing (after a short pause), Enter applies it at once
++                    onTextChanged: filterDelay.restart()
+                     onAccepted: {
++                        filterDelay.stop()
+                         root.output.filter = filterField.text
+                     }
++
++                    Timer {
++                        id: filterDelay
++                        interval: 150
++                        onTriggered: root.output.filter = filterField.text
++                    }
+                 }
+ 
+                 QQC2.ToolButton {
+@@ -239,6 +249,14 @@ KCM.SimpleKCM {
+             text: KI18n.i18ndc("kinfocenter", "@action:button resumes automatic refreshing", "Resume Refreshing")
+             onTriggered: root.output.autoRefresh = true
+         },
++        Kirigami.Action {
++            // a snapshot page: run the tool again (pages with automatic refreshing do it themselves)
++            visible: root.output.autoRefreshMs === 0
++            icon.name: "view-refresh-symbolic"
++            text: KI18n.i18ndc("kinfocenter", "@action:button runs the tool again and shows its new output", "Refresh")
++            onTriggered: root.output.refresh()
++            shortcut: StandardKey.Refresh
++        },
+         Kirigami.Action {
+             enabled: root.output.error === ''
+ 

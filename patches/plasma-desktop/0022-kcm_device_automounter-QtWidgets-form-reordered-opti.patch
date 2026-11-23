@@ -1,0 +1,237 @@
+From dd9a8ffaab45fdee85c3e88e31382dad29d4768f Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 02:22:32 +0500
+Subject: [PATCH 22/31] kcm_device_automounter: QtWidgets form reordered
+ (option first, device list under a title), clearer column names, device list
+ loaded after the first frame
+
+Page type: List (QtWidgets, docs/page-design.md section 8: no port). kcfg keys, per-device settings, save() housekeeping and the kded
+module reload are unchanged. Not built yet.
+
+Moved / renamed:
+- The checkbox that decides which new devices are mounted moved above the list, now "Also mount devices that have never been
+  mounted before" with a hint line under it (kcm_device_automounter/AutomountUnknownDevices; was the last widget, "Automatically
+  mount removable media that have never been mounted before").
+- The list gets a bold title "Devices" and a one-line hint. Columns "Automount Device / On Login / On Attach" became
+  "Device / At Login / When Connected"; branch "Attached Devices" became "Connected Devices" (kcm_device_automounter/deviceView).
+- "Forget Device" became "Forget Selected Devices", right-aligned under the list (kcm_device_automounter/forgetDevice).
+  Old wording is in the ia/layout.json aliases.
+HIG ids: HIG-001/005/006 (order by use), HIG-057, title case on buttons, no jargon ("attach").
+
+Speed cause (DeviceModel.cpp, DeviceAutomounterKCM.cpp): DeviceModel's constructor ran reload() and then load() ran reload() again,
+so every known device was enumerated and its config group read twice before the first frame. The constructor call is gone and
+load() now schedules the reload and column layout with QTimer::singleShot(0). save() runs the pending reload first
+(finishLoad), so the cleanup of removed device groups can never run against an empty model. After numbers: pending, manager
+will measure.
+
+Unconfirmed: nothing was compiled or opened; the .ui was only checked as well-formed XML. The whatsThis texts still quote the
+old checkbox wording (they already did not match upstream's current text).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ .../kcm/DeviceAutomounterKCM.cpp              | 23 ++++++-
+ .../kcm/DeviceAutomounterKCM.h                |  2 +
+ .../kcm/DeviceAutomounterKCM.ui               | 65 +++++++++++++++----
+ solid-device-automounter/kcm/DeviceModel.cpp  | 12 ++--
+ 4 files changed, 82 insertions(+), 20 deletions(-)
+
+diff --git a/solid-device-automounter/kcm/DeviceAutomounterKCM.cpp b/solid-device-automounter/kcm/DeviceAutomounterKCM.cpp
+index c9e01fb..466ebdc 100644
+--- a/solid-device-automounter/kcm/DeviceAutomounterKCM.cpp
++++ b/solid-device-automounter/kcm/DeviceAutomounterKCM.cpp
+@@ -12,6 +12,7 @@
+ #include <QItemSelectionModel>
+ #include <QStandardItem>
+ #include <QStandardItemModel>
++#include <QTimer>
+ 
+ #include <KAboutData>
+ #include <KConfigGroup>
+@@ -91,17 +92,33 @@ void DeviceAutomounterKCM::load()
+ {
+     KCModule::load();
+ 
+-    m_devices->reload();
+-    loadLayout();
+-
+     kcfg_AutomountUnknownDevices->setChecked(m_settings->automountUnknownDevices());
+ 
+     m_unmanagedChanges = false;
+     updateState();
++
++    // Enumerating the known devices and reading their config groups is the slow part: do it once the page is showing.
++    // save() calls finishLoad() itself when it runs first, so no device group is ever removed by mistake.
++    m_devicesLoaded = false;
++    QTimer::singleShot(0, this, &DeviceAutomounterKCM::finishLoad);
++}
++
++void DeviceAutomounterKCM::finishLoad()
++{
++    if (m_devicesLoaded) {
++        return;
++    }
++    m_devicesLoaded = true;
++
++    m_devices->reload();
++    loadLayout();
++    updateState();
+ }
+ 
+ void DeviceAutomounterKCM::save()
+ {
++    finishLoad();
++
+     KCModule::save();
+ 
+     // Housekeeping before saving.
+diff --git a/solid-device-automounter/kcm/DeviceAutomounterKCM.h b/solid-device-automounter/kcm/DeviceAutomounterKCM.h
+index 149ece3..be99bf1 100644
+--- a/solid-device-automounter/kcm/DeviceAutomounterKCM.h
++++ b/solid-device-automounter/kcm/DeviceAutomounterKCM.h
+@@ -32,10 +32,12 @@ private Q_SLOTS:
+     void updateState();
+ 
+ private:
++    void finishLoad();
+     void saveLayout();
+     void loadLayout();
+ 
+     AutomounterSettings *const m_settings;
+     DeviceModel *const m_devices;
+     bool m_unmanagedChanges = false;
++    bool m_devicesLoaded = false;
+ };
+diff --git a/solid-device-automounter/kcm/DeviceAutomounterKCM.ui b/solid-device-automounter/kcm/DeviceAutomounterKCM.ui
+index 6a1e056..7342b4d 100644
+--- a/solid-device-automounter/kcm/DeviceAutomounterKCM.ui
++++ b/solid-device-automounter/kcm/DeviceAutomounterKCM.ui
+@@ -11,6 +11,48 @@
+    </rect>
+   </property>
+   <layout class="QVBoxLayout" name="verticalLayout">
++   <!-- ksr: kcm_device_automounter/AutomountUnknownDevices -->
++   <item>
++    <widget class="QCheckBox" name="kcfg_AutomountUnknownDevices">
++     <property name="whatsThis">
++      <string>When this is not checked, only remembered devices will be automatically mounted. A device is 'remembered' if it has ever been mounted before. For instance, plugging in a USB media player to charge is not sufficient to 'remember' it - if the files are not accessed, it will not be automatically mounted the next time it is seen. Once they have been accessed, however, the device's contents will be automatically made available to the system.</string>
++     </property>
++     <property name="text">
++      <string>Also mount devices that have never been mounted before</string>
++     </property>
++    </widget>
++   </item>
++   <item>
++    <widget class="QLabel" name="unknownHint">
++     <property name="text">
++      <string>When this is off, only devices you have mounted before are mounted automatically.</string>
++     </property>
++     <property name="wordWrap">
++      <bool>true</bool>
++     </property>
++     <property name="indent">
++      <number>24</number>
++     </property>
++    </widget>
++   </item>
++   <item>
++    <widget class="QLabel" name="devicesTitle">
++     <property name="text">
++      <string>&lt;b&gt;Devices&lt;/b&gt;</string>
++     </property>
++    </widget>
++   </item>
++   <item>
++    <widget class="QLabel" name="devicesHint">
++     <property name="text">
++      <string>Choose which devices are mounted at login and when they are connected.</string>
++     </property>
++     <property name="wordWrap">
++      <bool>true</bool>
++     </property>
++    </widget>
++   </item>
++   <!-- ksr: kcm_device_automounter/deviceView -->
+    <item>
+     <widget class="QTreeView" name="deviceView">
+      <property name="whatsThis">
+@@ -48,28 +90,29 @@
+      </attribute>
+     </widget>
+    </item>
++   <!-- ksr: kcm_device_automounter/forgetDevice -->
+    <item>
++    <layout class="QHBoxLayout" name="forgetRow">
++     <item>
++      <spacer name="forgetSpacer">
++       <property name="orientation"><enum>Qt::Horizontal</enum></property>
++       <property name="sizeHint" stdset="0"><size><width>40</width><height>20</height></size></property>
++      </spacer>
++     </item>
++     <item>
+     <widget class="QPushButton" name="forgetDevice">
+      <property name="whatsThis">
+       <string>Clicking this button causes the selected devices to be 'forgotten'. This is only useful if &quot;Only automatically mount removable media that has been manually mounted before&quot; is checked. Once a device is forgotten and the system is set to only automatically mount familiar devices, the device will not be automatically mounted.</string>
+      </property>
+      <property name="text">
+-      <string>Forget Device</string>
++      <string>Forget Selected Devices</string>
+      </property>
+      <property name="enabled">
+       <bool>false</bool>
+      </property>
+     </widget>
+-   </item>
+-   <item>
+-    <widget class="QCheckBox" name="kcfg_AutomountUnknownDevices">
+-     <property name="whatsThis">
+-      <string>When this is not checked, only remembered devices will be automatically mounted. A device is 'remembered' if it has ever been mounted before. For instance, plugging in a USB media player to charge is not sufficient to 'remember' it - if the files are not accessed, it will not be automatically mounted the next time it is seen. Once they have been accessed, however, the device's contents will be automatically made available to the system.</string>
+-     </property>
+-     <property name="text">
+-      <string>Automatically mount removable media that have never been mounted before</string>
+-     </property>
+-    </widget>
++     </item>
++    </layout>
+    </item>
+   </layout>
+  </widget>
+diff --git a/solid-device-automounter/kcm/DeviceModel.cpp b/solid-device-automounter/kcm/DeviceModel.cpp
+index 6129e94..c22087d 100644
+--- a/solid-device-automounter/kcm/DeviceModel.cpp
++++ b/solid-device-automounter/kcm/DeviceModel.cpp
+@@ -25,8 +25,7 @@ DeviceModel::DeviceModel(AutomounterSettings *m_settings, QObject *parent)
+     : QAbstractItemModel(parent)
+     , m_settings(m_settings)
+ {
+-    reload();
+-
++    // No reload() here: the KCM calls it from load() after the first frame (it enumerates every known device).
+     connect(Solid::DeviceNotifier::instance(), &Solid::DeviceNotifier::deviceAdded, this, &DeviceModel::deviceAttached);
+     connect(Solid::DeviceNotifier::instance(), &Solid::DeviceNotifier::deviceRemoved, this, &DeviceModel::deviceRemoved);
+ }
+@@ -52,11 +51,12 @@ QVariant DeviceModel::headerData(int section, Qt::Orientation orientation, int r
+     if (orientation == Qt::Horizontal && role == Qt::DisplayRole) {
+         switch (section) {
+         case 0:
+-            return i18n("Automount Device");
++            // ksr: kcm_device_automounter/deviceView
++            return i18n("Device");
+         case 1:
+-            return i18nc("As in automount on login", "On Login");
++            return i18nc("As in automount on login", "At Login");
+         case 2:
+-            return i18nc("As in automount on attach", "On Attach");
++            return i18nc("As in automount on attach", "When Connected");
+         }
+     }
+     return QVariant();
+@@ -276,7 +276,7 @@ QVariant DeviceModel::data(const QModelIndex &index, int role) const
+             case RowAll:
+                 return m_settings->automountUnknownDevices() ? i18n("All Devices") : i18n("All Known Devices");
+             case RowAttached:
+-                return i18n("Attached Devices");
++                return i18n("Connected Devices");
+             case RowDetached:
+                 return i18n("Disconnected Devices");
+             }

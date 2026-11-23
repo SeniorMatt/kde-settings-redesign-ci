@@ -1,0 +1,585 @@
+From 2b28e8260ddad88b4b2f523c930842d7a62c6140 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 14:29:35 +0500
+Subject: [PATCH 1/9] kcm_about-distro: hardware rows filled in after the first
+ frame (GPU probe in a thread), Kirigami.FormLayout
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Page type: Form/info (docs/page-design.md): distro header and Software first, then Hardware. Copy Details, Launch
+Information Center, Show/Copy serial, the kcm-about-distrorc keys and the dump mode are unchanged. NOT BUILT YET (owner
+stopped heavy work); checked statically only.
+
+Moved / renamed:
+- Kirigami.Form/FormGroup/FormEntry -> one Kirigami.FormLayout with noun sections "Software" and "Hardware"; each row is
+  a label + value (+ hint badge, help button, Show button) as before. No label changed, so no aliases needed. "Reading
+  hardware…" busy indicator after 150 ms. (HIG-001/005: state first; design §2, §7.)
+- Relabel table inventory/relabel/kcm_about-distro.tsv (outer repo). 27 inventory rows kept (ksr markers in main.cpp and
+  main.qml); inventory_check --kcm kcm_about-distro --strict: 0 lost.
+
+Speed (cause found in code): the constructor called load() -> loadEntries() synchronously (bug 366158 asked for that so the
+page never looks half-empty). That ran, before the page existed: ThirdPartyEntry scripts (two QProcess + waitForFinished
+each), Solid::Device::listFromType + udev (CPUEntry, MemoryEntry), GPUEntryFactory::factorize(): the Vulkan and EGL helper
+processes with waitForFinished(2 s) each, and an OpenGL context as the last resort (GPUEntryFactory.cpp:45-54).
+Now: OS name/version and the cheap software rows are read in the constructor (first frame shows the state); then from
+QTimer::singleShot(0) the third-party rows, CPU/memory, the dmidecode KAuth job and device-tree files are added, and the
+GPU probe runs in a QThread (factorize(Fallback::No), entries moved to the GUI thread; the OpenGL fallback stays on the
+GUI thread, GPUEntryFactory::fallbackEntries()). GPU rows are inserted right after Memory (same order as before; the
+clipboard text keeps that order). "dump" mode still builds everything synchronously.
+After numbers: pending, manager will measure.
+
+Not built yet; uncertain: Kirigami.FormData.buddyFor on a RowLayout delegate of a Repeater; QThread::create lambda writes
+m_gpuResult and the queued finished() reads it (destructor waits for the thread); the hardware busy flag ends with the
+GPU probe, the dmidecode rows may arrive a bit later (as before).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/about-distro/src/GPUEntryFactory.cpp |  10 +-
+ kcms/about-distro/src/GPUEntryFactory.h   |  13 +-
+ kcms/about-distro/src/main.cpp            | 193 ++++++++++++++++++----
+ kcms/about-distro/src/ui/main.qml         | 172 ++++++++++---------
+ 4 files changed, 273 insertions(+), 115 deletions(-)
+
+diff --git a/kcms/about-distro/src/GPUEntryFactory.cpp b/kcms/about-distro/src/GPUEntryFactory.cpp
+index 0be0d67..42ef7df 100644
+--- a/kcms/about-distro/src/GPUEntryFactory.cpp
++++ b/kcms/about-distro/src/GPUEntryFactory.cpp
+@@ -259,7 +259,7 @@ QString fancyOpenGLRenderer()
+ }
+ } // namespace
+ 
+-std::vector<Entry *> GPUEntryFactory::factorize()
++std::vector<Entry *> GPUEntryFactory::factorize(Fallback fallback)
+ {
+     if (auto optionalGpus = gpus(); optionalGpus.has_value()) {
+         std::vector<Entry *> entries;
+@@ -276,6 +276,14 @@ std::vector<Entry *> GPUEntryFactory::factorize()
+         return entries;
+     }
+ 
++    if (fallback == Fallback::No) {
++        return {};
++    }
++    return fallbackEntries();
++}
++
++std::vector<Entry *> GPUEntryFactory::fallbackEntries()
++{
+     // fall back to old logic of using the singular GL_RENDERER of the app
+     return {new GPUEntry({}, GPUEntry::Device{.name = fancyOpenGLRenderer(), .type = VK_PHYSICAL_DEVICE_TYPE_OTHER})};
+ }
+diff --git a/kcms/about-distro/src/GPUEntryFactory.h b/kcms/about-distro/src/GPUEntryFactory.h
+index 9a37085..cb7d238 100644
+--- a/kcms/about-distro/src/GPUEntryFactory.h
++++ b/kcms/about-distro/src/GPUEntryFactory.h
+@@ -10,5 +10,16 @@ class Entry;
+ class GPUEntryFactory
+ {
+ public:
+-    static std::vector<Entry *> factorize();
++    enum class Fallback {
++        No,
++        Yes,
++    };
++
++    // Reads the GPUs with the Vulkan and EGL helper processes (blocks up to 2 s each, safe to call from a worker thread
++    // as long as the entries are moved to the GUI thread afterwards). With Fallback::Yes and no result it also asks
++    // OpenGL for the renderer of this process, which must run on the GUI thread; with Fallback::No it returns {} then.
++    static std::vector<Entry *> factorize(Fallback fallback = Fallback::Yes);
++
++    // The "renderer of this process" entry (needs a QOpenGLContext: GUI thread only)
++    static std::vector<Entry *> fallbackEntries();
+ };
+diff --git a/kcms/about-distro/src/main.cpp b/kcms/about-distro/src/main.cpp
+index 62e0937..19d2555 100644
+--- a/kcms/about-distro/src/main.cpp
++++ b/kcms/about-distro/src/main.cpp
+@@ -4,6 +4,7 @@
+ */
+ 
+ #include <iostream>
++#include <algorithm>
+ #include <utility>
+ 
+ #include <QAbstractListModel>
+@@ -13,6 +14,8 @@
+ #include <QIcon>
+ #include <QLocale>
+ #include <QLoggingCategory>
++#include <QThread>
++#include <QTimer>
+ #include <QWindow>
+ 
+ #include <qqml.h>
+@@ -83,6 +86,14 @@ public:
+         return roles;
+     }
+ 
++    void insert(int row, Entry *entry)
++    {
++        row = std::clamp(row, 0, int(m_entries.size()));
++        beginInsertRows(QModelIndex(), row, row);
++        m_entries.insert(m_entries.begin() + row, entry);
++        endInsertRows();
++    }
++
+     void append(Entry *entry)
+     {
+         beginInsertRows(QModelIndex(), m_entries.size(), m_entries.size());
+@@ -118,15 +129,18 @@ public:
+         qmlRegisterType<ServiceRunner>("org.kde.kinfocenter.about_distro.private", 1, 0, "ServiceRunner");
+         qmlRegisterUncreatableType<Hint>("org.kde.kinfocenter.about_distro.private", 1, 0, "hint", "Only for enums");
+ 
+-        // https://bugs.kde.org/show_bug.cgi?id=366158
+-        // When a KCM loads fast enough do a blocking load via the constructor.
+-        // Otherwise there is a noticeable rendering gap where dummy/no data is
+-        // shown. Makes it look bad.
++        // https://bugs.kde.org/show_bug.cgi?id=366158 asked for a blocking load here so that no half-empty page is
++        // shown. The OS name and the software versions are still read here (they cost nothing); the hardware rows
++        // (Solid/udev, GPU helper processes, third-party scripts) are filled in after the first frame, see loadEntries().
+         load();
+     }
+ 
+     ~KCMAboutSystem() override
+     {
++        if (m_gpuThread) {
++            m_gpuThread->wait(); // the helper processes time out after 2 s
++        }
++        qDeleteAll(m_gpuResult); // only non-empty when the result was never picked up
+         qDeleteAll(m_entries);
+     }
+ 
+@@ -168,13 +182,6 @@ public:
+         // Default to not show Build
+         const bool showBuild = cg.readEntry("ShowBuild", false);
+ 
+-        // Check if distro want's us to show extra values
+-        const QString entryName = QStringLiteral("ExtraSoftwareData");
+-        const QStringList entries = cg.readXdgListEntry(entryName, QStringList());
+-        for (const auto &script : entries) {
+-            m_extraDataEntries.push_back(new ThirdPartyEntry(script));
+-        }
+-
+         // as a product brand is different from Kubuntu.
+         const QString distroName = cg.readEntry("Name", os.name());
+         const QString osrVersion = cg.readEntry("UseOSReleaseVersion", false) ? os.version() : os.versionId();
+@@ -248,33 +255,132 @@ public:
+ 
+     void loadEntries()
+     {
+-        auto addEntriesToGrid = [this](EntryModel *model, const std::vector<Entry *> &entries) {
+-            for (auto entry : entries) {
+-                if (!entry->isValid()) {
+-                    delete entry; // since we do not keep it around
+-                    continue;
+-                }
+-                model->append(entry);
+-                m_entries.push_back(entry);
++        // Row ids of the inventory (labels are unchanged, they are built from the Entry classes and kcm-about-distrorc):
++        // ksr: kcm_about-distro/Sw-Plasma
++        // ksr: kcm_about-distro/Sw-Frameworks
++        // ksr: kcm_about-distro/Sw-Qt
++        // ksr: kcm_about-distro/Sw-Kernel
++        // ksr: kcm_about-distro/Sw-GraphicsPlatform
++        // ksr: kcm_about-distro/Hw-Cpu
++        // ksr: kcm_about-distro/Hw-Memory
++        // ksr: kcm_about-distro/Hw-Gpu
++        // ksr: kcm_about-distro/Hw-Manufacturer
++        // ksr: kcm_about-distro/Hw-ProductName
++        // ksr: kcm_about-distro/Hw-SystemVersion
++        // ksr: kcm_about-distro/Hw-Serial
++        // ksr: kcm_about-distro/Hw-UBoot
++        // ksr: kcm_about-distro/OsVersion
++        // ksr: kcm_about-distro/cfg-Name
++        // software: cheap, shown with the first frame
++        addEntries(m_softwareEntries,
++                   {new PlasmaEntry(),
++                    new Entry(ki18n("KDE Frameworks Version:"), KCoreAddons::versionString()),
++                    new Entry(ki18n("Qt Version:"), QString::fromLatin1(qVersion())),
++                    new KernelEntry(),
++                    new GraphicsPlatformEntry()});
++
++        if (m_dumpToStdout) {
++            // "dump" prints the whole text at once, so there is nothing to show first
++            loadExtraSoftware();
++            loadCpuAndMemory();
++            addGpuEntries(GPUEntryFactory::factorize());
++            loadSystemInformation();
++            return;
++        }
++
++        // Before: everything below ran in the constructor, before the page existed: third-party scripts (run twice
++        // each, waitForFinished), Solid/udev (CPU, memory), the Vulkan and EGL helper processes (up to 2 s each) and an
++        // OpenGL context as a last resort. Now they run in steps after the first frame; the GPU probe runs in a thread.
++        setHardwareLoading(true);
++        QTimer::singleShot(0, this, [this] {
++            loadExtraSoftware();
++            loadCpuAndMemory();
++            startGpuProbe();
++            loadSystemInformation();
++        });
++    }
++
++    void addEntries(EntryModel *model, const std::vector<Entry *> &entries)
++    {
++        for (auto entry : entries) {
++            if (!entry->isValid()) {
++                delete entry; // since we do not keep it around
++                continue;
+             }
+-        };
++            model->append(entry);
++            m_entries.push_back(entry);
++        }
++        Q_EMIT changed();
++    }
+ 
+-        // software
+-        addEntriesToGrid(m_softwareEntries,
+-                         {new PlasmaEntry(),
+-                          new Entry(ki18n("KDE Frameworks Version:"), KCoreAddons::versionString()),
+-                          new Entry(ki18n("Qt Version:"), QString::fromLatin1(qVersion())),
+-                          new KernelEntry(),
+-                          new GraphicsPlatformEntry()});
+-
+-        // Add any extraData entries
+-        if (!m_extraDataEntries.empty()) {
+-            addEntriesToGrid(m_softwareEntries, m_extraDataEntries);
++    void loadExtraSoftware()
++    {
++        // Check if distro want's us to show extra values (the scripts are run here, not in loadOSData())
++        KSharedConfig::Ptr config = KSharedConfig::openConfig(QStringLiteral("kcm-about-distrorc"), KConfig::NoGlobals);
++        KConfigGroup cg = KConfigGroup(config, "General");
++        const QStringList entries = cg.readXdgListEntry(QStringLiteral("ExtraSoftwareData"), QStringList());
++        std::vector<Entry *> extra;
++        for (const auto &script : entries) {
++            extra.push_back(new ThirdPartyEntry(script));
+         }
++        if (!extra.empty()) {
++            addEntries(m_softwareEntries, extra);
++        }
++    }
+ 
+-        // hardware
+-        addEntriesToGrid(m_hardwareEntries, {new CPUEntry, new MemoryEntry});
+-        addEntriesToGrid(m_hardwareEntries, GPUEntryFactory::factorize());
++    void loadCpuAndMemory()
++    {
++        addEntries(m_hardwareEntries, {new CPUEntry, new MemoryEntry});
++        // GPU rows go right after these two, wherever they arrive
++        m_gpuRow = m_hardwareEntries->rowCount({});
++        m_gpuEntryIndex = m_entries.size();
++    }
++
++    void startGpuProbe()
++    {
++        m_gpuThread = QThread::create([this] {
++            // No OpenGL fallback here: a QOpenGLContext/QOffscreenSurface belongs on the GUI thread
++            m_gpuResult = GPUEntryFactory::factorize(GPUEntryFactory::Fallback::No);
++            for (Entry *entry : std::as_const(m_gpuResult)) {
++                entry->moveToThread(qApp->thread());
++            }
++        });
++        m_gpuThread->setParent(this);
++        connect(m_gpuThread, &QThread::finished, this, [this] {
++            std::vector<Entry *> entries = std::move(m_gpuResult);
++            m_gpuResult.clear();
++            m_gpuThread->deleteLater();
++            m_gpuThread = nullptr;
++            if (entries.empty()) {
++                // same last resort as before: the renderer of this process
++                entries = GPUEntryFactory::fallbackEntries();
++            }
++            addGpuEntries(entries);
++            setHardwareLoading(false);
++        });
++        m_gpuThread->start();
++    }
++
++    void addGpuEntries(const std::vector<Entry *> &entries)
++    {
++        int row = m_gpuRow < 0 ? m_hardwareEntries->rowCount({}) : m_gpuRow;
++        int index = m_gpuEntryIndex < 0 ? int(m_entries.size()) : m_gpuEntryIndex;
++        for (auto entry : entries) {
++            if (!entry->isValid()) {
++                delete entry;
++                continue;
++            }
++            m_hardwareEntries->insert(row++, entry);
++            m_entries.insert(m_entries.begin() + index++, entry);
++        }
++        Q_EMIT changed();
++    }
++
++    void loadSystemInformation()
++    {
++        auto addEntriesToGrid = [this](EntryModel *model, const std::vector<Entry *> &entries) {
++            addEntries(model, entries);
++        };
+ 
+         KAuth::Action action(QStringLiteral("org.kde.kinfocenter.dmidecode.systeminformation"));
+         action.setHelperId(QStringLiteral("org.kde.kinfocenter.dmidecode"));
+@@ -316,6 +422,14 @@ public:
+         Q_EMIT changed();
+     }
+ 
++    void setHardwareLoading(bool loading)
++    {
++        if (m_hardwareLoading != loading) {
++            m_hardwareLoading = loading;
++            Q_EMIT hardwareLoadingChanged();
++        }
++    }
++
+     QString clipboardText(Entry::Language language) const
+     {
+         QString text;
+@@ -346,10 +460,17 @@ public:
+ private:
+     const bool m_dumpToStdout;
+     std::vector<const Entry *> m_entries;
+-    // Extra data distro wants to show in key/value pairs
+-    std::vector<Entry *> m_extraDataEntries;
++    std::vector<Entry *> m_gpuResult;
++    QThread *m_gpuThread = nullptr;
++    int m_gpuRow = -1;
++    int m_gpuEntryIndex = -1;
++    bool m_hardwareLoading = false;
+ 
+     Q_SIGNAL void changed();
++    Q_SIGNAL void hardwareLoadingChanged();
++
++    // True until the hardware rows (CPU, GPU, ...) have been read; the page shows a busy indicator after 150 ms.
++    Q_PROPERTY(bool hardwareLoading MEMBER m_hardwareLoading NOTIFY hardwareLoadingChanged)
+ 
+     Q_PROPERTY(EntryModel *softwareEntries MEMBER m_softwareEntries CONSTANT)
+     EntryModel *m_softwareEntries = new EntryModel(this);
+diff --git a/kcms/about-distro/src/ui/main.qml b/kcms/about-distro/src/ui/main.qml
+index 3c8d768..3a6eb5e 100644
+--- a/kcms/about-distro/src/ui/main.qml
++++ b/kcms/about-distro/src/ui/main.qml
+@@ -80,6 +80,7 @@ KCMUtils.SimpleKCM {
+             Layout.alignment: Qt.AlignHCenter
+             spacing: Kirigami.Units.largeSpacing
+ 
++            // ksr: kcm_about-distro/DistroName
+             Kirigami.Icon {
+                 source: kcm.distroLogo
+                 implicitWidth: Kirigami.Units.iconSizes.enormous
+@@ -115,113 +116,129 @@ KCMUtils.SimpleKCM {
+             }
+         }
+ 
+-        Kirigami.Form {
+-            Layout.fillHeight: true
++        Kirigami.FormLayout {
++            id: details
+             Layout.fillWidth: true
+             Layout.alignment: Qt.AlignHCenter | Qt.AlignTop
+ 
++            // One row of the Software and Hardware lists. Hardware rows arrive after the first frame (kcm.hardwareLoading).
+             Component {
+                 id: entryComponent
+-                Kirigami.FormEntry {
++                RowLayout {
+                     id: entryItem
+-                    Layout.alignment: Qt.AlignHCenter | Qt.AlignTop
+-                    Layout.fillWidth: true
+-                    title: entry.localizedLabel()
+-                    contentItem: RowLayout {
+-                        spacing: Kirigami.Units.smallSpacing
+-                        Component {
+-                            id: unhideDialog
+-                            Kirigami.PromptDialog {
+-                                // NB: should we ever have other entries that need this dialog then this needs refactoring on the Entry side.
+-                                //  Do NOT simply add if else logic here!
+-                                title: i18nc("@title", "Serial Number")
+-                                subtitle: entry.localizedValue()
+-                                flatFooterButtons: true
+-                                standardButtons: Kirigami.Dialog.NoButton
+-                                customFooterActions: [
+-                                    Kirigami.Action {
+-                                        text: i18nc("@action:button", "Copy")
+-                                        icon.name: "edit-copy-symbolic"
+-                                        onTriggered: source => {
+-                                            kcm.storeInClipboard(subtitle)
+-                                            root.showToast(i18nc("@info:status", "Serial number copied to clipboard"));
+-                                        }
+-                                        shortcut: StandardKey.Copy
++                    Kirigami.FormData.label: entry.localizedLabel()
++                    Kirigami.FormData.buddyFor: valueLabel
++                    spacing: Kirigami.Units.smallSpacing
++
++                    Component {
++                        id: unhideDialog
++                        Kirigami.PromptDialog {
++                            // NB: should we ever have other entries that need this dialog then this needs refactoring on the Entry side.
++                            //  Do NOT simply add if else logic here!
++                            title: i18nc("@title", "Serial Number")
++                            subtitle: entry.localizedValue()
++                            flatFooterButtons: true
++                            standardButtons: Kirigami.Dialog.NoButton
++                            customFooterActions: [
++                                // ksr: kcm_about-distro/CopySerial
++                                Kirigami.Action {
++                                    text: i18nc("@action:button", "Copy")
++                                    icon.name: "edit-copy-symbolic"
++                                    onTriggered: source => {
++                                        kcm.storeInClipboard(subtitle)
++                                        root.showToast(i18nc("@info:status", "Serial number copied to clipboard"));
+                                     }
+-                                ]
+-                                onClosed: destroy();
+-                            }
++                                    shortcut: StandardKey.Copy
++                                }
++                            ]
++                            onClosed: destroy();
+                         }
++                    }
+ 
+-                        Kirigami.SelectableLabel {
+-                            id: valueLabel
+-                            visible: !entry.isHidden()
+-                            text: entry.localizedValue()
+-                            Keys.onShortcutOverride: event => {
+-                                event.accepted = (valueLabel.contentItem.activeFocus && valueLabel.selectedText && event.matches(StandardKey.Copy));
+-                            }
+-                            Keys.onPressed: event => {
+-                                if (event.matches(StandardKey.Copy)) {
+-                                    valueLabel.copy();
+-                                    event.accepted = true;
+-                                }
++                    Kirigami.SelectableLabel {
++                        id: valueLabel
++                        visible: !entry.isHidden()
++                        text: entry.localizedValue()
++                        Keys.onShortcutOverride: event => {
++                            event.accepted = (valueLabel.contentItem.activeFocus && valueLabel.selectedText && event.matches(StandardKey.Copy));
++                        }
++                        Keys.onPressed: event => {
++                            if (event.matches(StandardKey.Copy)) {
++                                valueLabel.copy();
++                                event.accepted = true;
+                             }
+                         }
++                    }
+ 
+-                        Kirigami.Badge {
+-                            visible: text.length > 0
+-                            padding: 1
+-                            customColor: {
+-                                switch (entry.localizedHint().color) {
+-                                    case Private.hint.Color.One: return Kirigami.Theme.activeBackgroundColor
+-                                    case Private.hint.Color.Two: return Kirigami.Theme.positiveBackgroundColor
+-                                    case Private.hint.Color.Three: return Kirigami.Theme.alternateBackgroundColor
+-                                }
++                    Kirigami.Badge {
++                        visible: text.length > 0
++                        padding: 1
++                        customColor: {
++                            switch (entry.localizedHint().color) {
++                                case Private.hint.Color.One: return Kirigami.Theme.activeBackgroundColor
++                                case Private.hint.Color.Two: return Kirigami.Theme.positiveBackgroundColor
++                                case Private.hint.Color.Three: return Kirigami.Theme.alternateBackgroundColor
+                             }
+-                            text: entry.localizedHint().text
+                         }
++                        text: entry.localizedHint().text
++                    }
+ 
+-                        Kirigami.ContextualHelpButton {
+-                            visible: toolTipText.length > 0
+-                            toolTipText: entry.localizedHelp()
+-                        }
++                    Kirigami.ContextualHelpButton {
++                        visible: toolTipText.length > 0
++                        toolTipText: entry.localizedHelp()
++                    }
+ 
+-                        QQC2.Button {
+-                            visible: entry.isHidden()
+-                            property var dialog: null
+-                            icon.name: "view-visible-symbolic"
+-                            text: i18nc("@action:button show a hidden entry in an overlay", "Show")
+-                            onClicked: {
+-                                if (!dialog) {
+-                                    dialog = unhideDialog.createObject(root, {});
+-                                }
+-                                dialog.open();
++                    // ksr: kcm_about-distro/Show
++                    QQC2.Button {
++                        visible: entry.isHidden()
++                        property var dialog: null
++                        icon.name: "view-visible-symbolic"
++                        text: i18nc("@action:button show a hidden entry in an overlay", "Show")
++                        onClicked: {
++                            if (!dialog) {
++                                dialog = unhideDialog.createObject(root, {});
+                             }
++                            dialog.open();
+                         }
+                     }
+                 }
+             }
+ 
+-            Kirigami.FormGroup {
+-                title: i18nc("@title:group", "Software")
+-                Repeater {
+-                    model: kcm.softwareEntries
+-                    delegate: entryComponent
+-                }
++            Kirigami.Separator {
++                Kirigami.FormData.isSection: true
++                Kirigami.FormData.label: i18nc("@title:group", "Software")
++            }
++            Repeater {
++                model: kcm.softwareEntries
++                delegate: entryComponent
+             }
+ 
+-            Kirigami.FormGroup {
+-                title: i18nc("@title:group", "Hardware")
+-                Repeater {
+-                    model: kcm.hardwareEntries
+-                    delegate: entryComponent
+-                }
++            Kirigami.Separator {
++                Kirigami.FormData.isSection: true
++                Kirigami.FormData.label: i18nc("@title:group", "Hardware")
++            }
++            Repeater {
++                model: kcm.hardwareEntries
++                delegate: entryComponent
++            }
++
++            // The hardware list is read after the first frame; the spinner shows only if that takes over 150 ms
++            Timer {
++                id: busyDelay
++                interval: 150
++                running: kcm.hardwareLoading
++            }
++            QQC2.BusyIndicator {
++                Kirigami.FormData.label: i18nc("@label", "Reading hardware…")
++                running: kcm.hardwareLoading && !busyDelay.running
++                visible: running
+             }
+         }
+     }
+ 
+ 
+     actions: [
++        // ksr: kcm_about-distro/LaunchKInfoCenter
+         Kirigami.Action {
+             visible: !kcm.isThisKInfoCenter && kicRunner.canRun
+ 
+@@ -231,6 +248,7 @@ KCMUtils.SimpleKCM {
+             onTriggered: source => kicRunner.run()
+         },
+ 
++        // ksr: kcm_about-distro/CopyDetails
+         Kirigami.Action {
+             visible: kcm.isEnglish
+ 

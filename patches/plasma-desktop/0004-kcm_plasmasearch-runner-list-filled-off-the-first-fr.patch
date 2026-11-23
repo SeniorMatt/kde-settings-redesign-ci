@@ -1,0 +1,410 @@
+From 66c46a2c25487dcd42d765d7007d6a5ad5dd8e10 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 10:52:21 +0500
+Subject: [PATCH 04/31] kcm_plasmasearch: runner list filled off the first
+ frame (worker-thread scan, two-step model fill)
+
+Page type: List (docs/page-design.md). krunnerrc keys, plugin ids, favorites order, config dialogs and D-Bus
+notifications are unchanged.
+
+Moved / renamed:
+- The usage paragraph above the list became a Kirigami.ContextualHelpButton beside the search field, same text
+  (kcm_plasmasearch/SearchField). The page opens with the search field and the list.
+- Page actions: Configure KRunner... and Get New Plugins... kept; new links "File Search Settings..." (kcm_baloofile)
+  and "Web Search Keywords..." (kcm_webshortcuts) through KCMLauncher.openSystemSettings. Per ia/duplicates.md this
+  page owns the baloosearchEnabled runner switch (the per-runner checkbox stays here); kcm_baloofile still writes the
+  key on save (kcms/baloo/kcm.cpp:92-96), which I did not touch (other page, behaviour change: manager decides).
+- Busy indicator appears only after 150 ms of loading (kcm.loading property, new).
+- Relabel table: inventory/relabel/kcm_plasmasearch.tsv (outer repo). Inventory --strict: 22 rows ok, 1 reported lost
+  (kcm_plasmasearch/list, Special Characters list in kdeplasma-addons/runners/characters/charrunner_config.ui: not
+  part of this page's files, untouched).
+
+Speed (cause from code, not measured):
+- SearchConfigModule::load() called reloadPlugins() synchronously, which ran RunnerManager::runnerMetaDataList()
+  (scans the kf6/krunner plugin dirs and parses every runner's metadata, plus D-Bus runner desktop files) and then
+  KPluginModel::addPlugins() for all ~21 runners; addPlugins calls findConfig() per plugin, a QPluginLoader probe for
+  each X-KDE-ConfigModule (kcmutils/src/core/kpluginmodel.cpp:42-61, 190-204). All of it before the first frame.
+- Now the scan runs in a QThread (QThread::create, Qt Core only) and the result is cached, so Reset reuses it and
+  only Get New Plugins rescans. The model is filled in two steps: favorites (4 by default), then, one event-loop turn
+  later, the rest. Stale fills (Reset/Defaults while loading) are dropped by a generation counter. Defaults applies
+  KPluginModel::defaults() after the fill completes.
+- Numbers: before (build/bench/clean/before-*.tsv, measured under load) fast 487-1116 ms first run, slow (0.5 CPU)
+  2114-2261 ms. After: pending, manager will measure.
+
+HIG: HIG-001, HIG-005, HIG-006, HIG-019, HIG-020, HIG-047, HIG-058.
+
+Not built yet (freeze).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/runners/plasmasearch/kcm.cpp     | 144 +++++++++++++++++++++-----
+ kcms/runners/plasmasearch/kcm.h       |  33 +++++-
+ kcms/runners/plasmasearch/ui/main.qml |  53 ++++++++--
+ 3 files changed, 196 insertions(+), 34 deletions(-)
+
+diff --git a/kcms/runners/plasmasearch/kcm.cpp b/kcms/runners/plasmasearch/kcm.cpp
+index 2706c53..4ce5b3d 100644
+--- a/kcms/runners/plasmasearch/kcm.cpp
++++ b/kcms/runners/plasmasearch/kcm.cpp
+@@ -18,6 +18,11 @@
+ #include <QDBusConnection>
+ #include <QDBusMessage>
+ #include <QDBusMetaType>
++#include <QThread>
++#include <QTimer>
++
++#include <memory>
++#include <utility>
+ 
+ class KRunnerData : public KCModuleData
+ {
+@@ -64,29 +69,43 @@ SearchConfigModule::SearchConfigModule(QObject *parent, const KPluginMetaData &d
+     connect(m_model, &KPluginModel::isSaveNeededChanged, this, &SearchConfigModule::checkNeedsSave);
+ }
+ 
+-void SearchConfigModule::load()
++SearchConfigModule::~SearchConfigModule()
+ {
+-    reloadPlugins();
+-
+-    if (!m_pluginID.isEmpty()) {
+-        const KPluginMetaData data = m_model->findConfigForPluginId(m_pluginID);
+-        if (data.isValid()) {
+-            showKCM(data);
+-        } else {
+-            qWarning() << "Could not find plugin with id" << m_pluginID;
+-        }
+-        m_pluginID.clear(); // Clear this to avoid showing the plugin's config again if we reset the KCM
++    // The worker only reads plugin metadata, but it must not outlive the module
++    if (m_scanThread) {
++        m_scanThread->wait();
+     }
+ }
+ 
+-void SearchConfigModule::reloadPlugins()
++void SearchConfigModule::load()
+ {
++    // ksr: kcm_plasmasearch/RunnerList
++    // Resetting reuses the scanned runner list; only "Get New Plugins" (reloadPlugins) scans again.
+     m_model->clear();
+ 
+     m_model->setConfig(m_config->group("Plugins"));
+     m_initialFavs = m_config->group("Plugins").group("Favorites").readEntry("plugins", defaultFavoriteIds());
+-    loadPlugins(m_initialFavs);
+     setNeedsSave(false);
++    loadPlugins(m_initialFavs, [this]() {
++        setNeedsSave(false);
++        if (!m_pluginID.isEmpty()) {
++            const KPluginMetaData data = m_model->findConfigForPluginId(m_pluginID);
++            if (data.isValid()) {
++                showKCM(data);
++            } else {
++                qWarning() << "Could not find plugin with id" << m_pluginID;
++            }
++            m_pluginID.clear(); // Clear this to avoid showing the plugin's config again if we reset the KCM
++        }
++    });
++}
++
++void SearchConfigModule::reloadPlugins()
++{
++    // New runners may have been installed: scan again
++    m_runnerCacheValid = false;
++    m_rescanWanted = !m_scanThread.isNull();
++    load();
+ }
+ void SearchConfigModule::addToFavorites(const KPluginMetaData &data)
+ {
+@@ -159,25 +178,100 @@ void SearchConfigModule::defaults()
+     KQuickManagedConfigModule::defaults();
+ 
+     m_model->clear();
+-    loadPlugins(defaultFavoriteIds());
+-    m_model->defaults();
++    // The model is filled asynchronously, so apply the defaults once all plugins are in it
++    loadPlugins(defaultFavoriteIds(), [this]() {
++        m_model->defaults();
++        checkNeedsSave();
++    });
++}
+ 
+-    checkNeedsSave();
++void SearchConfigModule::setLoading(bool loading)
++{
++    if (m_loading != loading) {
++        m_loading = loading;
++        Q_EMIT loadingChanged();
++    }
+ }
+ 
+-void SearchConfigModule::loadPlugins(const QStringList &currentFavoriteIds)
++void SearchConfigModule::startRunnerScan()
+ {
+-    QList<KPluginMetaData> metaDataList = KRunner::RunnerManager::runnerMetaDataList();
+-    auto it = std::partition(metaDataList.begin(), metaDataList.end(), [&currentFavoriteIds](const KPluginMetaData &plugin) {
+-        return currentFavoriteIds.contains(plugin.pluginId());
++    // RunnerManager::runnerMetaDataList() scans the plugin directories and parses the metadata of every runner
++    // (plus the D-Bus runner .desktop files). It only returns value types, so it can run off the GUI thread.
++    auto result = std::make_shared<QList<KPluginMetaData>>();
++    QThread *thread = QThread::create([result]() {
++        *result = KRunner::RunnerManager::runnerMetaDataList();
++    });
++    m_scanThread = thread;
++    connect(thread, &QThread::finished, this, [this, result]() {
++        m_scanThread = nullptr;
++        if (m_rescanWanted) {
++            // reloadPlugins() was called while this scan ran, so it may have missed new plugins
++            m_rescanWanted = false;
++            startRunnerScan();
++            return;
++        }
++        m_runnerCache = *result;
++        m_runnerCacheValid = true;
++        const auto waiters = std::exchange(m_waiters, {});
++        for (const auto &waiter : waiters) {
++            waiter();
++        }
+     });
++    connect(thread, &QThread::finished, thread, &QObject::deleteLater);
++    thread->start();
++}
++
++void SearchConfigModule::whenRunnersReady(std::function<void()> continuation)
++{
++    if (m_runnerCacheValid) {
++        QMetaObject::invokeMethod(this, std::move(continuation), Qt::QueuedConnection);
++        return;
++    }
++    m_waiters << std::move(continuation);
++    if (!m_scanThread) {
++        startRunnerScan();
++    }
++}
+ 
+-    m_favoriteMetaDataList = QList<KPluginMetaData>(metaDataList.begin(), it);
+-    std::sort(m_favoriteMetaDataList.begin(), m_favoriteMetaDataList.end(), [&currentFavoriteIds](const KPluginMetaData &data1, const KPluginMetaData &data2) {
+-        return currentFavoriteIds.indexOf(data1.pluginId()) < currentFavoriteIds.indexOf(data2.pluginId());
++void SearchConfigModule::loadPlugins(const QStringList &currentFavoriteIds, const std::function<void()> &done)
++{
++    const quint64 generation = ++m_generation;
++    setLoading(true);
++
++    whenRunnersReady([this, generation, currentFavoriteIds, done]() {
++        if (generation != m_generation) {
++            return; // a newer load/defaults call replaced this one
++        }
++        QList<KPluginMetaData> metaDataList = m_runnerCache;
++        auto it = std::partition(metaDataList.begin(), metaDataList.end(), [&currentFavoriteIds](const KPluginMetaData &plugin) {
++            return currentFavoriteIds.contains(plugin.pluginId());
++        });
++
++        m_favoriteMetaDataList = QList<KPluginMetaData>(metaDataList.begin(), it);
++        std::sort(m_favoriteMetaDataList.begin(), m_favoriteMetaDataList.end(), [&currentFavoriteIds](const KPluginMetaData &data1, const KPluginMetaData &data2) {
++            return currentFavoriteIds.indexOf(data1.pluginId()) < currentFavoriteIds.indexOf(data2.pluginId());
++        });
++        // Step 1: the favorites (a handful of rows, enough for the first screen)
++        if (!m_favoriteMetaDataList.isEmpty()) {
++            m_model->addUnsortablePlugins(m_favoriteMetaDataList, m_favoriteCategory);
++        }
++
++        // Step 2, one event-loop turn later so the first rows can be painted: the other runners.
++        // KPluginModel::addPlugins looks up each plugin's config module (a QPluginLoader probe), which is the slow part.
++        const QList<KPluginMetaData> rest(it, metaDataList.end());
++        QTimer::singleShot(0, this, [this, generation, rest, done]() {
++            if (generation != m_generation) {
++                return;
++            }
++            if (!rest.isEmpty()) {
++                m_model->addPlugins(rest, m_normalCategory);
++            }
++            setLoading(false);
++            if (done) {
++                done();
++            }
++        });
+     });
+-    m_model->addUnsortablePlugins(m_favoriteMetaDataList, m_favoriteCategory);
+-    m_model->addPlugins(QList<KPluginMetaData>(it, metaDataList.end()), m_normalCategory);
+ }
+ 
+ #include "kcm.moc"
+diff --git a/kcms/runners/plasmasearch/kcm.h b/kcms/runners/plasmasearch/kcm.h
+index 4658943..3c2d97b 100644
+--- a/kcms/runners/plasmasearch/kcm.h
++++ b/kcms/runners/plasmasearch/kcm.h
+@@ -14,14 +14,28 @@
+ #include <KQuickManagedConfigModule>
+ #include <KSharedConfig>
+ 
++#include <QPointer>
++
++#include <functional>
++
++class QThread;
++
+ class SearchConfigModule : public KQuickManagedConfigModule
+ {
+     Q_OBJECT
+     Q_PROPERTY(QAbstractItemModel *model READ model CONSTANT)
+     Q_PROPERTY(QString favoriteCategory MEMBER m_favoriteCategory CONSTANT)
++    // true while the runner list is being scanned and added to the model (the page is already shown by then)
++    Q_PROPERTY(bool loading READ isLoading NOTIFY loadingChanged)
+ 
+ public:
+     explicit SearchConfigModule(QObject *parent, const KPluginMetaData &data, const QVariantList &args);
++    ~SearchConfigModule() override;
++
++    bool isLoading() const
++    {
++        return m_loading;
++    }
+ 
+     QAbstractItemModel *model() const
+     {
+@@ -35,6 +49,9 @@ public:
+                 QStringLiteral("krunner_systemsettings")};
+     }
+ 
++Q_SIGNALS:
++    void loadingChanged();
++
+ public Q_SLOTS:
+     void load() override;
+     void save() override;
+@@ -50,7 +67,13 @@ public Q_SLOTS:
+     void movePlugin(const KPluginMetaData &data, qsizetype destIndex);
+ 
+ private:
+-    void loadPlugins(const QStringList &currentFavoriteIds);
++    // Fills the model without blocking: the runner metadata is scanned in a worker thread the first time (and after
++    // "Get New Plugins"), then the model is filled in two event-loop steps (favorites first). done runs after the
++    // last step. A newer call makes the older, still pending one a no-op.
++    void loadPlugins(const QStringList &currentFavoriteIds, const std::function<void()> &done = {});
++    void whenRunnersReady(std::function<void()> continuation);
++    void startRunnerScan();
++    void setLoading(bool loading);
+     QStringList getFavPluginIds() const
+     {
+         QStringList favIds;
+@@ -70,4 +93,12 @@ private:
+     const QString m_normalCategory = i18n("Available Plugins");
+     QList<KPluginMetaData> m_favoriteMetaDataList;
+     QStringList m_initialFavs;
++
++    QList<KPluginMetaData> m_runnerCache;
++    bool m_runnerCacheValid = false;
++    bool m_rescanWanted = false;
++    bool m_loading = false;
++    quint64 m_generation = 0;
++    QPointer<QThread> m_scanThread;
++    QList<std::function<void()>> m_waiters;
+ };
+diff --git a/kcms/runners/plasmasearch/ui/main.qml b/kcms/runners/plasmasearch/ui/main.qml
+index fcdf96c..39f9424 100644
+--- a/kcms/runners/plasmasearch/ui/main.qml
++++ b/kcms/runners/plasmasearch/ui/main.qml
+@@ -19,14 +19,18 @@ KCMUtils.ScrollViewKCM {
+     implicitWidth: Kirigami.Units.gridUnit * 32
+     implicitHeight: Kirigami.Units.gridUnit * 18
+ 
++    // List page (docs/page-design.md). The page and its header are shown at once; the runner list is scanned in a
++    // worker thread and added to the model afterwards (kcm.loading), so nothing here waits for it.
+     actions: [
+         Kirigami.Action {
++            // ksr: kcm_plasmasearch/ConfigureKRunner
+             icon.name: "configure"
+             text: i18nc("@action:button in toolbar", "Configure KRunner…")
+             Accessible.name: text // https://bugreports.qt.io/browse/QTBUG-130360
+             onTriggered: kcm.showKRunnerKCM()
+         },
+         NewStuff.Action {
++            // ksr: kcm_plasmasearch/GetNewPlugins
+             text: i18nc("@action:button in toolbar", "Get New Plugins…")
+             visible: KAuthorized.authorize(KAuthorized.GHNS)
+             configFile: "krunner.knsrc"
+@@ -35,22 +39,51 @@ KCMUtils.ScrollViewKCM {
+                     kcm.reloadPlugins()
+                 }
+             }
++        },
++        // Links out. The file search runner is switched on and off in this list; indexing itself and the web search
++        // keywords have their own pages (ia/duplicates.md: this page owns the runner switch).
++        Kirigami.Action {
++            icon.name: "system-search"
++            text: i18nc("@action:button in toolbar, opens the file indexing page", "File Search Settings…")
++            Accessible.name: text
++            onTriggered: KCMUtils.KCMLauncher.openSystemSettings("kcm_baloofile")
++        },
++        Kirigami.Action {
++            icon.name: "internet-services"
++            text: i18nc("@action:button in toolbar, opens the web search keywords page", "Web Search Keywords…")
++            Accessible.name: text
++            onTriggered: KCMUtils.KCMLauncher.openSystemSettings("kcm_webshortcuts")
+         }
+     ]
+ 
+     header: ColumnLayout {
+         spacing: Kirigami.Units.smallSpacing
+ 
+-        QQC2.Label {
+-            text: i18nc("@info:usagetip", "Enable or disable plugins (used in KRunner, Application Launcher, and the Overview effect). Mark plugins as favorites and arrange them in order you want to prioritize them.")
+-            textFormat: Text.PlainText
+-            wrapMode: Text.WordWrap
+-            Layout.fillWidth: true
++        RowLayout {
++            spacing: Kirigami.Units.smallSpacing
++
++            Kirigami.SearchField {
++                // ksr: kcm_plasmasearch/SearchField
++                id: searchField
++                Layout.fillWidth: true
++            }
++
++            // Was a paragraph above the list; the same text, one click away (docs/page-design.md section 3)
++            Kirigami.ContextualHelpButton {
++                toolTipText: i18nc("@info:usagetip", "Enable or disable plugins (used in KRunner, Application Launcher, and the Overview effect). Mark plugins as favorites and arrange them in order you want to prioritize them.")
++            }
+         }
+ 
+-        Kirigami.SearchField {
+-            id: searchField
+-            Layout.fillWidth: true
++        // Shown only when filling the list takes longer than 150 ms, so a fast fill never flashes it
++        Timer {
++            id: busyDelay
++            interval: 150
++            running: kcm.loading
++        }
++        QQC2.BusyIndicator {
++            Layout.alignment: Qt.AlignHCenter
++            running: kcm.loading && !busyDelay.running
++            visible: running
+         }
+     }
+ 
+@@ -69,6 +102,8 @@ KCMUtils.ScrollViewKCM {
+             property var modelObject: model
+             property bool isFavorite: model.category === kcm.favoriteCategory
+             KCMUtils.PluginDelegate {
++                // ksr: kcm_plasmasearch/RunnerEnabled
++                // ksr: kcm_plasmasearch/RunnerConfigure
+                 id: pluginDelegate
+                 model: delegateItem.modelObject
+                 width: pluginSelector.width
+@@ -78,6 +113,7 @@ KCMUtils.ScrollViewKCM {
+                     listView: pluginSelector
+                         // Moving the rows now would cause a model reset and we could not drag an entry multiple rows up/down
+                     onMoveRequested: (oldIndex, newIndex) => (dropNewIndex = newIndex)
++                    // ksr: kcm_plasmasearch/RunnerOrder
+                     onDropped: () => kcm.movePlugin(model.metaData, dropNewIndex)
+                 }
+                 Component.onCompleted: {
+@@ -87,6 +123,7 @@ KCMUtils.ScrollViewKCM {
+                 }
+                 additionalActions: [
+                     Kirigami.Action {
++                        // ksr: kcm_plasmasearch/RunnerFavorite
+                         displayHint: Kirigami.DisplayHint.IconOnly
+                         text: isFavorite ? i18nc("@action:button, icononly", "Remove from favorites") : i18nc("@action:button, icononly", "Add to favorites")
+                         Accessible.name: text // https://bugreports.qt.io/browse/QTBUG-130360

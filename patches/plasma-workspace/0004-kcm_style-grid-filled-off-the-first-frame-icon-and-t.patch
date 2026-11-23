@@ -1,0 +1,613 @@
+From 163545ab36387d81ecfb80331d89003943b63500 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 13:38:41 +0500
+Subject: [PATCH 04/24] kcm_style: grid filled off the first frame, icon and
+ toolbar options on a sub-page
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Page type: Gallery (docs/page-design.md section 5). Config keys (kdeglobals KDE/widgetStyle, unionStyle, icon and
+toolbar keys), the GTK D-Bus calls (org.kde.GtkConfig), style plugins and the Breeze settings dialog are unchanged.
+
+Moved / renamed:
+- "Configure Icons and Toolbars…" was a popup dialog; now the sub-page "Icons and Toolbars…" (kcm.push), a Form with
+  an untitled first section (Show icons: On buttons, In menus) and a "Toolbars" section (main and secondary toolbar
+  label). Same four keys (kcm_style/iconsOnButtons, iconsInMenus, toolButtonStyle, toolButtonStyleOtherToolbars).
+- "Configure GNOME/GTK Application Style…" -> "GNOME/GTK Application Style…"; its page is a Form page now
+  (KCM.SimpleKCM + FormLayout instead of a bare Kirigami.Page with a Flow); the remove button got a text and tooltip
+  ("Remove Theme"). "Install From File…" -> "Install from File…".
+- Page actions stay top right (Install from File…, Icons and Toolbars…, GNOME/GTK Application Style…); per-style
+  Configure Style / Uninstall stay GridDelegate actions. Busy indicator after 150 ms.
+- Per ia/duplicates.md nothing is removed: toolbar/icon keys are also synced to GTK by kde-gtk-config.
+- Relabel table: inventory/relabel/kcm_style.tsv (outer repo). Inventory --strict: 47 rows ok, 0 lost.
+
+Speed (cause from code, not measured):
+- GtkPage::GtkPage() called load(), and KCMStyle::load() called it again: each run scanned every GTK theme
+  directory (gtkthemesmodel.cpp:23-31, 125-140) and made a blocking org.kde.GtkConfig.gtkTheme() D-Bus call
+  (gtkpage.cpp load(); this call can wait for service activation). isSaveNeeded(), asked on every change, made the
+  same blocking call again. Now: no load in the constructor, the call is async, the scan runs one event-loop turn
+  later, the selection is applied when both are done (generation counter drops stale loads), and isSaveNeeded()
+  compares with the value read at load/save. onThemeRemoved() keeps its order (scan, defaults, save).
+- StylesModel::load() (QStyleFactory::keys() plus one KConfig per themerc file) and UnionStylesModel::refresh()
+  (Union package scan, was in its constructor) ran before the first frame; now one event-loop turn later
+  (KCMStyle::loading property).
+- Every card's PreviewItem builds a QStyle plus a QWidget tree in componentComplete() (previewitem.cpp:95-143); the
+  thumbnail Loader is now asynchronous, so the cards are created incrementally between frames and show the
+  placeholder until ready. Widgets stay on the main thread, so this is spreading, not removing, the cost.
+- Numbers: before (build/bench/clean/before-slow.tsv) among the slowest pages. After: pending, manager will measure.
+
+HIG: HIG-001, HIG-005, HIG-006, HIG-019, HIG-047, HIG-058.
+
+Not built yet (freeze).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/style/gtkpage.cpp                        | 52 ++++++++++--
+ kcms/style/gtkpage.h                          | 12 ++-
+ kcms/style/kcmstyle.cpp                       | 26 +++++-
+ kcms/style/kcmstyle.h                         |  7 ++
+ kcms/style/ui/GtkStylePage.qml                | 81 +++++++++----------
+ ...ettingsPopup.qml => IconsToolbarsPage.qml} | 30 +++----
+ kcms/style/ui/main.qml                        | 62 ++++++--------
+ kcms/style/unionstylesmodel.cpp               |  2 +-
+ 8 files changed, 171 insertions(+), 101 deletions(-)
+ rename kcms/style/ui/{EffectSettingsPopup.qml => IconsToolbarsPage.qml} (79%)
+
+diff --git a/kcms/style/gtkpage.cpp b/kcms/style/gtkpage.cpp
+index c6d24d8..b626177 100644
+--- a/kcms/style/gtkpage.cpp
++++ b/kcms/style/gtkpage.cpp
+@@ -5,8 +5,11 @@
+ */
+ 
+ #include <QDBusPendingCall>
++#include <QDBusPendingCallWatcher>
++#include <QDBusPendingReply>
+ #include <QDir>
+ #include <QStandardPaths>
++#include <QTimer>
+ #include <QUrl>
+ 
+ #include <KLocalizedString>
+@@ -25,7 +28,8 @@ GtkPage::GtkPage(QObject *parent)
+         Q_EMIT gtkThemeSettingsChanged();
+     });
+ 
+-    load();
++    // No load() here: KCMStyle::load() calls it right after construction, and the constructor used to scan the theme
++    // directories and block on a D-Bus call a second time before the first frame.
+ }
+ 
+ GtkPage::~GtkPage() = default;
+@@ -42,7 +46,8 @@ void GtkPage::showGtkPreview()
+ 
+ void GtkPage::onThemeRemoved()
+ {
+-    load();
++    ++m_loadGeneration; // drop a load() still in flight, defaults() decides the selection now
++    m_gtkThemesModel->load();
+     defaults();
+     save();
+ }
+@@ -87,6 +92,7 @@ void GtkPage::save()
+     auto call = m_gtkConfigInterface.setGtkTheme(m_gtkThemesModel->selectedTheme());
+     // needs to block so "OK" button closing kcmshell still saves properly
+     call.waitForFinished();
++    m_loadedTheme = m_gtkThemesModel->selectedTheme();
+ }
+ 
+ void GtkPage::defaults()
+@@ -96,8 +102,42 @@ void GtkPage::defaults()
+ 
+ void GtkPage::load()
+ {
+-    m_gtkThemesModel->load();
+-    m_gtkThemesModel->setSelectedTheme(m_gtkConfigInterface.gtkTheme());
++    const quint64 generation = ++m_loadGeneration;
++    m_themeReceived = false;
++    m_themesScanned = false;
++
++    // Both parts used to run synchronously, twice, before the first frame: the blocking org.kde.GtkConfig.gtkTheme()
++    // call and the scan of every GTK theme directory. The call is async now and the scan runs one event-loop turn
++    // later; the selection is applied when both are done (the combo box needs the filled model first).
++    auto *watcher = new QDBusPendingCallWatcher(m_gtkConfigInterface.gtkTheme(), this);
++    connect(watcher, &QDBusPendingCallWatcher::finished, this, [this, generation](QDBusPendingCallWatcher *watcher) {
++        QDBusPendingReply<QString> reply = *watcher;
++        watcher->deleteLater();
++        if (generation != m_loadGeneration) {
++            return;
++        }
++        m_receivedTheme = reply.isError() ? QString() : reply.value();
++        m_themeReceived = true;
++        applyLoadedTheme();
++    });
++
++    QTimer::singleShot(0, this, [this, generation] {
++        if (generation != m_loadGeneration) {
++            return;
++        }
++        m_gtkThemesModel->load();
++        m_themesScanned = true;
++        applyLoadedTheme();
++    });
++}
++
++void GtkPage::applyLoadedTheme()
++{
++    if (!m_themeReceived || !m_themesScanned) {
++        return;
++    }
++    m_loadedTheme = m_receivedTheme; // before setSelectedTheme(): that signal makes KCMStyle ask isSaveNeeded()
++    m_gtkThemesModel->setSelectedTheme(m_receivedTheme);
+ }
+ 
+ bool GtkPage::isDefaults() const
+@@ -105,9 +145,9 @@ bool GtkPage::isDefaults() const
+     return m_gtkThemesModel->selectedTheme() == QLatin1String("Breeze");
+ }
+ 
+-bool GtkPage::isSaveNeeded()
++bool GtkPage::isSaveNeeded() const
+ {
+-    return m_gtkThemesModel->selectedTheme() != m_gtkConfigInterface.gtkTheme();
++    return m_gtkThemesModel->selectedTheme() != m_loadedTheme;
+ }
+ 
+ #include "moc_gtkpage.cpp"
+diff --git a/kcms/style/gtkpage.h b/kcms/style/gtkpage.h
+index 6428c00..f8d4531 100644
+--- a/kcms/style/gtkpage.h
++++ b/kcms/style/gtkpage.h
+@@ -7,6 +7,7 @@
+ #pragma once
+ 
+ #include <QObject>
++#include <QString>
+ #include <QQmlListReference>
+ 
+ #include "gtkthemesmodel.h"
+@@ -27,7 +28,7 @@ public:
+     void save();
+     void defaults();
+     bool isDefaults() const;
+-    bool isSaveNeeded();
++    bool isSaveNeeded() const;
+ 
+ public Q_SLOTS:
+     bool gtkPreviewAvailable();
+@@ -46,7 +47,16 @@ Q_SIGNALS:
+     void gtkThemeSettingsChanged();
+ 
+ private:
++    void applyLoadedTheme();
++
+     GtkThemesModel *m_gtkThemesModel;
++    // The theme kded reports, fetched with an async D-Bus call in load() and kept here, so isSaveNeeded() (called
++    // on every change) no longer makes a blocking D-Bus call.
++    QString m_loadedTheme = QStringLiteral("Breeze");
++    QString m_receivedTheme;
++    bool m_themeReceived = false;
++    bool m_themesScanned = false;
++    quint64 m_loadGeneration = 0;
+ 
+     OrgKdeGtkConfigInterface m_gtkConfigInterface;
+ };
+diff --git a/kcms/style/kcmstyle.cpp b/kcms/style/kcmstyle.cpp
+index 7637d42..e8dcb0d 100644
+--- a/kcms/style/kcmstyle.cpp
++++ b/kcms/style/kcmstyle.cpp
+@@ -38,6 +38,7 @@
+ #include <QQuickRenderControl>
+ #include <QQuickWindow>
+ #include <QStyleFactory>
++#include <QTimer>
+ #include <QWidget>
+ #include <QWindow>
+ 
+@@ -387,16 +388,39 @@ void KCMStyle::checkGtkConfigKdedModuleLoaded()
+     });
+ }
+ 
++bool KCMStyle::isLoading() const
++{
++    return m_loading;
++}
++
++void KCMStyle::setLoading(bool loading)
++{
++    if (m_loading != loading) {
++        m_loading = loading;
++        Q_EMIT loadingChanged();
++    }
++}
++
+ void KCMStyle::load()
+ {
+     checkGtkConfigKdedModuleLoaded();
+ 
++    // GtkPage::load() is async (D-Bus call and theme scan are off the first frame, see gtkpage.cpp)
+     m_gtkPage->load();
+ 
+     KQuickManagedConfigModule::load();
+-    m_stylesModel->load();
+     m_previousStyle = styleSettings()->widgetStyle();
+ 
++    // The style lists (QStyleFactory::keys() plus one KConfig per themerc file, and the Union package scan) used to be
++    // filled here, before the first frame. One event-loop turn later the page is already on screen; the grid then
++    // fills, and its previews are created one by one (Loader { asynchronous: true } in main.qml).
++    setLoading(true);
++    QTimer::singleShot(0, this, [this] {
++        m_unionStylesModel->refresh();
++        m_stylesModel->load();
++        setLoading(false);
++    });
++
+     loadSettingsToModel();
+ 
+     m_effectsDirty = false;
+diff --git a/kcms/style/kcmstyle.h b/kcms/style/kcmstyle.h
+index fd9ff07..4d275aa 100644
+--- a/kcms/style/kcmstyle.h
++++ b/kcms/style/kcmstyle.h
+@@ -40,6 +40,8 @@ class KCMStyle : public KQuickManagedConfigModule
+     Q_PROPERTY(ToolBarStyle mainToolBarStyle READ mainToolBarStyle WRITE setMainToolBarStyle NOTIFY mainToolBarStyleChanged)
+     Q_PROPERTY(ToolBarStyle otherToolBarStyle READ otherToolBarStyle WRITE setOtherToolBarStyle NOTIFY otherToolBarStyleChanged)
+     Q_PROPERTY(bool gtkConfigKdedModuleLoaded READ gtkConfigKdedModuleLoaded NOTIFY gtkConfigKdedModuleLoadedChanged)
++    // true from load() until the style lists are filled (the page shows a busy indicator after 150 ms)
++    Q_PROPERTY(bool loading READ isLoading NOTIFY loadingChanged)
+     Q_PROPERTY(QStringList stylesToUninstall READ stylesToUninstall WRITE setStylesToUninstall NOTIFY stylesToUninstallChanged)
+ 
+ public:
+@@ -71,6 +73,9 @@ public:
+     void setOtherToolBarStyle(ToolBarStyle style);
+     Q_SIGNAL void otherToolBarStyleChanged();
+ 
++    bool isLoading() const;
++    Q_SIGNAL void loadingChanged();
++
+     bool gtkConfigKdedModuleLoaded() const;
+     Q_SIGNAL void gtkConfigKdedModuleLoadedChanged();
+ 
+@@ -95,6 +100,7 @@ Q_SIGNALS:
+ private:
+     void loadSettingsToModel();
+     void checkGtkConfigKdedModuleLoaded();
++    void setLoading(bool loading);
+ 
+     StyleData *const m_data;
+     QSortFilterProxyModel *m_sortFilterModel = nullptr;
+@@ -103,6 +109,7 @@ private:
+ 
+     QString m_previousStyle;
+     bool m_effectsDirty = false;
++    bool m_loading = false;
+ 
+     ToolBarStyle m_mainToolBarStyle = NoText;
+     ToolBarStyle m_otherToolBarStyle = NoText;
+diff --git a/kcms/style/ui/GtkStylePage.qml b/kcms/style/ui/GtkStylePage.qml
+index fca8ed4..97377e0 100644
+--- a/kcms/style/ui/GtkStylePage.qml
++++ b/kcms/style/ui/GtkStylePage.qml
+@@ -10,9 +10,10 @@ import QtQuick.Layouts
+ import QtQuick.Dialogs as QtDialogs
+ import QtQuick.Controls as QtControls
+ import org.kde.kirigami as Kirigami
++import org.kde.kcmutils as KCM
+ import org.kde.newstuff as NewStuff
+ 
+-Kirigami.Page {
++KCM.SimpleKCM {
+     id: gtkStylePage
+     title: i18n("GNOME/GTK Application Style")
+ 
+@@ -35,11 +36,13 @@ Kirigami.Page {
+ 
+     actions: [
+         Kirigami.Action {
++            // ksr: kcm_style/gtkInstall
+             text: i18nc("@action:button", "Install from File…")
+             icon.name: "document-import"
+             onTriggered: fileDialogLoader.active = true
+         },
+         NewStuff.Action {
++            // ksr: kcm_style/gtkGetNew
+             text: i18nc("@action:button", "Get New…")
+             configFile: "gtk_themes.knsrc"
+             onEntryEvent: function (entry, event) {
+@@ -50,50 +53,46 @@ Kirigami.Page {
+         }
+     ]
+ 
+-    ColumnLayout {
+-        anchors.fill: parent
+-
+-        Kirigami.FormLayout {
+-            wideMode: true
+-
+-            Row {
+-                Kirigami.FormData.label: i18n("GTK theme:")
+-
+-                Flow {
+-                    spacing: Kirigami.Units.smallSpacing
+-
+-                    QtControls.ComboBox {
+-                        id: gtkThemeCombo
+-                        model: kcm.gtkPage.gtkThemesModel
+-                        currentIndex: model.findThemeIndex(kcm.gtkPage.gtkThemesModel.selectedTheme)
+-                        onCurrentTextChanged: function() {
+-                            model.selectedTheme = currentText
+-                            gtkRemoveButton.enabled = model.selectedThemeRemovable()
+-                        }
+-                        onActivated: model.setSelectedThemeDirty()
+-                        textRole: "theme-name"
+-                    }
+-
+-                    QtControls.Button {
+-                        id: gtkRemoveButton
+-                        icon.name: "edit-delete"
+-                        onClicked: gtkThemeCombo.model.removeSelectedTheme()
+-                    }
+-
+-                    QtControls.Button {
+-                        icon.name: "preview"
+-                        text: i18n("Preview…")
+-                        onClicked: kcm.gtkPage.showGtkPreview()
+-                        visible: kcm.gtkPage.gtkPreviewAvailable()
+-                    }
+-
++    Kirigami.FormLayout {
++        // GTK theme row: combo box, then its two actions
++        RowLayout {
++            Kirigami.FormData.label: i18n("GTK theme:")
++            spacing: Kirigami.Units.smallSpacing
++
++            QtControls.ComboBox {
++                id: gtkThemeCombo
++                // ksr: kcm_style/gtkPage-gtkThemesModel
++                model: kcm.gtkPage.gtkThemesModel
++                currentIndex: model.findThemeIndex(kcm.gtkPage.gtkThemesModel.selectedTheme)
++                onCurrentTextChanged: function() {
++                    model.selectedTheme = currentText
++                    gtkRemoveButton.enabled = model.selectedThemeRemovable()
+                 }
++                onActivated: model.setSelectedThemeDirty()
++                textRole: "theme-name"
+             }
+ 
+-        }
++            QtControls.Button {
++                id: gtkRemoveButton
++                // ksr: kcm_style/gtkRemove
++                icon.name: "edit-delete"
++                text: i18nc("@action:button", "Remove Theme")
++                display: QtControls.AbstractButton.IconOnly
++                Accessible.name: text
++                onClicked: gtkThemeCombo.model.removeSelectedTheme()
++
++                QtControls.ToolTip.text: text
++                QtControls.ToolTip.visible: hovered || visualFocus
++                QtControls.ToolTip.delay: Kirigami.Units.toolTipDelay
++            }
+ 
+-        Item {
+-            Layout.fillHeight: true
++            QtControls.Button {
++                // ksr: kcm_style/gtkPage-showGtkPreview
++                icon.name: "preview"
++                text: i18n("Preview…")
++                onClicked: kcm.gtkPage.showGtkPreview()
++                visible: kcm.gtkPage.gtkPreviewAvailable()
++            }
+         }
+     }
+ 
+diff --git a/kcms/style/ui/EffectSettingsPopup.qml b/kcms/style/ui/IconsToolbarsPage.qml
+similarity index 79%
+rename from kcms/style/ui/EffectSettingsPopup.qml
+rename to kcms/style/ui/IconsToolbarsPage.qml
+index 16aca60..1680c1e 100644
+--- a/kcms/style/ui/EffectSettingsPopup.qml
++++ b/kcms/style/ui/IconsToolbarsPage.qml
+@@ -11,28 +11,20 @@ import org.kde.kirigami as Kirigami
+ import org.kde.kcmutils as KCM
+ import org.kde.private.kcms.style as Private
+ 
+-Kirigami.Dialog {
+-    id: effectSettingsPopup
++// Was the popup "Configure Icons and Toolbars" (EffectSettingsPopup.qml); now a Form sub-page (docs/page-design.md
++// section 2) reached from the style grid. The same four keys, in two sections.
++KCM.SimpleKCM {
++    id: page
+ 
+-    readonly property int paddings: Kirigami.Units.largeSpacing * 2
+-
+-    title: i18nc("@title:window", "Configure Icons and Toolbars")
+-
+-    implicitWidth: Math.max((formLayout.implicitWidth + paddings), Kirigami.Units.gridUnit * 20)
+-    implicitHeight: Math.max((formLayout.implicitHeight + paddings), Kirigami.Units.gridUnit * 11)
+-
+-    onOpened: {
+-        // can we do this automatically with "focus: true" somewhere?
+-        iconsOnButtonsCheckBox.forceActiveFocus();
+-    }
++    title: i18nc("@title", "Icons and Toolbars")
+ 
+     Kirigami.FormLayout {
+         id: formLayout
+-        // Popup's autosizing causes FormLayout to collapse when opening it a second time :(
+-        wideMode: true
+ 
++        // First section has no title
+         QtControls.CheckBox {
+             id: iconsOnButtonsCheckBox
++            // ksr: kcm_style/iconsOnButtons
+             Kirigami.FormData.label: i18n("Show icons:")
+             text: i18n("On buttons")
+             checked: kcm.styleSettings.iconsOnButtons
+@@ -45,6 +37,7 @@ Kirigami.Dialog {
+         }
+ 
+         QtControls.CheckBox {
++            // ksr: kcm_style/iconsInMenus
+             text: i18n("In menus")
+             checked: kcm.styleSettings.iconsInMenus
+             onClicked: kcm.styleSettings.iconsInMenus = checked
+@@ -55,8 +48,14 @@ Kirigami.Dialog {
+             }
+         }
+ 
++        Kirigami.Separator {
++            Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18nc("@title:group", "Toolbars")
++        }
++
+         QtControls.ComboBox {
+             id: mainToolBarStyleCombo
++            // ksr: kcm_style/toolButtonStyle
+             Kirigami.FormData.label: i18n("Main toolbar label:")
+             model: [
+                 {text: i18n("None"), value: Private.KCM.NoText},
+@@ -77,6 +76,7 @@ Kirigami.Dialog {
+         }
+ 
+         QtControls.ComboBox {
++            // ksr: kcm_style/toolButtonStyleOtherToolbars
+             Kirigami.FormData.label: i18n("Secondary toolbar label:")
+             model: mainToolBarStyleCombo.model
+             textRole: "text"
+diff --git a/kcms/style/ui/main.qml b/kcms/style/ui/main.qml
+index 88271c0..3477fd7 100644
+--- a/kcms/style/ui/main.qml
++++ b/kcms/style/ui/main.qml
+@@ -7,6 +7,7 @@
+ import QtQuick
+ import QtQuick.Layouts
+ import QtQuick.Dialogs
++import QtQuick.Controls as QQC2
+ 
+ import org.kde.kirigami as Kirigami
+ import org.kde.kcmutils as KCM
+@@ -52,6 +53,19 @@ KCM.GridViewKCM {
+         kcm.push("GtkStylePage.qml");
+     }
+ 
++    // The grid is filled after the first frame (KCMStyle::load()): busy indicator only if that takes over 150 ms.
++    Timer {
++        id: busyDelay
++        interval: 150
++        running: kcm.loading
++    }
++    QQC2.BusyIndicator {
++        anchors.centerIn: parent
++        z: 1
++        running: kcm.loading && !busyDelay.running
++        visible: running
++    }
++
+     headerPaddingEnabled: false // Let the InlineMessage touch the edges
+     header: Kirigami.InlineMessage {
+         id: infoLabel
+@@ -82,30 +96,21 @@ KCM.GridViewKCM {
+     actions: [
+         Kirigami.Action {
+             icon.name: "document-import-symbolic"
+-            text: i18nc("@action:button", "Install From File…")
++            // ksr: kcm_style/InstallFromFile
++            text: i18nc("@action:button", "Install from File…")
+             onTriggered: installDialog.open()
+         },
+         Kirigami.Action {
+-            id: effectSettingsButton
+-            text: i18n("Configure Icons and Toolbars…")
++            // Was a popup; now a sub-page (IconsToolbarsPage.qml)
++            // ksr: kcm_style/ConfigureIconsToolbars
++            text: i18n("Icons and Toolbars…")
+             icon.name: "configure-toolbars" // proper icon?
+-            checkable: true
+-            checked: effectSettingsPopupLoader.popupOpen
+-            onTriggered: {
+-                if (effectSettingsPopupLoader.popupOpen) {
+-                    effectSettingsPopupLoader.item.close()
+-                    // We don't set the Loader to inactive here since that would
+-                    // happen before the popup has closed; instead we use a
+-                    // Connections object in the Loader itself to handle it
+-                } else {
+-                    effectSettingsPopupLoader.active = true;
+-                    effectSettingsPopupLoader.item.open();
+-                }
+-            }
++            onTriggered: kcm.push("IconsToolbarsPage.qml")
+         },
+         Kirigami.Action {
+             visible: kcm.gtkConfigKdedModuleLoaded
+-            text: i18n("Configure GNOME/GTK Application Style…")
++            // ksr: kcm_style/ConfigureGtk
++            text: i18n("GNOME/GTK Application Style…")
+             icon.name: "configure"
+             onTriggered: root.openGtkStyleSettings()
+         }
+@@ -123,6 +128,8 @@ KCM.GridViewKCM {
+ 
+             anchors.fill: parent
+             clip: true
++            // Creating a preview builds a QStyle and a QWidget tree; do it between frames, one card at a time
++            asynchronous: true
+             opacity: kcm.stylesToUninstall.includes(model.styleId) ? 0.3 : 1.0
+ 
+             Component {
+@@ -171,12 +178,14 @@ KCM.GridViewKCM {
+             },
+             Kirigami.Action {
+                 icon.name: "document-edit"
++                // ksr: kcm_style/ConfigureStyle
+                 tooltip: i18n("Configure Style…")
+                 enabled: model.configurable
+                 onTriggered: kcm.configure(model.display, model.styleName, delegate)
+             },
+             Kirigami.Action {
+                 icon.name:  "delete-symbolic"
++                // ksr: kcm_style/UninstallStyle
+                 tooltip: {
+                     if (model.canUninstall) {
+                         return i18nc("@action:button", "Uninstall…")
+@@ -220,25 +229,6 @@ KCM.GridViewKCM {
+         }
+     }
+ 
+-    Loader {
+-        id: effectSettingsPopupLoader
+-
+-        readonly property bool popupOpen: Boolean(effectSettingsPopupLoader.item?.opened)
+-
+-        active: false
+-        sourceComponent: EffectSettingsPopup {
+-            parent: root
+-        }
+-
+-        Connections {
+-            enabled: effectSettingsPopupLoader.active
+-            target: effectSettingsPopupLoader.item
+-            function onClosed() {
+-                effectSettingsPopupLoader.active = false;
+-            }
+-        }
+-    }
+-
+     FileDialog {
+         id: installDialog
+ 
+diff --git a/kcms/style/unionstylesmodel.cpp b/kcms/style/unionstylesmodel.cpp
+index 82fff1e..219b1c6 100644
+--- a/kcms/style/unionstylesmodel.cpp
++++ b/kcms/style/unionstylesmodel.cpp
+@@ -15,7 +15,7 @@ using namespace Qt::StringLiterals;
+ UnionStylesModel::UnionStylesModel(QObject *parent)
+     : QAbstractListModel(parent)
+ {
+-    refresh();
++    // No refresh() here: KCMStyle::load() fills the model after the first frame.
+ }
+ 
+ QHash<int, QByteArray> UnionStylesModel::roleNames() const

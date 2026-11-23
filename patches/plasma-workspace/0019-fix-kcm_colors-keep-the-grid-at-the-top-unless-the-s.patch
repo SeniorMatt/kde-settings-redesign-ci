@@ -1,0 +1,35 @@
+From 7cba57c79fb12485cee9576330bf240ed729faeb Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 23:43:39 +0500
+Subject: [PATCH 19/24] fix(kcm_colors): keep the grid at the top unless the
+ selected scheme is mostly below the first screen, not built yet
+
+CI shot (build/ci-shots/shots/kcm_colors.png): 34555dd still ended with the first row cut off. The selected scheme was in row 2
+whose bottom is a few pixels below the viewport, so positionViewAtIndex(Contain) scrolled the grid by those pixels and
+hid the top of row 1. Now the grid starts at the top and scrolls only when more than half of the selected cell's row is
+outside the first screenful. Verified against the screenshot geometry only, rerun in CI pending.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/colors/ui/main.qml | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/kcms/colors/ui/main.qml b/kcms/colors/ui/main.qml
+index 194de78..16085ab 100644
+--- a/kcms/colors/ui/main.qml
++++ b/kcms/colors/ui/main.qml
+@@ -36,7 +36,12 @@ KCM.GridViewKCM {
+                     return;
+                 }
+                 root.view.positionViewAtBeginning();
+-                if (root.view.currentIndex >= 0) {
++                // Scroll only when the selected scheme is mostly outside the first screenful (Contain would also scroll
++                // for a row that is just a few pixels too low, which hid the first row).
++                const cols = Math.max(1, Math.floor(root.view.width / root.view.cellWidth));
++                const row = Math.floor(root.view.currentIndex / cols);
++                const overflow = (row + 1) * root.view.cellHeight - root.view.height;
++                if (root.view.currentIndex >= 0 && overflow > root.view.cellHeight / 2) {
+                     root.view.positionViewAtIndex(root.view.currentIndex, GridView.Contain);
+                 }
+             });

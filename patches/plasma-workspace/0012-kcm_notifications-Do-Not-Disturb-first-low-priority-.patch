@@ -1,0 +1,335 @@
+From 3b8269f9c0f6568d092cd616b008bc6c63af86b9 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 14:22:01 +0500
+Subject: [PATCH 12/24] kcm_notifications: Do Not Disturb first, low priority
+ in its own section, application lists read after the first frame
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Page type: Form with List sub-pages (docs/page-design.md section 1). All KConfigXT keys (plasmanotifyrc, DoNotDisturb, per
+application/event settings), the global shortcut handling, sound playback and the sub-pages' content are unchanged. NOT BUILT
+YET (owner stopped heavy work); checked statically only.
+
+Moved / renamed (wording of every control unchanged, so no new aliases needed):
+- The first section is untitled and holds Do Not Disturb: the three automatic conditions, the toggle shortcut, and
+  "Critical notifications: Show in Do Not Disturb mode" (was under "Visibility conditions", which is gone).
+- "Popups" keeps Location / Hide after / timeout indicator; "Low priority" is a new section for the two low-priority
+  checkboxes (were under Visibility conditions); "Additional feedback" -> "Progress and badges".
+- "Configure for System…" and "Configure for Applications…" stay page actions top right (they open the per-application
+  master-detail sub-page SourcesPage.qml, unchanged apart from a busy indicator); they are disabled until the lists are read.
+- Relabel table: inventory/relabel/kcm_notifications.tsv (outer repo). Inventory --strict: 0 lost for this KCM.
+  HIG ids: HIG-001, HIG-005, HIG-006, HIG-057; page-design sections 2, 3.
+
+Speed (cause found in code, not measured):
+- KCMNotifications::load() did all of this before the page existed: SourcesModel::load() (KFileUtils::findAllUniqueFiles
+  over every notifyrc search path, a KApplicationTrader::query over all services, plasmanotifyrc reads), one
+  BehaviorSettings (own KConfig group) per application and service, SourcesModel::loadEvents() (reads every event group of
+  every notifyrc), loadBehaviorSettings(), and a blocking KGlobalAccel::globalShortcut() D-Bus lookup. Now the main page's
+  own settings load as before and the rest is loadSources(), queued one event-loop turn later (generation counter, new
+  property sourcesLoaded). A deep link (--desktop-entry, activationRequested) still waits for the lists
+  (navigateToComponent is emitted at the end of loadSources, as before for the first load).
+- After numbers: pending, manager will measure.
+
+Not built yet; uncertain: save()/defaults() before loadSources() has run (they iterate empty lists, which should be harmless);
+the blocking KGlobalAccel call is only moved, not made async (no async variant confirmed in this tree); the SourcesPage list
+is still one big ListView (not sliced).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/notifications/kcm.cpp            | 22 +++++++
+ kcms/notifications/kcm.h              | 11 ++++
+ kcms/notifications/ui/SourcesPage.qml | 14 ++++-
+ kcms/notifications/ui/main.qml        | 83 +++++++++++++++------------
+ 4 files changed, 91 insertions(+), 39 deletions(-)
+
+diff --git a/kcms/notifications/kcm.cpp b/kcms/notifications/kcm.cpp
+index 41c63ae..9554862 100644
+--- a/kcms/notifications/kcm.cpp
++++ b/kcms/notifications/kcm.cpp
+@@ -13,6 +13,7 @@
+ #include <QFile>
+ #include <QFileInfo>
+ #include <QStandardPaths>
++#include <QTimer>
+ 
+ #include <KConfigGroup>
+ #include <KGlobalAccel>
+@@ -172,6 +173,24 @@ void KCMNotifications::load()
+ {
+     KQuickManagedConfigModule::load();
+ 
++    // ksr: everything below the main page's own settings is deferred by one event-loop turn: the notifyrc scan and the
++    // KApplicationTrader query (SourcesModel::load), one KConfig-backed BehaviorSettings per application/service, every
++    // notifyrc event (loadEvents) and the blocking KGlobalAccel shortcut lookup. The main page is shown first; a newer
++    // load() makes an older pending one a no-op.
++    if (m_sourcesLoaded) {
++        m_sourcesLoaded = false;
++        Q_EMIT sourcesLoadedChanged();
++    }
++    const int generation = ++m_loadGeneration;
++    QTimer::singleShot(0, this, [this, generation] {
++        if (generation == m_loadGeneration) {
++            loadSources();
++        }
++    });
++}
++
++void KCMNotifications::loadSources()
++{
+     bool firstLoad = m_firstLoad;
+     if (m_firstLoad) {
+         m_firstLoad = false;
+@@ -213,6 +232,9 @@ void KCMNotifications::load()
+ 
+     m_toggleDoNotDisturbShortcutDirty = false;
+ 
++    m_sourcesLoaded = true;
++    Q_EMIT sourcesLoadedChanged();
++
+     if (firstLoad) {
+         Q_EMIT navigateToComponent(m_initialDesktopEntry, m_initialNotifyRcName, m_initialEventId);
+     }
+diff --git a/kcms/notifications/kcm.h b/kcms/notifications/kcm.h
+index b34bfab..37404c6 100644
+--- a/kcms/notifications/kcm.h
++++ b/kcms/notifications/kcm.h
+@@ -43,6 +43,8 @@ class KCMNotifications : public KQuickManagedConfigModule
+     Q_PROPERTY(NotificationManager::NotificationSettings *notificationSettings READ notificationSettings CONSTANT)
+     Q_PROPERTY(NotificationManager::JobSettings *jobSettings READ jobSettings CONSTANT)
+     Q_PROPERTY(NotificationManager::BadgeSettings *badgeSettings READ badgeSettings CONSTANT)
++    // false until the application/service list, per-app settings and events are read (one event-loop turn after load())
++    Q_PROPERTY(bool sourcesLoaded READ sourcesLoaded NOTIFY sourcesLoadedChanged)
+     Q_PROPERTY(bool isDefaultsBehaviorSettings READ isDefaultsBehaviorSettings NOTIFY isDefaultsBehaviorSettingsChanged)
+ 
+     Q_PROPERTY(
+@@ -54,6 +56,11 @@ public:
+ 
+     static QString plasmaWorkspaceNotifyRcName();
+ 
++    bool sourcesLoaded() const
++    {
++        return m_sourcesLoaded;
++    }
++
+     SourcesModel *sourcesModel() const;
+     FilterProxyModel *filteredModel() const;
+ 
+@@ -81,6 +88,7 @@ public Q_SLOTS:
+ Q_SIGNALS:
+     void navigateToComponent(const QString &desktopEntry, const QString notifyRcName, const QString eventId);
+     void isDefaultsBehaviorSettingsChanged();
++    void sourcesLoadedChanged();
+ 
+ private Q_SLOTS:
+     void onDefaultsIndicatorsVisibleChanged();
+@@ -88,6 +96,7 @@ private Q_SLOTS:
+     void parseArguments(const QVariantList &args);
+ 
+ private:
++    void loadSources(); // second half of load(), runs after the first frame
+     bool isSaveNeeded() const override;
+     bool isDefaults() const override;
+     void createConnections(NotificationManager::BehaviorSettings *settings, const QModelIndex &index);
+@@ -101,6 +110,8 @@ private:
+     QKeySequence m_toggleDoNotDisturbShortcut;
+     bool m_toggleDoNotDisturbShortcutDirty = false;
+     bool m_firstLoad = true;
++    bool m_sourcesLoaded = false;
++    int m_loadGeneration = 0;
+ 
+     QString m_initialDesktopEntry;
+     QString m_initialNotifyRcName;
+diff --git a/kcms/notifications/ui/SourcesPage.qml b/kcms/notifications/ui/SourcesPage.qml
+index bd29e47..cc918ac 100644
+--- a/kcms/notifications/ui/SourcesPage.qml
++++ b/kcms/notifications/ui/SourcesPage.qml
+@@ -148,11 +148,23 @@ KCM.AbstractKCM {
+                     }
+                 }
+ 
++                // The lists are read after the first frame (kcm.sourcesLoaded); busy only after 150 ms.
++                Timer {
++                    id: busyDelay
++                    interval: 150
++                    running: !kcm.sourcesLoaded
++                }
++                QtControls.BusyIndicator {
++                    anchors.centerIn: parent
++                    running: visible
++                    visible: !kcm.sourcesLoaded && !busyDelay.running
++                }
++
+                 Kirigami.PlaceholderMessage {
+                     anchors.centerIn: parent
+                     width: parent.width - (Kirigami.Units.largeSpacing * 4)
+ 
+-                    visible: sourcesList.count === 0 && searchField.length > 0
++                    visible: kcm.sourcesLoaded && sourcesList.count === 0 && searchField.length > 0
+ 
+                     text: i18n("No application or event matches your search term")
+                 }
+diff --git a/kcms/notifications/ui/main.qml b/kcms/notifications/ui/main.qml
+index 83dc772..5ed0bb1 100644
+--- a/kcms/notifications/ui/main.qml
++++ b/kcms/notifications/ui/main.qml
+@@ -44,15 +44,17 @@ KCM.SimpleKCM {
+ 
+     actions: [
+         Kirigami.Action {
++            // ksr: kcm_notifications/ConfigureSystem
+             text: i18nc("@action:button Plasma-specific notifications", "Configure for System…")
+             icon.name: "plasma-symbolic"
+-            enabled: root.notificationsAvailable
++            enabled: root.notificationsAvailable && kcm.sourcesLoaded
+             onTriggered: root.openSystemNotificationSettings()
+         },
+         Kirigami.Action {
++            // ksr: kcm_notifications/ConfigureApps
+             text: i18nc("@action:button Application-specific notifications", "Configure for Applications…")
+             icon.name: "applications-all-symbolic"
+-            enabled: root.notificationsAvailable
++            enabled: root.notificationsAvailable && kcm.sourcesLoaded
+             onTriggered: root.openSourcesSettings()
+         }
+     ]
+@@ -122,12 +124,9 @@ KCM.SimpleKCM {
+ 
+     Kirigami.FormLayout {
+ 
+-        Item {
+-            Kirigami.FormData.label: i18nc("@title:group", "Do Not Disturb mode")
+-            Kirigami.FormData.isSection: true
+-        }
+-
++        // First section has no title: Do Not Disturb is the state people open this page for.
+         QtControls.CheckBox {
++            // ksr: kcm_notifications/WhenScreensMirrored
+             Kirigami.FormData.label: i18nc("Automatically enable Do Not Disturb mode when screens are mirrored", "Enable automatically:")
+             text: i18nc("Automatically enable Do Not Disturb mode when screens are mirrored", "When screens are mirrored")
+             checked: kcm.dndSettings.whenScreensMirrored
+@@ -141,6 +140,7 @@ KCM.SimpleKCM {
+         }
+ 
+         QtControls.CheckBox {
++            // ksr: kcm_notifications/WhenScreenSharing
+             text: i18nc("Automatically enable Do Not Disturb mode during screen sharing", "During screen sharing")
+             checked: kcm.dndSettings.whenScreenSharing
+             onClicked: kcm.dndSettings.whenScreenSharing = checked
+@@ -155,6 +155,7 @@ KCM.SimpleKCM {
+         }
+ 
+         QtControls.CheckBox {
++            // ksr: kcm_notifications/WhenFullscreen
+             text: i18nc("Automatically enable Do Not Disturb mode while a fullscreen application is focused", "While a fullscreen application is focused")
+             checked: kcm.dndSettings.whenFullscreen
+             onClicked: kcm.dndSettings.whenFullscreen = checked
+@@ -167,18 +168,15 @@ KCM.SimpleKCM {
+         }
+ 
+         KQuickControls.KeySequenceItem {
++            // ksr: kcm_notifications/toggleDoNotDisturbShortcut
+             Kirigami.FormData.label: i18nc("Keyboard shortcut to turn Do Not Disturb mode on and off", "Manually toggle with shortcut:")
+             enabled: root.notificationsAvailable
+             keySequence: kcm.toggleDoNotDisturbShortcut
+             onCaptureFinished: kcm.toggleDoNotDisturbShortcut = keySequence
+         }
+ 
+-        Item {
+-            Kirigami.FormData.label: i18nc("@title:group", "Visibility conditions")
+-            Kirigami.FormData.isSection: true
+-        }
+-
+         QtControls.CheckBox {
++            // ksr: kcm_notifications/CriticalInDndMode
+             Kirigami.FormData.label: i18n("Critical notifications:")
+             text: i18n("Show in Do Not Disturb mode")
+             checked: kcm.notificationSettings.criticalInDndMode
+@@ -191,31 +189,6 @@ KCM.SimpleKCM {
+             }
+         }
+ 
+-        QtControls.CheckBox {
+-            Kirigami.FormData.label: i18n("Low priority notifications:")
+-            text: i18n("Show popup")
+-            checked: kcm.notificationSettings.lowPriorityPopups
+-            onClicked: kcm.notificationSettings.lowPriorityPopups = checked
+-
+-            KCM.SettingStateBinding {
+-                configObject: kcm.notificationSettings
+-                settingName: "LowPriorityPopups"
+-                extraEnabledConditions: root.notificationsAvailable
+-            }
+-        }
+-
+-        QtControls.CheckBox {
+-            text: i18n("Show in history")
+-            checked: kcm.notificationSettings.lowPriorityHistory
+-            onClicked: kcm.notificationSettings.lowPriorityHistory = checked
+-
+-            KCM.SettingStateBinding {
+-                configObject: kcm.notificationSettings
+-                settingName: "LowPriorityHistory"
+-                extraEnabledConditions: root.notificationsAvailable
+-            }
+-        }
+-
+         QtControls.ButtonGroup {
+             id: positionGroup
+             buttons: [positionCloseToWidget, positionCustomPosition]
+@@ -315,12 +288,45 @@ KCM.SimpleKCM {
+         }
+ 
+         Item {
+-            Kirigami.FormData.label: i18nc("@title:group", "Additional feedback")
++            Kirigami.FormData.label: i18nc("@title:group", "Low priority")
++            Kirigami.FormData.isSection: true
++        }
++
++        QtControls.CheckBox {
++            // ksr: kcm_notifications/LowPriorityPopups
++            Kirigami.FormData.label: i18n("Low priority notifications:")
++            text: i18n("Show popup")
++            checked: kcm.notificationSettings.lowPriorityPopups
++            onClicked: kcm.notificationSettings.lowPriorityPopups = checked
++
++            KCM.SettingStateBinding {
++                configObject: kcm.notificationSettings
++                settingName: "LowPriorityPopups"
++                extraEnabledConditions: root.notificationsAvailable
++            }
++        }
++
++        QtControls.CheckBox {
++            // ksr: kcm_notifications/LowPriorityHistory
++            text: i18n("Show in history")
++            checked: kcm.notificationSettings.lowPriorityHistory
++            onClicked: kcm.notificationSettings.lowPriorityHistory = checked
++
++            KCM.SettingStateBinding {
++                configObject: kcm.notificationSettings
++                settingName: "LowPriorityHistory"
++                extraEnabledConditions: root.notificationsAvailable
++            }
++        }
++
++        Item {
++            Kirigami.FormData.label: i18nc("@title:group", "Progress and badges")
+             Kirigami.FormData.isSection: true
+         }
+ 
+         QtControls.CheckBox {
+             id: applicationJobsEnabledCheck
++            // ksr: kcm_notifications/InNotifications
+             text: i18nc("Show application jobs in notification widget", "Show in notifications")
+             Kirigami.FormData.label: i18n("Application progress:")
+             checked: kcm.jobSettings.inNotifications
+@@ -349,6 +355,7 @@ KCM.SimpleKCM {
+         }
+ 
+         QtControls.CheckBox {
++            // ksr: kcm_notifications/InTaskManager
+             Kirigami.FormData.label: i18n("Notification badges:")
+             text: i18n("Show in task manager")
+             checked: kcm.badgeSettings.inTaskManager

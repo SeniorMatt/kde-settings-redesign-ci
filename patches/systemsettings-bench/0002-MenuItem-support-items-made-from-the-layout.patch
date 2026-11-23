@@ -1,0 +1,309 @@
+From a62457d1607fc9a3ede23f5fb003bbfe4099a1a4 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 08:15:50 +0500
+Subject: [PATCH 02/34] MenuItem: support items made from the layout
+
+Setters for synthetic categories, name and description overrides, extra
+keywords, breadcrumb and visibility in the sidebar and in search. The
+existing API is unchanged.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ app/MenuItem.cpp       | 86 +++++++++++++++++++++++++++++++++++++++++-
+ app/MenuItem.h         | 54 ++++++++++++++++++++++++++
+ app/MenuModel.cpp      |  8 ++++
+ app/MenuModel.h        | 10 +++++
+ app/MenuProxyModel.cpp | 23 +++++++++++
+ 5 files changed, 180 insertions(+), 1 deletion(-)
+
+diff --git a/app/MenuItem.cpp b/app/MenuItem.cpp
+index 35dad79..3e276f8 100644
+--- a/app/MenuItem.cpp
++++ b/app/MenuItem.cpp
+@@ -40,12 +40,18 @@ public:
+     bool menu;
+     QString name;
+     QString category;
+-    int weight;
++    int weight = 100;
+     KService::Ptr service;
+     bool showDefaultIndicator = false;
+     bool isCategoryOwner = false;
+     QString comment;
+     QString iconName;
++    QString originalName;
++    QString breadcrumb;
++    QString layoutCategoryId;
++    QStringList extraKeywords;
++    bool hiddenInSidebar = false;
++    bool hiddenInSearch = false;
+     QString systemsettingsCategoryModule;
+     bool isSystemsettingsCategory = false;
+     bool isSystemsettingsRootCategory = false;
+@@ -92,6 +98,11 @@ QStringList MenuItem::keywords(bool doesRemoveDuplicates) const
+     }
+     listOfKeywords << KJsonUtils::readTranslatedString(rawData, QStringLiteral("X-KDE-Keywords")).split(QStringLiteral(","));
+     listOfKeywords << d->name;
++    // The page's own name (and the layout's aliases) stay searchable when the layout renames it
++    if (!d->originalName.isEmpty()) {
++        listOfKeywords << d->originalName;
++    }
++    listOfKeywords << d->extraKeywords;
+     for (MenuItem *child : std::as_const(d->children)) {
+         listOfKeywords << child->keywords(false);
+     }
+@@ -191,6 +202,7 @@ void MenuItem::setMetaData(const KPluginMetaData &data)
+         d->category = data.value(QStringLiteral("X-KDE-KInfoCenter-Category"));
+     }
+     d->name = data.name();
++    d->originalName.clear();
+     d->weight = data.value(QStringLiteral("X-KDE-Weight"), 100);
+     d->comment = data.description();
+     d->iconName = data.iconName();
+@@ -202,6 +214,78 @@ void MenuItem::setMetaData(const KPluginMetaData &data)
+     }
+ }
+ 
++void MenuItem::setLayoutCategory(const QString &id, const QString &name, const QString &iconName, const QString &comment, int order, bool isRoot)
++{
++    d->layoutCategoryId = id;
++    d->name = name;
++    d->iconName = iconName;
++    d->comment = comment;
++    d->weight = order;
++    d->isSystemsettingsCategory = true;
++    d->isSystemsettingsRootCategory = isRoot;
++}
++
++void MenuItem::setNameOverride(const QString &name, const QString &comment)
++{
++    if (!name.isEmpty() && name != d->name) {
++        d->originalName = d->name;
++        d->name = name;
++    }
++    if (!comment.isEmpty()) {
++        d->comment = comment;
++    }
++}
++
++void MenuItem::setOrder(int order)
++{
++    d->weight = order;
++}
++
++void MenuItem::addKeywords(const QStringList &keywords)
++{
++    d->extraKeywords << keywords;
++}
++
++QString MenuItem::breadcrumb() const
++{
++    return d->breadcrumb;
++}
++
++void MenuItem::setBreadcrumb(const QString &breadcrumb)
++{
++    d->breadcrumb = breadcrumb;
++}
++
++bool MenuItem::isHiddenInSidebar() const
++{
++    return d->hiddenInSidebar;
++}
++
++void MenuItem::setHiddenInSidebar(bool hidden)
++{
++    d->hiddenInSidebar = hidden;
++}
++
++bool MenuItem::isHiddenInSearch() const
++{
++    return d->hiddenInSearch;
++}
++
++void MenuItem::setHiddenInSearch(bool hidden)
++{
++    d->hiddenInSearch = hidden;
++}
++
++bool MenuItem::isLayoutCategory() const
++{
++    return !d->layoutCategoryId.isEmpty();
++}
++
++QString MenuItem::layoutCategoryId() const
++{
++    return d->layoutCategoryId;
++}
++
+ KPluginMetaData MenuItem::metaData()
+ {
+     return d->metaData;
+diff --git a/app/MenuItem.h b/app/MenuItem.h
+index a3204dc..06e936d 100644
+--- a/app/MenuItem.h
++++ b/app/MenuItem.h
+@@ -167,6 +167,60 @@ public:
+ 
+     void setDefaultIndicator(bool defaultIndicator);
+ 
++    /**
++     * Turns this item into a category of the System Settings layout (see settingslayout_p.h), which
++     * is not backed by a .desktop file.
++     *
++     * @param id Stable id of the category, e.g. "appearance". Empty for a group (a sidebar section).
++     * @param order Position among its siblings, replaces the X-KDE-Weight sorting.
++     * @param isRoot true for the unnamed group that holds the home page
++     */
++    void setLayoutCategory(const QString &id, const QString &name, const QString &iconName, const QString &comment, int order, bool isRoot = false);
++
++    /**
++     * Replaces the name and description the KCM provides. Empty strings keep the KCM's own.
++     * The KCM's own name stays searchable.
++     */
++    void setNameOverride(const QString &name, const QString &comment);
++
++    /**
++     * Sets the position among the siblings, replacing the X-KDE-Weight of the KCM.
++     */
++    void setOrder(int order);
++
++    /**
++     * Adds search keywords that are not part of the KCM's own metadata.
++     */
++    void addKeywords(const QStringList &keywords);
++
++    /**
++     * The path shown below the name in search results, e.g. "Appearance".
++     */
++    QString breadcrumb() const;
++    void setBreadcrumb(const QString &breadcrumb);
++
++    /**
++     * Items that are hidden from the sidebar can still be found by search and opened.
++     */
++    bool isHiddenInSidebar() const;
++    void setHiddenInSidebar(bool hidden);
++
++    /**
++     * Search never lists this item. Used for the home page.
++     */
++    bool isHiddenInSearch() const;
++    void setHiddenInSearch(bool hidden);
++
++    /**
++     * @return true for categories made by setLayoutCategory() (not groups)
++     */
++    bool isLayoutCategory() const;
++
++    /**
++     * @return the id given to setLayoutCategory()
++     */
++    QString layoutCategoryId() const;
++
+     /**
+      * If true this is the main module of this category and should appear in a more prominent way compared to the others
+      */
+diff --git a/app/MenuModel.cpp b/app/MenuModel.cpp
+index 895c21b..3904538 100644
+--- a/app/MenuModel.cpp
++++ b/app/MenuModel.cpp
+@@ -83,6 +83,8 @@ QHash<int, QByteArray> MenuModel::roleNames() const
+     names[IconNameRole] = "iconName";
+     names[IsRelevantRole] = "isRelevant";
+     names[AuxiliaryActionRole] = "auxiliaryAction";
++    names[BreadcrumbRole] = "breadcrumb";
++    names[DescriptionRole] = "description";
+     return names;
+ }
+ 
+@@ -187,6 +189,12 @@ QVariant MenuModel::data(const QModelIndex &index, int role) const
+         theData.setValue(mi->iconName());
+         break;
+ 
++    case MenuModel::BreadcrumbRole:
++        theData.setValue(mi->breadcrumb());
++        break;
++    case MenuModel::DescriptionRole:
++        theData.setValue(mi->comment());
++        break;
+     case MenuModel::IsRelevantRole:
+         theData.setValue(!mi->moduleData() || mi->moduleData()->isRelevant());
+         break;
+diff --git a/app/MenuModel.h b/app/MenuModel.h
+index 7839ce5..4a73ff8 100644
+--- a/app/MenuModel.h
++++ b/app/MenuModel.h
+@@ -53,6 +53,16 @@ public:
+         IsRelevantRole,
+ 
+         AuxiliaryActionRole,
++
++        /**
++         * Role used to request the path shown below the name in search results.
++         */
++        BreadcrumbRole,
++
++        /**
++         * Role used to request the description of an item.
++         */
++        DescriptionRole,
+     };
+ 
+     /**
+diff --git a/app/MenuProxyModel.cpp b/app/MenuProxyModel.cpp
+index fb09a1a..310e721 100644
+--- a/app/MenuProxyModel.cpp
++++ b/app/MenuProxyModel.cpp
+@@ -12,6 +12,8 @@
+ 
+ #include <KPluginMetaData>
+ 
++#include <algorithm>
++
+ MenuProxyModel::MenuProxyModel(QObject *parent)
+     : KCategorizedSortFilterProxyModel(parent)
+     , m_showIrrelevantModules(false)
+@@ -71,9 +73,19 @@ bool MenuProxyModel::filterAcceptsRow(int source_row, const QModelIndex &source_
+ 
+     // Search can find irrelevant modules.
+     if (!filterRegExp.pattern().isEmpty()) {
++        // Results are pages only; the categories of the System Settings layout would just be
++        // disabled headings. Their pages carry the category name as a keyword and breadcrumb.
++        if (mItem->isLayoutCategory() || mItem->isHiddenInSearch()) {
++            return false;
++        }
+         return KCategorizedSortFilterProxyModel::filterAcceptsRow(source_row, source_parent);
+     }
+ 
++    // Pages that are only reachable by search
++    if (mItem->isHiddenInSidebar()) {
++        return false;
++    }
++
+     // Don't show empty categories
+     if (mItem->menu() && mItem->children().isEmpty()) {
+         return false;
+@@ -89,10 +101,21 @@ bool MenuProxyModel::filterAcceptsRow(int source_row, const QModelIndex &source_
+             return false;
+         }
+ 
++        if (m_showIrrelevantModules && mItem->isLayoutCategory()) {
++            const auto &children = mItem->children();
++            return std::any_of(children.cbegin(), children.cend(), [](MenuItem *child) {
++                return !child->isHiddenInSidebar();
++            });
++        }
++
+         if (!m_showIrrelevantModules) {
+             bool hasRelevantChildren = false;
+             for (int i = 0; i < sourceModel()->rowCount(index); ++i) {
+                 const QModelIndex childIndex = sourceModel()->index(i, 0, index);
++                const auto childItem = childIndex.data(Qt::UserRole).value<MenuItem *>();
++                if (childItem && childItem->isHiddenInSidebar()) {
++                    continue;
++                }
+                 if (childIndex.data(MenuModel::IsRelevantRole).toBool()) {
+                     hasRelevantChildren = true;
+                     break;

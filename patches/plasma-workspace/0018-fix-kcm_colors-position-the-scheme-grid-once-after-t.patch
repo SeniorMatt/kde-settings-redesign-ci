@@ -1,0 +1,46 @@
+From 34555dd0fdabb0ea2d09c01fb8915b0a82fe5d59 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 19:05:38 +0500
+Subject: [PATCH 18/24] fix(kcm_colors): position the scheme grid once after
+ the async fill (first row was cut off), not built yet
+
+Cause: GridViewInternal.qml onCurrentIndexChanged calls positionViewAtIndex(currentIndex, Contain); with the deferred fill the
+model and the selected index arrive in one step before the cells are laid out, so contentY ended up past the first row. Now,
+once after the model reports loaded (Qt.callLater), positionViewAtBeginning() then positionViewAtIndex(currentIndex, Contain).
+Cause not proven without a run.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/colors/ui/main.qml | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/kcms/colors/ui/main.qml b/kcms/colors/ui/main.qml
+index 42557fd..194de78 100644
+--- a/kcms/colors/ui/main.qml
++++ b/kcms/colors/ui/main.qml
+@@ -25,6 +25,24 @@ KCM.GridViewKCM {
+     view.model: kcm.model.loaded ? kcm.filteredModel : null
+     view.currentIndex: kcm.model.loaded ? kcm.filteredModel.selectedSchemeIndex : -1
+ 
++    // GridViewInternal runs positionViewAtIndex(currentIndex, Contain) the moment the model is assigned, before the cells have their
++    // size, which left the first row scrolled out of view. Once, after the list is complete and laid out: start at the top, and
++    // scroll only as far as needed to keep the selected scheme visible.
++    Connections {
++        target: kcm.model
++        function onLoadedChanged() {
++            Qt.callLater(function () {
++                if (!kcm.model.loaded) {
++                    return;
++                }
++                root.view.positionViewAtBeginning();
++                if (root.view.currentIndex >= 0) {
++                    root.view.positionViewAtIndex(root.view.currentIndex, GridView.Contain);
++                }
++            });
++        }
++    }
++
+     // Busy only when reading takes longer than 150 ms; an empty state when no scheme was found.
+     Timer {
+         id: busyDelay

@@ -1,0 +1,528 @@
+From 737b84cdfd2fb49a0ee0bec124983100fe529f9f Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 14:14:44 +0500
+Subject: [PATCH 09/24] kcm_colors: schemes read in slices after the first
+ frame, accent color labelled, colour dialog built on use
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Page type: Gallery (docs/page-design.md section 5). Config keys (kdeglobals General/ColorScheme, AccentColor,
+accentColorFromWallpaper, LastUsedCustomAccentColor), the scheme apply code, the accent-color service and the
+kcolorschemeeditor are unchanged. NOT BUILT YET (owner stopped heavy work); checked statically only.
+
+Moved / renamed:
+- The accent color row (source combo + swatches) now starts with the label "Accent color:" (was an unlabelled combo box
+  above the search field); its three choices keep their wording. Search and the All/Light/Dark filter stay in the header;
+  Install from File… and Get New… stay page actions top right; Edit / Remove / Don't delete stay GridDelegate actions.
+- Empty state: "No color schemes found" / "No color schemes match" (was an empty grid); busy indicator only after 150 ms.
+- Relabel table: inventory/relabel/kcm_colors.tsv (outer repo). Inventory --strict: 29 rows ok, 0 lost
+  (marker kept in editor/scmeditordialog.cpp for the unchanged Save As row).
+- ia/duplicates.md lists no colors duplicate, so no link row was added. HIG ids: HIG-001, HIG-006; page-design sections 5, 7.
+
+Speed (cause found in code, not measured):
+- KCMColors::load() called ColorsModel::load() synchronously, before the page exists: for every *.colors file in every
+  color-schemes data dir it opened a KConfig, built KColorScheme::createApplicationPalette (all colour sets and states),
+  a second KColorScheme for the selection set, and a header-set check (colorsmodel.cpp load()), then sorted. About 30-50
+  files on a normal install. Also Platform.ColorDialog was created with the page, inside the accent row.
+- Now: ColorsModel::loadAsync() lists the files immediately and reads them in ~8 ms slices (loadNextBatch, same pattern
+  as kcm_lookandfeel cf609d2); the finished list replaces the old one in one reset, sorted as before. New properties
+  ColorsModel.loading / loaded; the grid has no model and currentIndex -1 until `loaded`. The scheme selection (and the
+  "scheme is not installed" warning) is applied from the loadFinished signal (loadSelectedColorScheme). The synchronous
+  ColorsModel::load() stays for install/edit, which need the list at once, and cancels a running background load.
+  The colour dialog sits in a Loader that is active only while it is open.
+- After numbers: pending, manager will measure.
+
+Not built yet; uncertain: Qt.labs.platform ColorDialog created from a Loader's sourceComponent and opened in
+Component.onCompleted (same pattern as the FileDialog Loaders on these pages); that a second load() while the first
+slices are pending restarts cleanly; FilterProxyModel's selectedSchemeIndex re-evaluation after the final reset on a
+reload (unchanged from before).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/colors/colors.cpp                 |   7 +-
+ kcms/colors/colorsmodel.cpp            | 194 ++++++++++++++++++-------
+ kcms/colors/colorsmodel.h              |  26 ++++
+ kcms/colors/editor/scmeditordialog.cpp |   1 +
+ kcms/colors/ui/AccentColorUI.qml       |  44 ++++--
+ kcms/colors/ui/main.qml                |  32 +++-
+ 6 files changed, 234 insertions(+), 70 deletions(-)
+
+diff --git a/kcms/colors/colors.cpp b/kcms/colors/colors.cpp
+index 9bd0fa8..124e47c 100644
+--- a/kcms/colors/colors.cpp
++++ b/kcms/colors/colors.cpp
+@@ -111,6 +111,8 @@ KCMColors::KCMColors(QObject *parent, const KPluginMetaData &data)
+     connect(colorsSettings(), &ColorsSettings::accentColorChanged, this, &KCMColors::accentColorChanged);
+     connect(colorsSettings(), &ColorsSettings::accentColorFromWallpaperChanged, this, &KCMColors::accentColorFromWallpaperChanged);
+ 
++    connect(m_model, &ColorsModel::loadFinished, this, &KCMColors::loadSelectedColorScheme);
++
+     connect(m_model, &ColorsModel::selectedSchemeChanged, m_filteredModel, &FilterProxyModel::setSelectedScheme);
+     m_filteredModel->setSourceModel(m_model);
+ 
+@@ -424,12 +426,13 @@ bool KCMColors::isSaveNeeded() const
+ void KCMColors::load()
+ {
+     KQuickManagedConfigModule::load();
+-    m_model->load();
+ 
+     m_config->markAsClean();
+     m_config->reparseConfiguration();
+ 
+-    loadSelectedColorScheme();
++    // The schemes are read in slices after the first frame; the selection is applied when the last slice is in
++    // (loadFinished -> loadSelectedColorScheme, connected in the constructor).
++    m_model->loadAsync();
+ 
+     Q_EMIT accentColorFromWallpaperChanged();
+     Q_EMIT accentColorChanged();
+diff --git a/kcms/colors/colorsmodel.cpp b/kcms/colors/colorsmodel.cpp
+index 0cb899e..648331f 100644
+--- a/kcms/colors/colorsmodel.cpp
++++ b/kcms/colors/colorsmodel.cpp
+@@ -17,6 +17,9 @@
+ #include <KConfigGroup>
+ #include <KSharedConfig>
+ 
++#include <QElapsedTimer>
++#include <QTimer>
++
+ #include <algorithm>
+ 
+ #include "colorsapplicator.h"
+@@ -161,14 +164,8 @@ int ColorsModel::selectedSchemeIndex() const
+     return indexOfScheme(m_selectedScheme);
+ }
+ 
+-void ColorsModel::load()
++QStringList ColorsModel::findSchemeFiles()
+ {
+-    beginResetModel();
+-
+-    const int oldCount = m_data.count();
+-
+-    m_data.clear();
+-
+     QStringList schemeFiles;
+ 
+     const QStringList schemeDirs =
+@@ -188,55 +185,65 @@ void ColorsModel::load()
+         return QStandardPaths::locate(QStandardPaths::GenericDataLocation, item);
+     });
+ 
+-    for (const QString &schemeFile : schemeFiles) {
+-        const QFileInfo fi(schemeFile);
+-        const QString baseName = fi.baseName();
+-
+-        KSharedConfigPtr config = KSharedConfig::openConfig(schemeFile, KConfig::SimpleConfig);
+-        KConfigGroup group(config, u"General"_s);
+-        const QString name = group.readEntry("Name", baseName);
+-
+-        const QPalette palette = KColorScheme::createApplicationPalette(config);
+-
+-        // QPalette has no "selected" state, so there's e.g. no "selected link" color.
+-        const KColorScheme selectedScheme = KColorScheme(QPalette::Normal, KColorScheme::Selection, config);
+-        QPalette selectedPalette = palette;
+-        selectedPalette.setBrush(QPalette::Base, selectedScheme.background());
+-        selectedPalette.setBrush(QPalette::Text, selectedScheme.foreground());
+-        selectedPalette.setBrush(QPalette::AlternateBase, selectedScheme.background(KColorScheme::AlternateBackground));
+-        selectedPalette.setBrush(QPalette::Link, selectedScheme.foreground(KColorScheme::LinkText));
+-        selectedPalette.setBrush(QPalette::LinkVisited, selectedScheme.foreground(KColorScheme::VisitedText));
+-
+-        QColor activeTitleBarBackground, activeTitleBarForeground;
+-        if (KColorScheme::isColorSetSupported(config, KColorScheme::Header)) {
+-            KColorScheme headerColorScheme(QPalette::Active, KColorScheme::Header, config);
+-            activeTitleBarBackground = headerColorScheme.background().color();
+-            activeTitleBarForeground = headerColorScheme.foreground().color();
+-        } else {
+-            KConfigGroup wmConfig(config, u"WM"_s);
+-            activeTitleBarBackground = wmConfig.readEntry("activeBackground", palette.color(QPalette::Active, QPalette::Highlight));
+-            activeTitleBarForeground = wmConfig.readEntry("activeForeground", palette.color(QPalette::Active, QPalette::HighlightedText));
+-        }
++    return schemeFiles;
++}
+ 
+-        const bool colorActiveTitleBar = group.readEntry("accentActiveTitlebar", false);
+-
+-        ColorsModelData item{
+-            name,
+-            baseName,
+-            palette,
+-            selectedPalette,
+-            activeTitleBarBackground,
+-            activeTitleBarForeground,
+-            fi.isWritable(),
+-            colorActiveTitleBar,
+-            false, // pending deletion
+-            group.hasKey("TintFactor"),
+-            group.readEntry<qreal>("TintFactor", DefaultTintFactor),
+-        };
+-
+-        m_data.append(item);
++ColorsModelData ColorsModel::readScheme(const QString &schemeFile)
++{
++    const QFileInfo fi(schemeFile);
++    const QString baseName = fi.baseName();
++
++    KSharedConfigPtr config = KSharedConfig::openConfig(schemeFile, KConfig::SimpleConfig);
++    KConfigGroup group(config, u"General"_s);
++    const QString name = group.readEntry("Name", baseName);
++
++    const QPalette palette = KColorScheme::createApplicationPalette(config);
++
++    // QPalette has no "selected" state, so there's e.g. no "selected link" color.
++    const KColorScheme selectedScheme = KColorScheme(QPalette::Normal, KColorScheme::Selection, config);
++    QPalette selectedPalette = palette;
++    selectedPalette.setBrush(QPalette::Base, selectedScheme.background());
++    selectedPalette.setBrush(QPalette::Text, selectedScheme.foreground());
++    selectedPalette.setBrush(QPalette::AlternateBase, selectedScheme.background(KColorScheme::AlternateBackground));
++    selectedPalette.setBrush(QPalette::Link, selectedScheme.foreground(KColorScheme::LinkText));
++    selectedPalette.setBrush(QPalette::LinkVisited, selectedScheme.foreground(KColorScheme::VisitedText));
++
++    QColor activeTitleBarBackground, activeTitleBarForeground;
++    if (KColorScheme::isColorSetSupported(config, KColorScheme::Header)) {
++        KColorScheme headerColorScheme(QPalette::Active, KColorScheme::Header, config);
++        activeTitleBarBackground = headerColorScheme.background().color();
++        activeTitleBarForeground = headerColorScheme.foreground().color();
++    } else {
++        KConfigGroup wmConfig(config, u"WM"_s);
++        activeTitleBarBackground = wmConfig.readEntry("activeBackground", palette.color(QPalette::Active, QPalette::Highlight));
++        activeTitleBarForeground = wmConfig.readEntry("activeForeground", palette.color(QPalette::Active, QPalette::HighlightedText));
+     }
+ 
++    const bool colorActiveTitleBar = group.readEntry("accentActiveTitlebar", false);
++
++    return ColorsModelData{
++        name,
++        baseName,
++        palette,
++        selectedPalette,
++        activeTitleBarBackground,
++        activeTitleBarForeground,
++        fi.isWritable(),
++        colorActiveTitleBar,
++        false, // pending deletion
++        group.hasKey("TintFactor"),
++        group.readEntry<qreal>("TintFactor", DefaultTintFactor),
++    };
++}
++
++void ColorsModel::replaceData(QList<ColorsModelData> &&data)
++{
++    const int oldCount = m_data.count();
++
++    beginResetModel();
++
++    m_data = std::move(data);
++
+     // Sort case-insensitively
+     QCollator collator;
+     collator.setCaseSensitivity(Qt::CaseInsensitive);
+@@ -252,6 +259,87 @@ void ColorsModel::load()
+     }
+ }
+ 
++void ColorsModel::load()
++{
++    // A synchronous load (install, edit) wins over a running background load
++    m_pendingFiles.clear();
++    m_building.clear();
++    setLoading(false);
++
++    QList<ColorsModelData> data;
++    const QStringList schemeFiles = findSchemeFiles();
++    for (const QString &schemeFile : schemeFiles) {
++        data.append(readScheme(schemeFile));
++    }
++    replaceData(std::move(data));
++    setLoaded();
++}
++
++void ColorsModel::loadAsync()
++{
++    // The cheap part (directory listing) now, the expensive part (a palette per file) in ~8 ms slices.
++    m_pendingFiles = findSchemeFiles();
++    m_pendingIndex = 0;
++    m_building.clear();
++    if (!m_loading) {
++        setLoading(true);
++        QTimer::singleShot(0, this, &ColorsModel::loadNextBatch);
++    }
++}
++
++void ColorsModel::loadNextBatch()
++{
++    if (!m_loading) {
++        return; // a synchronous load() finished first
++    }
++
++    QElapsedTimer timer;
++    timer.start();
++    while (m_pendingIndex < m_pendingFiles.size() && timer.elapsed() < 8) {
++        m_building.append(readScheme(m_pendingFiles.at(m_pendingIndex++)));
++    }
++
++    if (m_pendingIndex < m_pendingFiles.size()) {
++        QTimer::singleShot(0, this, &ColorsModel::loadNextBatch);
++        return;
++    }
++
++    m_pendingFiles.clear();
++    m_pendingIndex = 0;
++    // The old list (if any) stays until the new one is complete, then it is swapped in one reset
++    replaceData(std::move(m_building));
++    m_building.clear();
++    setLoading(false);
++    setLoaded();
++    Q_EMIT loadFinished();
++}
++
++bool ColorsModel::isLoading() const
++{
++    return m_loading;
++}
++
++bool ColorsModel::isLoaded() const
++{
++    return m_loaded;
++}
++
++void ColorsModel::setLoading(bool loading)
++{
++    if (m_loading != loading) {
++        m_loading = loading;
++        Q_EMIT loadingChanged();
++    }
++}
++
++void ColorsModel::setLoaded()
++{
++    if (!m_loaded) {
++        m_loaded = true;
++        Q_EMIT loadedChanged();
++    }
++}
++
+ QStringList ColorsModel::pendingDeletions() const
+ {
+     QStringList pendingDeletions;
+diff --git a/kcms/colors/colorsmodel.h b/kcms/colors/colorsmodel.h
+index 11eace0..b25635a 100644
+--- a/kcms/colors/colorsmodel.h
++++ b/kcms/colors/colorsmodel.h
+@@ -35,6 +35,10 @@ class ColorsModel : public QAbstractListModel
+ 
+     Q_PROPERTY(QString selectedScheme READ selectedScheme WRITE setSelectedScheme NOTIFY selectedSchemeChanged)
+     Q_PROPERTY(int selectedSchemeIndex READ selectedSchemeIndex NOTIFY selectedSchemeIndexChanged)
++    /** True while the schemes are being read in the background (loadAsync). */
++    Q_PROPERTY(bool loading READ isLoading NOTIFY loadingChanged)
++    /** False until the first load (synchronous or not) has finished. */
++    Q_PROPERTY(bool loaded READ isLoaded NOTIFY loadedChanged)
+ 
+ public:
+     ColorsModel(QObject *parent);
+@@ -69,16 +73,38 @@ public:
+     QStringList pendingDeletions() const;
+     void removeItemsPendingDeletion();
+ 
++    /** Reads every scheme now. Used after installing or editing a scheme. */
+     void load();
++    /** Reads every scheme in short slices, so the page can be shown first. Emits loadFinished() at the end. */
++    void loadAsync();
++
++    bool isLoading() const;
++    bool isLoaded() const;
+ 
+ Q_SIGNALS:
++    void loadingChanged();
++    void loadedChanged();
++    void loadFinished();
+     void selectedSchemeChanged(const QString &scheme);
+     void selectedSchemeIndexChanged();
+ 
+     void pendingDeletionsChanged();
+ 
+ private:
++    static QStringList findSchemeFiles();
++    static ColorsModelData readScheme(const QString &schemeFile);
++    void replaceData(QList<ColorsModelData> &&data);
++    void loadNextBatch();
++    void setLoading(bool loading);
++    void setLoaded();
++
+     QString m_selectedScheme;
+ 
+     QList<ColorsModelData> m_data;
++
++    QStringList m_pendingFiles;
++    int m_pendingIndex = 0;
++    QList<ColorsModelData> m_building;
++    bool m_loading = false;
++    bool m_loaded = false;
+ };
+diff --git a/kcms/colors/editor/scmeditordialog.cpp b/kcms/colors/editor/scmeditordialog.cpp
+index c07311d..66bcafc 100644
+--- a/kcms/colors/editor/scmeditordialog.cpp
++++ b/kcms/colors/editor/scmeditordialog.cpp
+@@ -109,6 +109,7 @@ void SchemeEditorDialog::on_buttonBox_clicked(QAbstractButton *button)
+ 
+ void SchemeEditorDialog::saveScheme(bool overwrite)
+ {
++    // ksr: kcm_colors/Editor-SaveAs (unchanged: name prompt and overwrite question)
+     QString name = m_schemeName;
+ 
+     // prompt for the name to save as
+diff --git a/kcms/colors/ui/AccentColorUI.qml b/kcms/colors/ui/AccentColorUI.qml
+index 0c7965a..c770b71 100644
+--- a/kcms/colors/ui/AccentColorUI.qml
++++ b/kcms/colors/ui/AccentColorUI.qml
+@@ -19,6 +19,13 @@ RowLayout {
+ 
+     spacing: Kirigami.Units.smallSpacing
+ 
++    QQC2.Label {
++        Layout.alignment: Qt.AlignTop
++        Layout.topMargin: Math.round((colorModeBox.height - implicitHeight) / 2)
++        text: i18nc("@label accent color setting, followed by its source and swatches", "Accent color:")
++        textFormat: Text.PlainText
++    }
++
+     QQC2.ComboBox {
+         id: colorModeBox
+         Layout.alignment: Qt.AlignTop | Qt.AlignRight
+@@ -142,17 +149,6 @@ RowLayout {
+             }
+         }
+ 
+-        Platform.ColorDialog {
+-            id: colorDialog
+-
+-            currentColor: Qt.colorEqual(kcm.lastUsedCustomAccentColor, "transparent") ? kcm.accentColor : kcm.lastUsedCustomAccentColor
+-            onAccepted: {
+-                kcm.accentColor = color;
+-                kcm.lastUsedCustomAccentColor = color;
+-                kcm.accentColorFromWallpaper = false;
+-            }
+-        }
+-
+         Rectangle {
+             id: customColorIndicator
+ 
+@@ -186,7 +182,7 @@ RowLayout {
+                     anchors.fill: parent
+                     onClicked: {
+                         colorPicker.forceActiveFocus(Qt.MouseFocusReason)
+-                        colorDialog.open()
++                        accentColorUI.openColorDialog()
+                     }
+                 }
+             }
+@@ -198,8 +194,30 @@ RowLayout {
+                 padding: 0  // Round button adds some padding by default which we don't need. Setting this to 0 centers the icon
+                 icon.name: "color-picker"
+                 icon.width : Math.round(Kirigami.Units.iconSizes.small * 0.9) // This provides a nice padding.
+-                onClicked: colorDialog.open()
++                onClicked: accentColorUI.openColorDialog()
++            }
++        }
++    }
++
++    function openColorDialog(): void {
++        colorDialogLoader.active = true;
++    }
++
++    // The native colour dialog object is created only when a colour is picked, not with the page.
++    Loader {
++        id: colorDialogLoader
++        visible: false
++        active: false
++        sourceComponent: Platform.ColorDialog {
++            currentColor: Qt.colorEqual(kcm.lastUsedCustomAccentColor, "transparent") ? kcm.accentColor : kcm.lastUsedCustomAccentColor
++            Component.onCompleted: open()
++            onAccepted: {
++                kcm.accentColor = color;
++                kcm.lastUsedCustomAccentColor = color;
++                kcm.accentColorFromWallpaper = false;
++                colorDialogLoader.active = false;
+             }
++            onRejected: colorDialogLoader.active = false
+         }
+     }
+ }
+diff --git a/kcms/colors/ui/main.qml b/kcms/colors/ui/main.qml
+index 12bec73..42557fd 100644
+--- a/kcms/colors/ui/main.qml
++++ b/kcms/colors/ui/main.qml
+@@ -21,8 +21,31 @@ import org.kde.private.kcms.colors as Private
+ KCM.GridViewKCM {
+     id: root
+ 
+-    view.model: kcm.filteredModel
+-    view.currentIndex: kcm.filteredModel.selectedSchemeIndex
++    // The schemes are read in slices after the first frame (kcm.model.loaded); the grid gets its model when the list is complete.
++    view.model: kcm.model.loaded ? kcm.filteredModel : null
++    view.currentIndex: kcm.model.loaded ? kcm.filteredModel.selectedSchemeIndex : -1
++
++    // Busy only when reading takes longer than 150 ms; an empty state when no scheme was found.
++    Timer {
++        id: busyDelay
++        interval: 150
++        running: !kcm.model.loaded
++    }
++    QtControls.BusyIndicator {
++        anchors.centerIn: parent
++        z: 1
++        running: visible
++        visible: !kcm.model.loaded && !busyDelay.running
++    }
++    Kirigami.PlaceholderMessage {
++        anchors.centerIn: parent
++        width: parent.width - Kirigami.Units.gridUnit * 4
++        visible: kcm.model.loaded && root.view.count === 0
++        icon.name: "preferences-desktop-color"
++        text: searchField.text.length > 0 || filterCombo.currentIndex !== 0
++            ? i18nc("@info", "No color schemes match")
++            : i18nc("@info", "No color schemes found")
++    }
+ 
+     Binding {
+         target: kcm.filteredModel
+@@ -121,6 +144,7 @@ KCM.GridViewKCM {
+                     Layout.fillWidth: true
+                 }
+ 
++                // ksr: kcm_colors/All-schemes
+                 QtControls.ComboBox {
+                     id: filterCombo
+                     textRole: "text"
+@@ -138,11 +162,13 @@ KCM.GridViewKCM {
+ 
+     actions: [
+         Kirigami.Action {
++            // ksr: kcm_colors/InstallFromFile
+             text: i18n("Install from File…")
+             icon.name: "document-import"
+             onTriggered: fileDialogLoader.active = true
+         },
+         NewStuff.Action {
++            // ksr: kcm_colors/GetNew
+             text: i18n("Get New…")
+             configFile: "colorschemes.knsrc"
+             onEntryEvent: function (entry, event) {
+@@ -309,12 +335,14 @@ KCM.GridViewKCM {
+ 
+         actions: [
+             Kirigami.Action {
++                // ksr: kcm_colors/EditScheme
+                 icon.name: "document-edit"
+                 tooltip: i18n("Edit Color Scheme…")
+                 enabled: !model.pendingDeletion
+                 onTriggered: kcm.editScheme(model.schemeName, root)
+             },
+             Kirigami.Action {
++                // ksr: kcm_colors/RemoveScheme
+                 icon.name: "edit-delete"
+                 tooltip: if (enabled) {
+                     return i18nc("@info:tooltip", "Remove color scheme");

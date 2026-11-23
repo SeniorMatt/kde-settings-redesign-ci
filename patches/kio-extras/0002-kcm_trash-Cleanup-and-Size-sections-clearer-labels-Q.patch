@@ -1,0 +1,131 @@
+From e4c29f3e659c17c75b88c16f96808a15c25e93f1 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 15:05:43 +0500
+Subject: [PATCH 2/4] kcm_trash: Cleanup and Size sections, clearer labels
+ (QtWidgets kept)
+
+Page type: Form (docs/page-design.md sections 1, 8). Stays QtWidgets; the port is not small. Layout: bold frameless section
+titles Cleanup / Size (and Trash location above the list when there are several trashes); the rows keep their
+checkbox + spin box pairs. Settings, ktrashrc keys and defaults unchanged.
+
+Renamed (inventory/relabel/kcm_trash.tsv): 'Cleanup:' / 'Size:' row labels became section titles; 'Limit to' -> 'Limit trash size to';
+'Full trash:' -> 'When the limit is reached:' and the combo is now disabled while the size limit is off (it only applies then).
+ksr: markers added.
+
+Speed (from code): setupGui() runs only after the KIO::special job (trash: directories) finishes, so the page body is
+empty until then (kcmtrash.cpp constructor). Not changed; building the GUI first would need the mount list. After: pending,
+manager will measure.
+
+HIG: HIG-005, HIG-006, HIG-019.
+
+Not built yet (freeze).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/trash/kcmtrash.cpp | 32 ++++++++++++++++++++++++++++----
+ 1 file changed, 28 insertions(+), 4 deletions(-)
+
+diff --git a/kcms/trash/kcmtrash.cpp b/kcms/trash/kcmtrash.cpp
+index 37836bd..1c05549 100644
+--- a/kcms/trash/kcmtrash.cpp
++++ b/kcms/trash/kcmtrash.cpp
+@@ -30,6 +30,15 @@
+ 
+ K_PLUGIN_CLASS_WITH_JSON(TrashConfigModule, "kcm_trash.json")
+ 
++static QLabel *sectionTitle(const QString &text)
++{
++    auto label = new QLabel(text);
++    QFont font = label->font();
++    font.setBold(true);
++    label->setFont(font);
++    return label;
++}
++
+ static constexpr int SPECIAL_TRASH_DIRECTORIES = 4;
+ 
+ TrashConfigModule::TrashConfigModule(QObject *parent, const KPluginMetaData &data)
+@@ -149,6 +158,7 @@ void TrashConfigModule::useTypeChanged()
+     mDays->setEnabled(mUseTimeLimit->isChecked());
+     mPercent->setEnabled(mUseSizeLimit->isChecked());
+     mSizeLabel->setEnabled(mUseSizeLimit->isChecked());
++    mLimitReachedAction->setEnabled(mUseSizeLimit->isChecked());
+ }
+ 
+ void TrashConfigModule::readConfig()
+@@ -215,7 +225,10 @@ void TrashConfigModule::setupGui()
+     if (m_trashMap.count() != 1) {
+         // If we have multiple trashes, we setup a widget to choose
+         // which trash to configure
++        // ksr: kcm_trash/Mountpoints (section title added)
++        layout->addWidget(sectionTitle(i18nc("@title:group", "Trash location")));
+         QListWidget *mountPoints = new QListWidget(widget());
++        mountPoints->setMaximumHeight(mountPoints->fontMetrics().height() * 6);
+         layout->addWidget(mountPoints);
+ 
+         QMapIterator<uint, QString> it(m_trashMap);
+@@ -242,17 +255,21 @@ void TrashConfigModule::setupGui()
+         mCurrentTrash = m_trashMap.value(0);
+     }
+ 
++    // Sections as bold titles without frames (docs/page-design.md section 8)
++    layout->addWidget(sectionTitle(i18nc("@title:group", "Cleanup")));
+     QFormLayout *formLayout = new QFormLayout();
+     layout->addLayout(formLayout);
+ 
+     QHBoxLayout *daysLayout = new QHBoxLayout();
+ 
++    // ksr: kcm_trash/UseTimeLimit (label "Cleanup:" became the section title)
+     mUseTimeLimit = new QCheckBox(i18n("Delete files older than"), widget());
+     mUseTimeLimit->setWhatsThis(
+         xi18nc("@info:whatsthis",
+                "<para>Check this box to allow <emphasis strong='true'>automatic deletion</emphasis> of files that are older than the value specified. "
+                "Leave this disabled to <emphasis strong='true'>not</emphasis> automatically delete any items after a certain timespan</para>"));
+     daysLayout->addWidget(mUseTimeLimit);
++    // ksr: kcm_trash/Days (unchanged)
+     mDays = new QSpinBox(widget());
+ 
+     mDays->setRange(1, 365);
+@@ -263,15 +280,20 @@ void TrashConfigModule::setupGui()
+                                "Any files older than this will be automatically deleted.</para>"));
+     daysLayout->addWidget(mDays);
+     daysLayout->addStretch();
+-    formLayout->addRow(i18n("Cleanup:"), daysLayout);
++    formLayout->addRow(daysLayout);
++
++    layout->addWidget(sectionTitle(i18nc("@title:group", "Size")));
++    QFormLayout *sizeForm = new QFormLayout();
++    layout->addLayout(sizeForm);
+ 
+     QHBoxLayout *maximumSizeLayout = new QHBoxLayout();
+-    mUseSizeLimit = new QCheckBox(i18n("Limit to"), widget());
++    // ksr: kcm_trash/UseSizeLimit (label "Size:" became the section title)
++    mUseSizeLimit = new QCheckBox(i18n("Limit trash size to"), widget());
+     mUseSizeLimit->setWhatsThis(xi18nc("@info:whatsthis",
+                                        "<para>Check this box to limit the trash to the maximum amount of disk space that you specify below. "
+                                        "Otherwise, it will be unlimited.</para>"));
+     maximumSizeLayout->addWidget(mUseSizeLimit);
+-    formLayout->addRow(i18n("Size:"), maximumSizeLayout);
++    sizeForm->addRow(maximumSizeLayout);
+ 
+     mPercent = new QDoubleSpinBox(widget());
+     mPercent->setRange(0.01, 100);
+@@ -285,6 +307,7 @@ void TrashConfigModule::setupGui()
+     mSizeLabel->setWhatsThis(
+         xi18nc("@info:whatsthis", "<para>This is the calculated amount of disk space that will be allowed for the trash, the maximum.</para>"));
+     maximumSizeLayout->addWidget(mSizeLabel);
++    maximumSizeLayout->addStretch();
+ 
+     mLimitReachedAction = new QComboBox();
+     mLimitReachedAction->addItem(i18n("Show a warning"));
+@@ -293,7 +316,8 @@ void TrashConfigModule::setupGui()
+     mLimitReachedAction->setWhatsThis(xi18nc("@info:whatsthis",
+                                              "<para>When the size limit is reached, it will prefer to delete the type of files that you specify, first. "
+                                              "If this is set to warn you, it will do so instead of automatically deleting files.</para>"));
+-    formLayout->addRow(i18n("Full trash:"), mLimitReachedAction);
++    // ksr: kcm_trash/LimitReachedAction ("Full trash:" -> "When the limit is reached:")
++    sizeForm->addRow(i18n("When the limit is reached:"), mLimitReachedAction);
+ 
+     layout->addStretch();
+ }

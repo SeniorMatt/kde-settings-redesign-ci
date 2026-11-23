@@ -1,0 +1,392 @@
+From b9c522d0563d7462b473edea69153130db27dc44 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 01:30:23 +0500
+Subject: [PATCH 3/9] info pages on CommandOutputKCM: inventory markers for the
+ 18 command-output pages (cpu, edid, egl, glx, vulkan, opencl, vaapi, wayland,
+ xserver, kwinsupportinfo, pci, usb, network, interrupts, sensors,
+ audio_information, block_devices, firmware_security)
+
+These pages need nothing beyond the shared base (previous commit): each is a main.qml with CommandOutputKCM and a
+CommandOutputContext in main.cpp; their look, busy indicator, filter, Refresh and error message all come from the base,
+so they now look and behave the same. What this commit adds is only the `ksr: kcm_x/<row>` markers next to the
+CommandOutputKCM item (Output, CopyToClipboard, Filter, FilterText, ReportError, PauseRefreshing on sensors), because the
+rows' anchors are text only and the strict inventory check wants them in the page's own folder. No label, key, command or
+argument changed, so nothing for ia/layout.json aliases. Relabel tables written in the outer repo (inventory/relabel).
+
+Per page what it runs (unchanged): cpu lscpu --hierarchic=always; edid edid.sh; egl eglinfo; glx glxinfo; vulkan
+vulkaninfo; opencl clinfo; vaapi vainfo; wayland wayland-info; xserver xdpyinfo; kwinsupportinfo qdbus KWin
+supportInformation; pci lspci backend; usb lsusb -tv (auto refresh 1 s); network ip.sh (rich text); interrupts cat
+/proc/interrupts (auto refresh not set); sensors sensors (1 s); audio_information pactl list; block_devices lsblk;
+firmware_security fwupdmgr.sh (rich text). Wrap mode stays as it was (wrapping for cpu, audio, pci, wayland; tables do not
+wrap).
+
+Inventory: --strict 0 lost for each of the 18. Speed: see base commit (tool now started after page creation). Remaining
+cost not fixed: the output goes into one Kirigami.SelectableLabel, so a very long output (vulkaninfo, glxinfo, clinfo)
+lays out its whole text on the GUI thread when it arrives. Not built yet.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/audio_information/ui/main.qml | 8 ++++++++
+ kcms/block_devices/ui/main.qml     | 8 ++++++++
+ kcms/cpu/ui/main.qml               | 8 ++++++++
+ kcms/edid/ui/main.qml              | 8 ++++++++
+ kcms/egl/ui/main.qml               | 8 ++++++++
+ kcms/firmware_security/ui/main.qml | 8 ++++++++
+ kcms/glx/ui/main.qml               | 8 ++++++++
+ kcms/interrupts/ui/main.qml        | 8 ++++++++
+ kcms/kwinsupportinfo/ui/main.qml   | 8 ++++++++
+ kcms/network/ui/main.qml           | 8 ++++++++
+ kcms/opencl/ui/main.qml            | 8 ++++++++
+ kcms/pci/ui/main.qml               | 8 ++++++++
+ kcms/sensors/ui/main.qml           | 9 +++++++++
+ kcms/usbview/ui/main.qml           | 8 ++++++++
+ kcms/vaapi/ui/main.qml             | 8 ++++++++
+ kcms/vulkan/ui/main.qml            | 8 ++++++++
+ kcms/wayland/ui/main.qml           | 8 ++++++++
+ kcms/xserver/ui/main.qml           | 8 ++++++++
+ 18 files changed, 145 insertions(+)
+
+diff --git a/kcms/audio_information/ui/main.qml b/kcms/audio_information/ui/main.qml
+index ab1f4d7..579a8bc 100644
+--- a/kcms/audio_information/ui/main.qml
++++ b/kcms/audio_information/ui/main.qml
+@@ -3,6 +3,14 @@
+     SPDX-FileCopyrightText: 2024 Shubham Arora <shubhamarora@protonmail.com>
+ */
+ 
++// The toolbar (Copy, Filter, Refresh, Pause), the filter bar and the error message come from CommandOutputKCM
++// (src/qml/CommandOutputKCM.qml); the rows of this page are provided by it:
++// ksr: kcm_audio_information/Output
++// ksr: kcm_audio_information/CopyToClipboard
++// ksr: kcm_audio_information/Filter
++// ksr: kcm_audio_information/FilterText
++// ksr: kcm_audio_information/ReportError
++
+ import QtQuick 2.5
+ 
+ import org.kde.kcmutils as KCM
+diff --git a/kcms/block_devices/ui/main.qml b/kcms/block_devices/ui/main.qml
+index 53e7150..d2b29f8 100644
+--- a/kcms/block_devices/ui/main.qml
++++ b/kcms/block_devices/ui/main.qml
+@@ -3,6 +3,14 @@
+     SPDX-FileCopyrightText: 2024 Harald Sitter <sitter@kde.org>
+ */
+ 
++// The toolbar (Copy, Filter, Refresh, Pause), the filter bar and the error message come from CommandOutputKCM
++// (src/qml/CommandOutputKCM.qml); the rows of this page are provided by it:
++// ksr: kcm_block_devices/Output
++// ksr: kcm_block_devices/CopyToClipboard
++// ksr: kcm_block_devices/Filter
++// ksr: kcm_block_devices/FilterText
++// ksr: kcm_block_devices/ReportError
++
+ import QtQuick 2.5
+ 
+ import org.kde.kcmutils as KCM
+diff --git a/kcms/cpu/ui/main.qml b/kcms/cpu/ui/main.qml
+index 7bd15b5..8e74d8b 100644
+--- a/kcms/cpu/ui/main.qml
++++ b/kcms/cpu/ui/main.qml
+@@ -3,6 +3,14 @@
+     SPDX-FileCopyrightText: 2021 Harald Sitter <sitter@kde.org>
+ */
+ 
++// The toolbar (Copy, Filter, Refresh, Pause), the filter bar and the error message come from CommandOutputKCM
++// (src/qml/CommandOutputKCM.qml); the rows of this page are provided by it:
++// ksr: kcm_cpu/Output
++// ksr: kcm_cpu/CopyToClipboard
++// ksr: kcm_cpu/Filter
++// ksr: kcm_cpu/FilterText
++// ksr: kcm_cpu/ReportError
++
+ import QtQuick 2.5
+ 
+ import org.kde.kcmutils as KCM
+diff --git a/kcms/edid/ui/main.qml b/kcms/edid/ui/main.qml
+index f5fefc7..658ace0 100644
+--- a/kcms/edid/ui/main.qml
++++ b/kcms/edid/ui/main.qml
+@@ -1,6 +1,14 @@
+ // SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
+ // SPDX-FileCopyrightText: 2021-2024 Harald Sitter <sitter@kde.org>
+ 
++// The toolbar (Copy, Filter, Refresh, Pause), the filter bar and the error message come from CommandOutputKCM
++// (src/qml/CommandOutputKCM.qml); the rows of this page are provided by it:
++// ksr: kcm_edid/Output
++// ksr: kcm_edid/CopyToClipboard
++// ksr: kcm_edid/Filter
++// ksr: kcm_edid/FilterText
++// ksr: kcm_edid/ReportError
++
+ import org.kde.kinfocenter.private 1.0 as KInfoCenter
+ 
+ KInfoCenter.CommandOutputKCM {
+diff --git a/kcms/egl/ui/main.qml b/kcms/egl/ui/main.qml
+index e937546..b36954a 100644
+--- a/kcms/egl/ui/main.qml
++++ b/kcms/egl/ui/main.qml
+@@ -3,6 +3,14 @@
+     SPDX-FileCopyrightText: 2021 Harald Sitter <sitter@kde.org>
+ */
+ 
++// The toolbar (Copy, Filter, Refresh, Pause), the filter bar and the error message come from CommandOutputKCM
++// (src/qml/CommandOutputKCM.qml); the rows of this page are provided by it:
++// ksr: kcm_egl/Output
++// ksr: kcm_egl/CopyToClipboard
++// ksr: kcm_egl/Filter
++// ksr: kcm_egl/FilterText
++// ksr: kcm_egl/ReportError
++
+ import QtQuick 2.5
+ 
+ import org.kde.kcmutils as KCM
+diff --git a/kcms/firmware_security/ui/main.qml b/kcms/firmware_security/ui/main.qml
+index 61c75b9..b1b8815 100644
+--- a/kcms/firmware_security/ui/main.qml
++++ b/kcms/firmware_security/ui/main.qml
+@@ -3,6 +3,14 @@
+     SPDX-FileCopyrightText: 2021-2022 Harald Sitter <sitter@kde.org>
+ */
+ 
++// The toolbar (Copy, Filter, Refresh, Pause), the filter bar and the error message come from CommandOutputKCM
++// (src/qml/CommandOutputKCM.qml); the rows of this page are provided by it:
++// ksr: kcm_firmware_security/Output
++// ksr: kcm_firmware_security/CopyToClipboard
++// ksr: kcm_firmware_security/Filter
++// ksr: kcm_firmware_security/FilterText
++// ksr: kcm_firmware_security/ReportError
++
+ import QtQuick 2.5
+ 
+ import org.kde.kcmutils as KCM
+diff --git a/kcms/glx/ui/main.qml b/kcms/glx/ui/main.qml
+index e937546..96930a1 100644
+--- a/kcms/glx/ui/main.qml
++++ b/kcms/glx/ui/main.qml
+@@ -3,6 +3,14 @@
+     SPDX-FileCopyrightText: 2021 Harald Sitter <sitter@kde.org>
+ */
+ 
++// The toolbar (Copy, Filter, Refresh, Pause), the filter bar and the error message come from CommandOutputKCM
++// (src/qml/CommandOutputKCM.qml); the rows of this page are provided by it:
++// ksr: kcm_glx/Output
++// ksr: kcm_glx/CopyToClipboard
++// ksr: kcm_glx/Filter
++// ksr: kcm_glx/FilterText
++// ksr: kcm_glx/ReportError
++
+ import QtQuick 2.5
+ 
+ import org.kde.kcmutils as KCM
+diff --git a/kcms/interrupts/ui/main.qml b/kcms/interrupts/ui/main.qml
+index e937546..a4bcf04 100644
+--- a/kcms/interrupts/ui/main.qml
++++ b/kcms/interrupts/ui/main.qml
+@@ -3,6 +3,14 @@
+     SPDX-FileCopyrightText: 2021 Harald Sitter <sitter@kde.org>
+ */
+ 
++// The toolbar (Copy, Filter, Refresh, Pause), the filter bar and the error message come from CommandOutputKCM
++// (src/qml/CommandOutputKCM.qml); the rows of this page are provided by it:
++// ksr: kcm_interrupts/Output
++// ksr: kcm_interrupts/CopyToClipboard
++// ksr: kcm_interrupts/Filter
++// ksr: kcm_interrupts/FilterText
++// ksr: kcm_interrupts/ReportError
++
+ import QtQuick 2.5
+ 
+ import org.kde.kcmutils as KCM
+diff --git a/kcms/kwinsupportinfo/ui/main.qml b/kcms/kwinsupportinfo/ui/main.qml
+index d4ef0d1..460c4f5 100644
+--- a/kcms/kwinsupportinfo/ui/main.qml
++++ b/kcms/kwinsupportinfo/ui/main.qml
+@@ -4,6 +4,14 @@
+     SPDX-FileCopyrightText: 2022 Nate Graham <nate@kde.org>
+ */
+ 
++// The toolbar (Copy, Filter, Refresh, Pause), the filter bar and the error message come from CommandOutputKCM
++// (src/qml/CommandOutputKCM.qml); the rows of this page are provided by it:
++// ksr: kcm_kwinsupportinfo/Output
++// ksr: kcm_kwinsupportinfo/CopyToClipboard
++// ksr: kcm_kwinsupportinfo/Filter
++// ksr: kcm_kwinsupportinfo/FilterText
++// ksr: kcm_kwinsupportinfo/ReportError
++
+ import QtQuick 2.5
+ 
+ import org.kde.kcmutils as KCM
+diff --git a/kcms/network/ui/main.qml b/kcms/network/ui/main.qml
+index 53e7150..54ca911 100644
+--- a/kcms/network/ui/main.qml
++++ b/kcms/network/ui/main.qml
+@@ -3,6 +3,14 @@
+     SPDX-FileCopyrightText: 2024 Harald Sitter <sitter@kde.org>
+ */
+ 
++// The toolbar (Copy, Filter, Refresh, Pause), the filter bar and the error message come from CommandOutputKCM
++// (src/qml/CommandOutputKCM.qml); the rows of this page are provided by it:
++// ksr: kcm_network/Output
++// ksr: kcm_network/CopyToClipboard
++// ksr: kcm_network/Filter
++// ksr: kcm_network/FilterText
++// ksr: kcm_network/ReportError
++
+ import QtQuick 2.5
+ 
+ import org.kde.kcmutils as KCM
+diff --git a/kcms/opencl/ui/main.qml b/kcms/opencl/ui/main.qml
+index b0c9dbc..094794f 100644
+--- a/kcms/opencl/ui/main.qml
++++ b/kcms/opencl/ui/main.qml
+@@ -5,6 +5,14 @@
+     SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
+ */
+ 
++// The toolbar (Copy, Filter, Refresh, Pause), the filter bar and the error message come from CommandOutputKCM
++// (src/qml/CommandOutputKCM.qml); the rows of this page are provided by it:
++// ksr: kcm_opencl/Output
++// ksr: kcm_opencl/CopyToClipboard
++// ksr: kcm_opencl/Filter
++// ksr: kcm_opencl/FilterText
++// ksr: kcm_opencl/ReportError
++
+ import QtQuick 2.5
+ 
+ import org.kde.kcmutils as KCM
+diff --git a/kcms/pci/ui/main.qml b/kcms/pci/ui/main.qml
+index b0c9327..dc67a5f 100644
+--- a/kcms/pci/ui/main.qml
++++ b/kcms/pci/ui/main.qml
+@@ -3,6 +3,14 @@
+     SPDX-FileCopyrightText: 2021 Harald Sitter <sitter@kde.org>
+ */
+ 
++// The toolbar (Copy, Filter, Refresh, Pause), the filter bar and the error message come from CommandOutputKCM
++// (src/qml/CommandOutputKCM.qml); the rows of this page are provided by it:
++// ksr: kcm_pci/Output
++// ksr: kcm_pci/CopyToClipboard
++// ksr: kcm_pci/Filter
++// ksr: kcm_pci/FilterText
++// ksr: kcm_pci/ReportError
++
+ import QtQuick 2.5
+ 
+ import org.kde.kcmutils as KCM
+diff --git a/kcms/sensors/ui/main.qml b/kcms/sensors/ui/main.qml
+index 20e38a2..0613829 100644
+--- a/kcms/sensors/ui/main.qml
++++ b/kcms/sensors/ui/main.qml
+@@ -3,6 +3,15 @@
+     SPDX-FileCopyrightText: 2025 Thomas Duckworth <tduck@filotimoproject.org>
+ */
+ 
++// The toolbar (Copy, Filter, Refresh, Pause), the filter bar and the error message come from CommandOutputKCM
++// (src/qml/CommandOutputKCM.qml); the rows of this page are provided by it:
++// ksr: kcm_sensors/Output
++// ksr: kcm_sensors/CopyToClipboard
++// ksr: kcm_sensors/Filter
++// ksr: kcm_sensors/FilterText
++// ksr: kcm_sensors/PauseRefreshing
++// ksr: kcm_sensors/ReportError
++
+ import QtQuick
+ 
+ import org.kde.kcmutils as KCM
+diff --git a/kcms/usbview/ui/main.qml b/kcms/usbview/ui/main.qml
+index 3499da6..929647b 100644
+--- a/kcms/usbview/ui/main.qml
++++ b/kcms/usbview/ui/main.qml
+@@ -3,6 +3,14 @@
+  *   SPDX-License-Identifier: GPL-2.0-or-later
+  */
+ 
++// The toolbar (Copy, Filter, Refresh, Pause), the filter bar and the error message come from CommandOutputKCM
++// (src/qml/CommandOutputKCM.qml); the rows of this page are provided by it:
++// ksr: kcm_usb/Output
++// ksr: kcm_usb/CopyToClipboard
++// ksr: kcm_usb/Filter
++// ksr: kcm_usb/FilterText
++// ksr: kcm_usb/ReportError
++
+ import QtQuick
+ 
+ import org.kde.kinfocenter.private as KInfoCenter
+diff --git a/kcms/vaapi/ui/main.qml b/kcms/vaapi/ui/main.qml
+index 00ffe1b..9d6a911 100644
+--- a/kcms/vaapi/ui/main.qml
++++ b/kcms/vaapi/ui/main.qml
+@@ -3,6 +3,14 @@
+     SPDX-FileCopyrightText: 2026 Satakun Utama <linesofcodes@dailitation.xyz>
+ */
+ 
++// The toolbar (Copy, Filter, Refresh, Pause), the filter bar and the error message come from CommandOutputKCM
++// (src/qml/CommandOutputKCM.qml); the rows of this page are provided by it:
++// ksr: kcm_vaapi/Output
++// ksr: kcm_vaapi/CopyToClipboard
++// ksr: kcm_vaapi/Filter
++// ksr: kcm_vaapi/FilterText
++// ksr: kcm_vaapi/ReportError
++
+ import QtQuick 2.5
+ 
+ import org.kde.kinfocenter.private 1.0 as KInfoCenter
+diff --git a/kcms/vulkan/ui/main.qml b/kcms/vulkan/ui/main.qml
+index e937546..df6ffed 100644
+--- a/kcms/vulkan/ui/main.qml
++++ b/kcms/vulkan/ui/main.qml
+@@ -3,6 +3,14 @@
+     SPDX-FileCopyrightText: 2021 Harald Sitter <sitter@kde.org>
+ */
+ 
++// The toolbar (Copy, Filter, Refresh, Pause), the filter bar and the error message come from CommandOutputKCM
++// (src/qml/CommandOutputKCM.qml); the rows of this page are provided by it:
++// ksr: kcm_vulkan/Output
++// ksr: kcm_vulkan/CopyToClipboard
++// ksr: kcm_vulkan/Filter
++// ksr: kcm_vulkan/FilterText
++// ksr: kcm_vulkan/ReportError
++
+ import QtQuick 2.5
+ 
+ import org.kde.kcmutils as KCM
+diff --git a/kcms/wayland/ui/main.qml b/kcms/wayland/ui/main.qml
+index 7bd15b5..872c1ff 100644
+--- a/kcms/wayland/ui/main.qml
++++ b/kcms/wayland/ui/main.qml
+@@ -3,6 +3,14 @@
+     SPDX-FileCopyrightText: 2021 Harald Sitter <sitter@kde.org>
+ */
+ 
++// The toolbar (Copy, Filter, Refresh, Pause), the filter bar and the error message come from CommandOutputKCM
++// (src/qml/CommandOutputKCM.qml); the rows of this page are provided by it:
++// ksr: kcm_wayland/Output
++// ksr: kcm_wayland/CopyToClipboard
++// ksr: kcm_wayland/Filter
++// ksr: kcm_wayland/FilterText
++// ksr: kcm_wayland/ReportError
++
+ import QtQuick 2.5
+ 
+ import org.kde.kcmutils as KCM
+diff --git a/kcms/xserver/ui/main.qml b/kcms/xserver/ui/main.qml
+index e937546..9e0e0a5 100644
+--- a/kcms/xserver/ui/main.qml
++++ b/kcms/xserver/ui/main.qml
+@@ -3,6 +3,14 @@
+     SPDX-FileCopyrightText: 2021 Harald Sitter <sitter@kde.org>
+ */
+ 
++// The toolbar (Copy, Filter, Refresh, Pause), the filter bar and the error message come from CommandOutputKCM
++// (src/qml/CommandOutputKCM.qml); the rows of this page are provided by it:
++// ksr: kcm_xserver/Output
++// ksr: kcm_xserver/CopyToClipboard
++// ksr: kcm_xserver/Filter
++// ksr: kcm_xserver/FilterText
++// ksr: kcm_xserver/ReportError
++
+ import QtQuick 2.5
+ 
+ import org.kde.kcmutils as KCM

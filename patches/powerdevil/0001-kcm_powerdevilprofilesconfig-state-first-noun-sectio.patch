@@ -1,0 +1,790 @@
+From 8a35e5198d510a90de4af56ef0a01f7a00e8ccfe Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 13:57:28 +0500
+Subject: [PATCH] kcm_powerdevilprofilesconfig: state first, noun sections,
+ async action support check
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Moved/renamed (UI only, same config keys, same backend):
+- New first row "Right now: Using the "<state>" settings" (kcm.currentProfile). The AC/Battery/Low battery switch
+  stays: the three power states are peers of one kind.
+- "Suspend Session" split by topic into "Sleep" (when inactive, sleep mode), "Buttons and lid" (power button, lid,
+  external monitor); "Display and Brightness" split into "Screen" (turn off, dim) and "Brightness" (screen, keyboard);
+  "Other Settings" split into "Power profile" and "Commands". Order by use: Sleep, Screen, Brightness, Buttons and
+  lid, Power profile, Commands. Sleep mode now sits next to the inactivity action it applies to.
+- Toolbar "Configure Advanced Settings…" -> "Battery Levels and Charging…"; its page "Advanced Power Settings" ->
+  "Battery Levels and Charging"; its "Other Settings" section -> "Media".
+- "Choose run conditions" -> "Choose Run Conditions…" (opens a menu: title case + ellipsis).
+HIG ids: HIG-001/005/006 (state and common task first), HIG-015 (group by topic), HIG-023 (no blocking work),
+HIG-057 (no "Advanced"). Page-design.md sections 2, 3, 6, 7.
+
+Speed cause (code evidence): PowerKCM::PowerKCM() called asyncCall() and then reply.waitForFinished() once per
+powerdevil action plugin with X-KDE-PowerDevil-Action-HasRuntimeRequirement, on the GUI thread, before the first
+frame. Now a QDBusPendingCallWatcher per action; the action starts as unsupported (rows hidden) and
+supportedActionsChanged() is emitted when the reply arrives; a failed call still means "supported" as before.
+Only one ProfileConfig is instantiated (main.qml), not three, so there is nothing to defer there.
+After-numbers: pending, manager will measure. Not built yet.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcm/PowerKCM.cpp         |  39 ++-
+ kcm/ui/GlobalConfig.qml  |  15 +-
+ kcm/ui/ProfileConfig.qml | 503 ++++++++++++++++++++-------------------
+ kcm/ui/RunScriptEdit.qml |   2 +
+ kcm/ui/main.qml          |   5 +-
+ 5 files changed, 305 insertions(+), 259 deletions(-)
+
+diff --git a/kcm/PowerKCM.cpp b/kcm/PowerKCM.cpp
+index f9450ee..16eb13f 100644
+--- a/kcm/PowerKCM.cpp
++++ b/kcm/PowerKCM.cpp
+@@ -36,6 +36,8 @@
+ #include <QDBusConnectionInterface>
+ #include <QDBusMessage>
+ #include <QDBusPendingCall>
++#include <QDBusPendingCallWatcher>
++#include <QDBusPendingReply>
+ #include <QDBusServiceWatcher>
+ #include <QQuickItem>
+ #include <QQuickRenderControl>
+@@ -199,9 +201,10 @@ PowerKCM::PowerKCM(QObject *parent, const KPluginMetaData &metaData)
+ 
+     for (const KPluginMetaData &offer : offers) {
+         QString actionId = offer.value(QStringLiteral("X-KDE-PowerDevil-Action-ID"));
+-        bool supported = true;
+-
+-        // Does it have a runtime requirement?
++        // ksr: the runtime-requirement query used to block the GUI thread (asyncCall + waitForFinished) once per
++        // action while the KCM was being constructed. Now the answer arrives asynchronously: the action starts
++        // out as "not supported" (its rows stay hidden) and supportedActionsChanged() fires when the daemon replies.
++        // A failed call keeps the old behaviour: assume the action is supported.
+         if (offer.value(QStringLiteral("X-KDE-PowerDevil-Action-HasRuntimeRequirement"), false)) {
+             qCDebug(POWERDEVIL) << offer.name() << " has a runtime requirement";
+ 
+@@ -210,18 +213,28 @@ PowerKCM::PowerKCM(QObject *parent, const KPluginMetaData &metaData)
+                                                                u"org.kde.Solid.PowerManagement"_s,
+                                                                u"isActionSupported"_s);
+             call.setArguments(QVariantList() << actionId);
+-            QDBusPendingReply<bool> reply = QDBusConnection::sessionBus().asyncCall(call);
+-            reply.waitForFinished();
+-
+-            if (reply.isValid()) {
+-                if (!reply.value()) {
+-                    supported = false;
+-                    qCDebug(POWERDEVIL) << "The action " << actionId << " appears not to be supported by the core.";
++            auto *watcher = new QDBusPendingCallWatcher(QDBusConnection::sessionBus().asyncCall(call), this);
++            connect(watcher, &QDBusPendingCallWatcher::finished, this, [this, actionId](QDBusPendingCallWatcher *w) {
++                QDBusPendingReply<bool> reply = *w;
++                w->deleteLater();
++                bool supported = true;
++                if (reply.isValid()) {
++                    supported = reply.value();
++                    if (!supported) {
++                        qCDebug(POWERDEVIL) << "The action " << actionId << " appears not to be supported by the core.";
++                    }
++                } else {
++                    qCDebug(POWERDEVIL) << "There was a problem in contacting DBus!! Assuming the action is ok.";
+                 }
+-            } else {
+-                qCDebug(POWERDEVIL) << "There was a problem in contacting DBus!! Assuming the action is ok.";
+-            }
++                if (m_supportedActions.value(actionId).toBool() != supported) {
++                    m_supportedActions.insert(actionId, supported);
++                    Q_EMIT supportedActionsChanged();
++                }
++            });
++            m_supportedActions.insert(actionId, false);
++            continue;
+         }
++        bool supported = true;
+ 
+         m_supportedActions.insert(actionId, supported);
+     }
+diff --git a/kcm/ui/GlobalConfig.qml b/kcm/ui/GlobalConfig.qml
+index dee32d1..b31f61b 100644
+--- a/kcm/ui/GlobalConfig.qml
++++ b/kcm/ui/GlobalConfig.qml
+@@ -13,7 +13,7 @@ import org.kde.kirigami as Kirigami
+ Kirigami.ScrollablePage {
+     id: root
+ 
+-    title: i18nc("@title", "Advanced Power Settings")
++    title: i18nc("@title", "Battery Levels and Charging")
+ 
+     readonly property var globalSettings: kcm.settings.global
+     readonly property var externalSettings: kcm.externalServiceSettings
+@@ -387,12 +387,10 @@ Kirigami.ScrollablePage {
+         /////
+ 
+         Item {
+-            Kirigami.FormData.label: i18nc(
+-                "@title:group Miscellaneous power management settings that didn't fit elsewhere",
+-                "Other Settings"
+-            )
++            // ksr: kcm_powerdevilprofilesconfig/PausePlayersOnSuspend (was Other Settings)
++            Kirigami.FormData.label: i18nc("@title:group", "Media")
+             Kirigami.FormData.isSection: true
+-            // If these are the only settings, they're not "Other Settings" and we don't need a section title
++            // If these are the only settings, they don't need a section title
+             visible: batteryLevelsHeader.visible || chargeLimitHeader.visible
+         }
+ 
+@@ -425,6 +423,7 @@ Kirigami.ScrollablePage {
+ 
+             MostUsedItem {
+                 id: firstRelatedPage
++                // ksr: kcm_powerdevilprofilesconfig/RelatedNotifications (unchanged)
+                 kcmIcon: "preferences-desktop-notification-bell"
+                 kcmName: i18nc(
+                     "@text:button Name of KCM, plus Power Management notification category",
+@@ -436,6 +435,7 @@ Kirigami.ScrollablePage {
+             }
+             MostUsedItem {
+                 id: keyboardShortcutsPage
++                // ksr: kcm_powerdevilprofilesconfig/RelatedShortcuts (unchanged)
+                 kcmIcon: "preferences-desktop-keyboard-shortcut"
+                 kcmName: i18nc(
+                     "@text:button Name of KCM, plus Power Management shortcut category",
+@@ -447,6 +447,7 @@ Kirigami.ScrollablePage {
+             }
+             MostUsedItem {
+                 id: screenLockingPage
++                // ksr: kcm_powerdevilprofilesconfig/RelatedScreenLocking (unchanged)
+                 kcmIcon: "preferences-desktop-user-password"
+                 kcmName: i18nc("@text:button Name of KCM", "Screen Locking")
+                 Accessible.name: i18n("Open \"Screen Locking\" settings page")
+@@ -455,6 +456,7 @@ Kirigami.ScrollablePage {
+             }
+             MostUsedItem {
+                 id: desktopSessionsPage
++                // ksr: kcm_powerdevilprofilesconfig/RelatedDesktopSession (unchanged)
+                 kcmIcon: "system-log-out"
+                 kcmName: i18nc("@text:button Name of KCM", "Desktop Session")
+                 Accessible.name: i18n("Open \"Desktop Session\" settings page")
+@@ -463,6 +465,7 @@ Kirigami.ScrollablePage {
+             }
+             MostUsedItem {
+                 id: activitiesPage
++                // ksr: kcm_powerdevilprofilesconfig/RelatedActivities (unchanged)
+                 kcmIcon: "preferences-desktop-activities"
+                 kcmName: i18nc("@text:button Name of KCM", "Activities")
+                 Accessible.name: i18n("Open \"Activities\" settings page")
+diff --git a/kcm/ui/ProfileConfig.qml b/kcm/ui/ProfileConfig.qml
+index c881204..167b7a4 100644
+--- a/kcm/ui/ProfileConfig.qml
++++ b/kcm/ui/ProfileConfig.qml
+@@ -17,6 +17,8 @@ Kirigami.FormLayout {
+ 
+     required property string profileId
+     required property string profileLabel
++    // ksr: label of the profile in use right now ("" = unknown yet)
++    property string currentProfileLabel: ""
+     readonly property var profileSettings: kcm.settings["profile" + profileId]
+ 
+     function formatPercentageText(value) {
+@@ -36,19 +38,21 @@ Kirigami.FormLayout {
+         }
+     }
+ 
+-    //
+-    // Suspend Session
++    // ksr: state first. Which of the three settings sets is in use right now (the tab bar also opens on it).
++    QQC2.Label {
++        Kirigami.FormData.label: i18nc("@label", "Right now:")
++        visible: root.currentProfileLabel !== "" && kcm.supportsBatteryProfiles
++        text: i18nc("@info %1 is a power state such as On AC Power or On Battery", "Using the \"%1\" settings", root.currentProfileLabel)
++        wrapMode: Text.Wrap
++        Layout.fillWidth: true
++        Layout.maximumWidth: Kirigami.Units.gridUnit * 16
++    }
+ 
+     Item {
++        // ksr: kcm_powerdevilprofilesconfig/AutoSuspendAction (was Suspend Session)
+         Kirigami.FormData.isSection: true
+-        Kirigami.FormData.label: i18nc("@title:group", "Suspend Session")
+-        visible: (
+-            autoSuspendActionRow.visible
+-            || powerButtonActionCombo.visible
+-            || lidActionCombo.visible
+-            || triggersLidActionWhenExternalMonitorPresentCheck.visible
+-            || sleepModeCombo.visible
+-        )
++        Kirigami.FormData.label: i18nc("@title:group", "Sleep")
++        visible: autoSuspendActionRow.visible || sleepModeCombo.visible
+     }
+ 
+     Kirigami.InlineMessage {
+@@ -173,102 +177,6 @@ Kirigami.FormLayout {
+         }
+     }
+ 
+-    Kirigami.InlineMessage {
+-        Kirigami.FormData.isSection: true
+-        visible: powerButtonActionCombo.visible && !powerButtonActionCombo.isConfiguredValueSupported
+-        Layout.fillWidth: true
+-        type: Kirigami.MessageType.Warning
+-        text: i18nc("@info:status", "The action you had previously configured for when the power button is pressed is now unsupported on your system. Please select a different one.")
+-    }
+-
+-    ComboBoxWithIcon {
+-        id: powerButtonActionCombo
+-        Kirigami.FormData.label: i18nc(
+-            "@label:combobox Suspend action such as sleep/hibernate to perform when the power button is pressed",
+-            "When &power button pressed:"
+-        )
+-        Accessible.name: i18nc("@accessible:name:combobox", "Action to perform when the power button is pressed")
+-
+-        visible: kcm.supportedActions["HandleButtonEvents"] === true && kcm.isPowerButtonPresent
+-        Layout.fillWidth: true
+-        implicitContentWidthPolicy: QQC2.ComboBox.WidestTextWhenCompleted
+-
+-        model: kcm.powerButtonActionModel
+-        textRole: "name"
+-        valueRole: "value"
+-
+-        readonly property bool isConfiguredValueSupported: currentValue === root.profileSettings.powerButtonAction
+-
+-        KCM.SettingStateBinding {
+-            configObject: root.profileSettings
+-            settingName: "PowerButtonAction"
+-        }
+-        Component.onCompleted: {
+-            // indexOfValue() is invalid before onCompleted, so wait until here to bind currentIndex.
+-            currentIndex = Qt.binding(() => indexOfValue(root.profileSettings.powerButtonAction));
+-        }
+-        onActivated: {
+-            root.profileSettings.powerButtonAction = currentValue;
+-        }
+-    }
+-
+-    Kirigami.InlineMessage {
+-        Kirigami.FormData.isSection: true
+-        visible: lidActionCombo.visible && !lidActionCombo.isConfiguredValueSupported
+-        Layout.fillWidth: true
+-        type: Kirigami.MessageType.Warning
+-        text: i18nc("@info:status", "The action you had previously configured for when the lid is closed is now unsupported on your system. Please select a different one.")
+-    }
+-
+-    ComboBoxWithIcon {
+-        id: lidActionCombo
+-        Kirigami.FormData.label: i18nc(
+-            "@label:combobox Suspend action such as sleep/hibernate to perform when the power button is pressed",
+-            "When laptop &lid closed:"
+-        )
+-        Accessible.name: i18nc("@accessible:name:combobox", "Action to perform when the laptop lid is closed")
+-
+-        visible: kcm.supportedActions["HandleButtonEvents"] === true && kcm.isLidPresent
+-        Layout.fillWidth: true
+-        implicitContentWidthPolicy: QQC2.ComboBox.WidestTextWhenCompleted
+-
+-        model: kcm.lidActionModel
+-        textRole: "name"
+-        valueRole: "value"
+-
+-        readonly property bool isConfiguredValueSupported: currentValue === root.profileSettings.lidAction
+-
+-        KCM.SettingStateBinding {
+-            configObject: root.profileSettings
+-            settingName: "LidAction"
+-        }
+-        Component.onCompleted: {
+-            // indexOfValue() is invalid before onCompleted, so wait until here to bind currentIndex.
+-            currentIndex = Qt.binding(() => indexOfValue(root.profileSettings.lidAction));
+-        }
+-        onActivated: {
+-            root.profileSettings.lidAction = currentValue;
+-        }
+-    }
+-
+-    QQC2.CheckBox {
+-        id: triggersLidActionWhenExternalMonitorPresentCheck
+-        text: i18nc(
+-            "@text:checkbox Trigger laptop lid action even when an external monitor is connected",
+-            "Even when an external monitor is connected"
+-        )
+-        Accessible.name: i18n("Perform laptop lid action even when an external monitor is connected")
+-
+-        visible: lidActionCombo.visible
+-
+-        KCM.SettingStateBinding {
+-            configObject: root.profileSettings
+-            settingName: "InhibitLidActionWhenExternalMonitorPresent"
+-            extraEnabledConditions: lidActionCombo.currentValue !== PD.PowerDevil.PowerButtonAction.NoAction
+-        }
+-        checked: !root.profileSettings.inhibitLidActionWhenExternalMonitorPresent
+-        onToggled: { root.profileSettings.inhibitLidActionWhenExternalMonitorPresent = !checked; }
+-    }
+ 
+     Kirigami.InlineMessage {
+         Kirigami.FormData.isSection: true
+@@ -328,137 +236,12 @@ Kirigami.FormLayout {
+         }
+     }
+ 
+-    //
+-    // Display and Brightness
+ 
+     Item {
++        // ksr: kcm_powerdevilprofilesconfig/TurnOffDisplayIdleTimeoutSec (was Display and Brightness)
+         Kirigami.FormData.isSection: true
+-        Kirigami.FormData.label: i18nc("@title:group", "Display and Brightness")
+-        visible: (
+-            kcm.supportedActions["DimDisplay"] === true
+-            || kcm.supportedActions["DPMSControl"] === true
+-            || kcm.supportedActions["KeyboardBrightnessControl"] === true
+-            || kcm.supportedActions["ScreenBrightnessControl"] === true
+-        )
+-    }
+-
+-    RowLayout {
+-        Kirigami.FormData.label: i18nc("@label:slider Brightness level", "Change scr&een brightness:")
+-        Kirigami.FormData.buddyFor: displayBrightnessCheck
+-
+-        visible: kcm.supportedActions["ScreenBrightnessControl"] === true
+-        Layout.fillWidth: true
+-        spacing: Kirigami.Units.smallSpacing
+-
+-        QQC2.CheckBox {
+-            id: displayBrightnessCheck
+-
+-            KCM.SettingStateBinding {
+-                configObject: root.profileSettings
+-                settingName: "UseProfileSpecificDisplayBrightness"
+-            }
+-            checked: root.profileSettings.useProfileSpecificDisplayBrightness
+-            onToggled: { root.profileSettings.useProfileSpecificDisplayBrightness = checked; }
+-        }
+-        QQC2.Slider {
+-            id: displayBrightnessSlider
+-            Layout.fillWidth: true
+-            from: 1
+-            to: 100
+-            stepSize: 1
+-
+-            KCM.SettingStateBinding {
+-                configObject: root.profileSettings
+-                settingName: "DisplayBrightness"
+-                extraEnabledConditions: displayBrightnessCheck.checked
+-            }
+-            value: root.profileSettings.displayBrightness
+-            onMoved: { root.profileSettings.displayBrightness = value; }
+-        }
+-        QQC2.Label {
+-            enabled: displayBrightnessCheck.checked
+-            text: root.formatPercentageText(displayBrightnessSlider.value)
+-            Layout.preferredWidth: displayBrightnessPercentageMetrics.width
+-        }
+-        TextMetrics {
+-            id: displayBrightnessPercentageMetrics
+-            text: root.formatPercentageText(100)
+-        }
+-    }
+-
+-    TimeDurationComboBox {
+-        id: dimDisplayIdleTimeoutCombo
+-        visible: kcm.supportedActions["DimDisplay"] === true
+-        Layout.fillWidth: true
+-        Kirigami.FormData.label: i18nc("@label:combobox Dim screen after X minutes", "Di&m automatically:")
+-
+-        durationPromptLabel: i18nc("@label:spinbox Dim screen after X minutes", "Di&m automatically after:")
+-        durationPromptAcceptsUnits: [DurationPromptDialog.Unit.Seconds, DurationPromptDialog.Unit.Minutes]
+-
+-        function translateSeconds(n, formatUnit = DurationPromptDialog.Unit.Seconds) {
+-            return formatUnit == DurationPromptDialog.Unit.Minutes
+-                ? translateMinutes(n / 60) : i18ncp("@option:combobox", "%1 second", "%1 seconds", n);
+-        }
+-        function translateMinutes(n) { return i18ncp("@option:combobox", "%1 minute", "%1 minutes", n); }
+-
+-        valueRole: "seconds"
+-        textRole: "text"
+-        unitOfValueRole: DurationPromptDialog.Unit.Seconds
+-        durationPromptFromValue: 10
+-        presetOptions: [
+-            { seconds: -1, text: i18nc("@option:combobox Dim screen automatically", "Never") },
+-            { seconds: 30, text: translateSeconds(30), unit: DurationPromptDialog.Unit.Seconds },
+-            { seconds: 1 * 60, text: translateMinutes(1), unit: DurationPromptDialog.Unit.Minutes },
+-            { seconds: 2 * 60, text: translateMinutes(2), unit: DurationPromptDialog.Unit.Minutes },
+-            { seconds: 5 * 60, text: translateMinutes(5), unit: DurationPromptDialog.Unit.Minutes },
+-            { seconds: 10 * 60, text: translateMinutes(10), unit: DurationPromptDialog.Unit.Minutes },
+-            { seconds: 15 * 60, text: translateMinutes(15), unit: DurationPromptDialog.Unit.Minutes },
+-            { seconds: -2, text: i18nc("@option:combobox Choose a custom value outside the list of preset values", "Custom…") },
+-        ]
+-        customRequesterValue: -2
+-        configuredValue: root.profileSettings.dimDisplayWhenIdle ? root.profileSettings.dimDisplayIdleTimeoutSec : -1
+-        configuredDisplayUnit: model[indexOfValue(configuredValue)]?.unit ?? DurationPromptDialog.Unit.Minutes
+-
+-        onRegularValueActivated: {
+-            root.profileSettings.dimDisplayIdleTimeoutSec = currentValue;
+-            root.profileSettings.dimDisplayWhenIdle = currentValue > 0;
+-        }
+-        onCustomDurationAccepted: {
+-            root.profileSettings.dimDisplayIdleTimeoutSec = valueToUnit(
+-                customDuration.value, customDuration.unit, DurationPromptDialog.Unit.Seconds);
+-            root.profileSettings.dimDisplayWhenIdle = customDuration.value > 0;
+-        }
+-
+-        onConfiguredValueOptionMissing: {
+-            const unit = configuredValue % 60 === 0
+-                ? customDuration?.unit ?? DurationPromptDialog.Unit.Minutes
+-                : DurationPromptDialog.Unit.Seconds;
+-
+-            customOptions = [{
+-                seconds: configuredValue,
+-                text: translateSeconds(configuredValue, unit),
+-                unit: unit,
+-            }];
+-            customDuration = null;
+-        }
+-
+-        KCM.SettingStateBinding {
+-            configObject: root.profileSettings
+-            settingName: "DimDisplayIdleTimeoutSec"
+-        }
+-    }
+-
+-    Kirigami.InlineMessage {
+-        Kirigami.FormData.isSection: true
+-        visible: (
+-            dimDisplayIdleTimeoutCombo.visible
+-            && root.profileSettings.dimDisplayWhenIdle && root.profileSettings.turnOffDisplayWhenIdle
+-            && root.profileSettings.dimDisplayIdleTimeoutSec >= root.profileSettings.turnOffDisplayIdleTimeoutSec
+-            && root.profileSettings.dimDisplayIdleTimeoutSec >= root.profileSettings.turnOffDisplayIdleTimeoutWhenLockedSec
+-        )
+-        Layout.fillWidth: true
+-        type: Kirigami.MessageType.Warning
+-        text: i18nc("@info:status", "The screen will not be dimmed because it is configured to turn off sooner.")
++        Kirigami.FormData.label: i18nc("@title:group", "Screen")
++        visible: dimDisplayIdleTimeoutCombo.visible || turnOffDisplayRow.visible
+     }
+ 
+     RowLayout {
+@@ -587,6 +370,135 @@ Kirigami.FormLayout {
+         }
+     }
+ 
++
++    TimeDurationComboBox {
++        id: dimDisplayIdleTimeoutCombo
++        visible: kcm.supportedActions["DimDisplay"] === true
++        Layout.fillWidth: true
++        Kirigami.FormData.label: i18nc("@label:combobox Dim screen after X minutes", "Di&m automatically:")
++
++        durationPromptLabel: i18nc("@label:spinbox Dim screen after X minutes", "Di&m automatically after:")
++        durationPromptAcceptsUnits: [DurationPromptDialog.Unit.Seconds, DurationPromptDialog.Unit.Minutes]
++
++        function translateSeconds(n, formatUnit = DurationPromptDialog.Unit.Seconds) {
++            return formatUnit == DurationPromptDialog.Unit.Minutes
++                ? translateMinutes(n / 60) : i18ncp("@option:combobox", "%1 second", "%1 seconds", n);
++        }
++        function translateMinutes(n) { return i18ncp("@option:combobox", "%1 minute", "%1 minutes", n); }
++
++        valueRole: "seconds"
++        textRole: "text"
++        unitOfValueRole: DurationPromptDialog.Unit.Seconds
++        durationPromptFromValue: 10
++        presetOptions: [
++            { seconds: -1, text: i18nc("@option:combobox Dim screen automatically", "Never") },
++            { seconds: 30, text: translateSeconds(30), unit: DurationPromptDialog.Unit.Seconds },
++            { seconds: 1 * 60, text: translateMinutes(1), unit: DurationPromptDialog.Unit.Minutes },
++            { seconds: 2 * 60, text: translateMinutes(2), unit: DurationPromptDialog.Unit.Minutes },
++            { seconds: 5 * 60, text: translateMinutes(5), unit: DurationPromptDialog.Unit.Minutes },
++            { seconds: 10 * 60, text: translateMinutes(10), unit: DurationPromptDialog.Unit.Minutes },
++            { seconds: 15 * 60, text: translateMinutes(15), unit: DurationPromptDialog.Unit.Minutes },
++            { seconds: -2, text: i18nc("@option:combobox Choose a custom value outside the list of preset values", "Custom…") },
++        ]
++        customRequesterValue: -2
++        configuredValue: root.profileSettings.dimDisplayWhenIdle ? root.profileSettings.dimDisplayIdleTimeoutSec : -1
++        configuredDisplayUnit: model[indexOfValue(configuredValue)]?.unit ?? DurationPromptDialog.Unit.Minutes
++
++        onRegularValueActivated: {
++            root.profileSettings.dimDisplayIdleTimeoutSec = currentValue;
++            root.profileSettings.dimDisplayWhenIdle = currentValue > 0;
++        }
++        onCustomDurationAccepted: {
++            root.profileSettings.dimDisplayIdleTimeoutSec = valueToUnit(
++                customDuration.value, customDuration.unit, DurationPromptDialog.Unit.Seconds);
++            root.profileSettings.dimDisplayWhenIdle = customDuration.value > 0;
++        }
++
++        onConfiguredValueOptionMissing: {
++            const unit = configuredValue % 60 === 0
++                ? customDuration?.unit ?? DurationPromptDialog.Unit.Minutes
++                : DurationPromptDialog.Unit.Seconds;
++
++            customOptions = [{
++                seconds: configuredValue,
++                text: translateSeconds(configuredValue, unit),
++                unit: unit,
++            }];
++            customDuration = null;
++        }
++
++        KCM.SettingStateBinding {
++            configObject: root.profileSettings
++            settingName: "DimDisplayIdleTimeoutSec"
++        }
++    }
++
++    Kirigami.InlineMessage {
++        Kirigami.FormData.isSection: true
++        visible: (
++            dimDisplayIdleTimeoutCombo.visible
++            && root.profileSettings.dimDisplayWhenIdle && root.profileSettings.turnOffDisplayWhenIdle
++            && root.profileSettings.dimDisplayIdleTimeoutSec >= root.profileSettings.turnOffDisplayIdleTimeoutSec
++            && root.profileSettings.dimDisplayIdleTimeoutSec >= root.profileSettings.turnOffDisplayIdleTimeoutWhenLockedSec
++        )
++        Layout.fillWidth: true
++        type: Kirigami.MessageType.Warning
++        text: i18nc("@info:status", "The screen will not be dimmed because it is configured to turn off sooner.")
++    }
++
++
++    Item {
++        // ksr: kcm_powerdevilprofilesconfig/DisplayBrightness (was Display and Brightness)
++        Kirigami.FormData.isSection: true
++        Kirigami.FormData.label: i18nc("@title:group", "Brightness")
++        visible: kcm.supportedActions["ScreenBrightnessControl"] === true || kcm.supportedActions["KeyboardBrightnessControl"] === true
++    }
++
++    RowLayout {
++        Kirigami.FormData.label: i18nc("@label:slider Brightness level", "Change scr&een brightness:")
++        Kirigami.FormData.buddyFor: displayBrightnessCheck
++
++        visible: kcm.supportedActions["ScreenBrightnessControl"] === true
++        Layout.fillWidth: true
++        spacing: Kirigami.Units.smallSpacing
++
++        QQC2.CheckBox {
++            id: displayBrightnessCheck
++
++            KCM.SettingStateBinding {
++                configObject: root.profileSettings
++                settingName: "UseProfileSpecificDisplayBrightness"
++            }
++            checked: root.profileSettings.useProfileSpecificDisplayBrightness
++            onToggled: { root.profileSettings.useProfileSpecificDisplayBrightness = checked; }
++        }
++        QQC2.Slider {
++            id: displayBrightnessSlider
++            Layout.fillWidth: true
++            from: 1
++            to: 100
++            stepSize: 1
++
++            KCM.SettingStateBinding {
++                configObject: root.profileSettings
++                settingName: "DisplayBrightness"
++                extraEnabledConditions: displayBrightnessCheck.checked
++            }
++            value: root.profileSettings.displayBrightness
++            onMoved: { root.profileSettings.displayBrightness = value; }
++        }
++        QQC2.Label {
++            enabled: displayBrightnessCheck.checked
++            text: root.formatPercentageText(displayBrightnessSlider.value)
++            Layout.preferredWidth: displayBrightnessPercentageMetrics.width
++        }
++        TextMetrics {
++            id: displayBrightnessPercentageMetrics
++            text: root.formatPercentageText(100)
++        }
++    }
++
++
+     RowLayout {
+         Kirigami.FormData.label: i18nc("@label:slider Brightness level", "Change key&board brightness:")
+         Kirigami.FormData.buddyFor: keyboardBrightnessCheck
+@@ -631,13 +543,117 @@ Kirigami.FormLayout {
+         }
+     }
+ 
+-    //
+-    // Advanced customization options
+ 
+     Item {
++        // ksr: kcm_powerdevilprofilesconfig/PowerButtonAction (was Suspend Session)
+         Kirigami.FormData.isSection: true
+-        Kirigami.FormData.label: i18nc("@title:group", "Other Settings")
+-        visible: kcm.supportedActions["RunScript"] === true || powerProfileCombo.visible
++        Kirigami.FormData.label: i18nc("@title:group", "Buttons and lid")
++        visible: powerButtonActionCombo.visible || lidActionCombo.visible
++    }
++
++    Kirigami.InlineMessage {
++        Kirigami.FormData.isSection: true
++        visible: powerButtonActionCombo.visible && !powerButtonActionCombo.isConfiguredValueSupported
++        Layout.fillWidth: true
++        type: Kirigami.MessageType.Warning
++        text: i18nc("@info:status", "The action you had previously configured for when the power button is pressed is now unsupported on your system. Please select a different one.")
++    }
++
++    ComboBoxWithIcon {
++        id: powerButtonActionCombo
++        Kirigami.FormData.label: i18nc(
++            "@label:combobox Suspend action such as sleep/hibernate to perform when the power button is pressed",
++            "When &power button pressed:"
++        )
++        Accessible.name: i18nc("@accessible:name:combobox", "Action to perform when the power button is pressed")
++
++        visible: kcm.supportedActions["HandleButtonEvents"] === true && kcm.isPowerButtonPresent
++        Layout.fillWidth: true
++        implicitContentWidthPolicy: QQC2.ComboBox.WidestTextWhenCompleted
++
++        model: kcm.powerButtonActionModel
++        textRole: "name"
++        valueRole: "value"
++
++        readonly property bool isConfiguredValueSupported: currentValue === root.profileSettings.powerButtonAction
++
++        KCM.SettingStateBinding {
++            configObject: root.profileSettings
++            settingName: "PowerButtonAction"
++        }
++        Component.onCompleted: {
++            // indexOfValue() is invalid before onCompleted, so wait until here to bind currentIndex.
++            currentIndex = Qt.binding(() => indexOfValue(root.profileSettings.powerButtonAction));
++        }
++        onActivated: {
++            root.profileSettings.powerButtonAction = currentValue;
++        }
++    }
++
++    Kirigami.InlineMessage {
++        Kirigami.FormData.isSection: true
++        visible: lidActionCombo.visible && !lidActionCombo.isConfiguredValueSupported
++        Layout.fillWidth: true
++        type: Kirigami.MessageType.Warning
++        text: i18nc("@info:status", "The action you had previously configured for when the lid is closed is now unsupported on your system. Please select a different one.")
++    }
++
++    ComboBoxWithIcon {
++        id: lidActionCombo
++        Kirigami.FormData.label: i18nc(
++            "@label:combobox Suspend action such as sleep/hibernate to perform when the power button is pressed",
++            "When laptop &lid closed:"
++        )
++        Accessible.name: i18nc("@accessible:name:combobox", "Action to perform when the laptop lid is closed")
++
++        visible: kcm.supportedActions["HandleButtonEvents"] === true && kcm.isLidPresent
++        Layout.fillWidth: true
++        implicitContentWidthPolicy: QQC2.ComboBox.WidestTextWhenCompleted
++
++        model: kcm.lidActionModel
++        textRole: "name"
++        valueRole: "value"
++
++        readonly property bool isConfiguredValueSupported: currentValue === root.profileSettings.lidAction
++
++        KCM.SettingStateBinding {
++            configObject: root.profileSettings
++            settingName: "LidAction"
++        }
++        Component.onCompleted: {
++            // indexOfValue() is invalid before onCompleted, so wait until here to bind currentIndex.
++            currentIndex = Qt.binding(() => indexOfValue(root.profileSettings.lidAction));
++        }
++        onActivated: {
++            root.profileSettings.lidAction = currentValue;
++        }
++    }
++
++    QQC2.CheckBox {
++        id: triggersLidActionWhenExternalMonitorPresentCheck
++        text: i18nc(
++            "@text:checkbox Trigger laptop lid action even when an external monitor is connected",
++            "Even when an external monitor is connected"
++        )
++        Accessible.name: i18n("Perform laptop lid action even when an external monitor is connected")
++
++        visible: lidActionCombo.visible
++
++        KCM.SettingStateBinding {
++            configObject: root.profileSettings
++            settingName: "InhibitLidActionWhenExternalMonitorPresent"
++            extraEnabledConditions: lidActionCombo.currentValue !== PD.PowerDevil.PowerButtonAction.NoAction
++        }
++        checked: !root.profileSettings.inhibitLidActionWhenExternalMonitorPresent
++        onToggled: { root.profileSettings.inhibitLidActionWhenExternalMonitorPresent = !checked; }
++    }
++
++
++    Item {
++        // ksr: kcm_powerdevilprofilesconfig/PowerProfile (was Other Settings)
++        Kirigami.FormData.isSection: true
++        Kirigami.FormData.label: i18nc("@title:group", "Power profile")
++        visible: powerProfileCombo.visible
+     }
+ 
+     ComboBoxWithIcon {
+@@ -673,6 +689,14 @@ Kirigami.FormLayout {
+         }
+     }
+ 
++
++    Item {
++        // ksr: kcm_powerdevilprofilesconfig/ProfileLoadCommand (was Other Settings)
++        Kirigami.FormData.isSection: true
++        Kirigami.FormData.label: i18nc("@title:group", "Commands")
++        visible: addScriptCommandButton.visible || idleTimeoutCommandEdit.visible
++    }
++
+     QQC2.Button {
+         id: addScriptCommandButton
+         Kirigami.FormData.label: i18nc("@label:button", "Run command or script:")
+@@ -685,8 +709,9 @@ Kirigami.FormLayout {
+         icon.name: "settings-configure"
+         text: i18nc(
+             "@text:button Determine what will trigger a command or script to run in this power state",
+-            "Choose run conditions"
++            "Choose Run Conditions…"
+         )
++        // ksr: kcm_powerdevilprofilesconfig/RunConditions (was "Choose run conditions")
+         Accessible.name: i18nc("@accessible:name:button", "Choose run conditions for command or script")
+         Accessible.role: Accessible.ButtonMenu
+ 
+diff --git a/kcm/ui/RunScriptEdit.qml b/kcm/ui/RunScriptEdit.qml
+index 41cdfec..35ee055 100644
+--- a/kcm/ui/RunScriptEdit.qml
++++ b/kcm/ui/RunScriptEdit.qml
+@@ -51,6 +51,8 @@ FocusScope {
+         QQC2.Button {
+             id: selectFileButton
+             icon.name: "document-open"
++            // ksr: kcm_powerdevilprofilesconfig/Choose (unchanged)
++            // ksr: kcm_powerdevilprofilesconfig/x (script text field, unchanged)
+             text: i18nc("@action:button opens file picker", "Choose…")
+             Accessible.name: i18nc("@action:button opens file picker", "Choose script file")
+             onClicked: { fileDialogComponent.incubateObject(root); }
+diff --git a/kcm/ui/main.qml b/kcm/ui/main.qml
+index d4d856f..18a2115 100644
+--- a/kcm/ui/main.qml
++++ b/kcm/ui/main.qml
+@@ -16,7 +16,8 @@ KCM.AbstractKCM {
+     KCM.ConfigModule.buttons: KCM.ConfigModule.Default | KCM.ConfigModule.Apply | KCM.ConfigModule.Help
+ 
+     actions: Kirigami.Action {
+-        text: i18nc("@action:button", "Configure Advanced &Settings…")
++        // ksr: kcm_powerdevilprofilesconfig/ConfigureAdvanced (was "Configure Advanced Settings…")
++        text: i18nc("@action:button", "&Battery Levels and Charging…")
+         icon.name: "settings-configure"
+         enabled: kcm.powerManagementServiceRegistered
+         displayHint: Kirigami.DisplayHint.KeepVisible
+@@ -52,6 +53,7 @@ KCM.AbstractKCM {
+ 
+         Kirigami.NavigationTabBar {
+             id: profileTabBar
++            // ksr: kcm_powerdevilprofilesconfig/ProfileTabs (kept: the three power states are peers)
+ 
+             Layout.fillWidth: true
+             visible: kcm.supportsBatteryProfiles
+@@ -173,6 +175,7 @@ KCM.AbstractKCM {
+                         id: profileConfig
+                         profileId: profileTabBar.selectedProfile
+                         profileLabel: profileTabBar.profileInfo[profileTabBar.selectedProfile].label
++                        currentProfileLabel: kcm.currentProfile && profileTabBar.profileInfo[kcm.currentProfile] ? profileTabBar.profileInfo[kcm.currentProfile].label : ""
+ 
+                         width: tabContentContainer.width - 2 * Kirigami.Units.smallSpacing
+                         anchors.horizontalCenter: parent.horizontalCenter

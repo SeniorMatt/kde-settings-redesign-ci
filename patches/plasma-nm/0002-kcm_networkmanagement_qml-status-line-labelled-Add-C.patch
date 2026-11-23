@@ -1,0 +1,439 @@
+From b24318bc27f7f1453a2ff5475998ab75909be321 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 15:08:52 +0500
+Subject: [PATCH 2/2] kcm_networkmanagement_qml: status line, labelled
+ Add/Configure, NetworkManager reads after the first frame
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Same changes as kcm_networkmanagement (10d7b53) for the QML variant, so both look and read alike.
+Page type: List (connections) + editor; connection settings, handler and editor unchanged.
+
+Moved / renamed (ui/main.qml):
+- Status line first: PlasmaNM.NetworkStatus activeConnections or 'Not connected', created by a Loader 50 ms after open.
+- 'Add new connection' (icon-only, bottom) -> 'Add Connection…' labelled button beside the search field;
+  'Configure' (icon-only) -> 'Configure…' labelled. Forget and Export keep icons, now with Accessible.name.
+- Empty editor side shows 'Select a connection to see and change its settings.'
+- No inventory rows exist for this KCM id (it shares the rows of kcm_networkmanagement), so no markers beyond comments.
+
+Speed (from code, kcm.cpp constructor): before the first frame it ran NetworkManager::networkInterfaces() (blocking
+GetDevices + per-device properties), primaryConnection()/listConnections() with a sort over all connections, and
+onSelectedConnectionChanged(), which loads the whole editor for the preselected connection. All of that now runs in
+startDeferredWork(), 100 ms after construction (single-shot; skipped when a connection is already selected, e.g. by launch
+argument or click). useApMode (read by nothing in QML; Handler computes its own) now has a NOTIFY signal.
+Not changed: KcmIdentityModel / creatable models still built with main.qml. After: pending, manager will measure.
+
+HIG: HIG-001, HIG-005, HIG-006, HIG-017, HIG-019, HIG-020.
+
+Not built yet. Uncertain: 100 ms is a guess for 'after the first frame' (no afterRendering hook in KQuickConfigModule
+checked); anchors of search field vs Add button; NetworkStatus import in this module.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/kcm_connections_qml/kcm.cpp     | 187 +++++++++++++++------------
+ kcms/kcm_connections_qml/kcm.h       |   4 +-
+ kcms/kcm_connections_qml/ui/main.qml | 102 +++++++++++----
+ 3 files changed, 181 insertions(+), 112 deletions(-)
+
+diff --git a/kcms/kcm_connections_qml/kcm.cpp b/kcms/kcm_connections_qml/kcm.cpp
+index efe5e0c..4fd03a3 100644
+--- a/kcms/kcm_connections_qml/kcm.cpp
++++ b/kcms/kcm_connections_qml/kcm.cpp
+@@ -117,91 +117,8 @@ KCMNetworkManagementQml::KCMNetworkManagementQml(QObject *parent, const KPluginM
+     connect(this, &KCMNetworkManagementQml::vpnServiceTypeChanged, this, &KCMNetworkManagementQml::connectionValidChanged);
+     connect(this, &KCMNetworkManagementQml::wiredSecurityEnabledChanged, this, &KCMNetworkManagementQml::connectionValidChanged);
+ 
+-    // Check if we can use AP mode to identify security type
+-    bool foundInactive = false;
+-    NetworkManager::WirelessDevice::Ptr wifiDev;
+-
+-    for (const NetworkManager::Device::Ptr &device : NetworkManager::networkInterfaces()) {
+-        if (device->type() == NetworkManager::Device::Wifi) {
+-            wifiDev = device.objectCast<NetworkManager::WirelessDevice>();
+-            if (wifiDev) {
+-                if (!wifiDev->isActive()) {
+-                    foundInactive = true;
+-                } else {
+-                    // Prefer previous device if it was inactive
+-                    if (foundInactive) {
+-                        break;
+-                    }
+-                }
+-
+-                if (wifiDev->wirelessCapabilities().testFlag(NetworkManager::WirelessDevice::ApCap)) {
+-                    m_useApMode = true;
+-                }
+-
+-                // We prefer inactive wireless card with AP capabilities
+-                if (foundInactive && m_useApMode) {
+-                    break;
+-                }
+-            }
+-        }
+-    }
+-
+-    NetworkManager::Connection::Ptr selectedConnection;
+-
+-    // Pre-select the currently active primary connection
+-    if (auto active = NetworkManager::primaryConnection(); active && active->isValid()) {
+-        selectedConnection = active->connection();
+-        if (selectedConnection) {
+-            qCDebug(PLASMA_NM_KCM_QML_LOG) << "Selecting active connection:" << selectedConnection->uuid();
+-        }
+-    }
+-
+-    // Select the very first connection as a fallback
+-    if (!selectedConnection || !selectedConnection->isValid()) {
+-        NetworkManager::Connection::List connectionList = NetworkManager::listConnections();
+-        std::sort(connectionList.begin(), connectionList.end(), [](const NetworkManager::Connection::Ptr &left, const NetworkManager::Connection::Ptr &right) {
+-            const QString leftName = left->settings()->id();
+-            const UiUtils::SortedConnectionType leftType = UiUtils::connectionTypeToSortedType(left->settings()->connectionType());
+-            const QDateTime leftDate = left->settings()->timestamp();
+-
+-            const QString rightName = right->settings()->id();
+-            const UiUtils::SortedConnectionType rightType = UiUtils::connectionTypeToSortedType(right->settings()->connectionType());
+-            const QDateTime rightDate = right->settings()->timestamp();
+-
+-            if (leftType < rightType) {
+-                return true;
+-            } else if (leftType > rightType) {
+-                return false;
+-            }
+-
+-            if (leftDate > rightDate) {
+-                return true;
+-            } else if (leftDate < rightDate) {
+-                return false;
+-            }
+-
+-            if (QString::localeAwareCompare(leftName, rightName) > 0) {
+-                return true;
+-            } else {
+-                return false;
+-            }
+-        });
+-
+-        for (const NetworkManager::Connection::Ptr &connection : connectionList) {
+-            const NetworkManager::ConnectionSettings::ConnectionType type = connection->settings()->connectionType();
+-            if (UiUtils::isConnectionTypeSupported(type)) {
+-                selectedConnection = connection;
+-                qCDebug(PLASMA_NM_KCM_QML_LOG) << "Selecting first connection:" << connection->uuid();
+-                break;
+-            }
+-        }
+-    }
+-
+-    if (selectedConnection && selectedConnection->isValid()) {
+-        onSelectedConnectionChanged(selectedConnection->path());
+-    } else {
+-        qCDebug(PLASMA_NM_KCM_QML_LOG) << "Cannot preselect a connection";
+-    }
++    // NetworkManager is read after the first frame (blocking GetDevices/listConnections calls), see startDeferredWork()
++    QTimer::singleShot(100, this, &KCMNetworkManagementQml::startDeferredWork);
+ 
+     connect(m_wifiSecurity, &WifiSecuritySetting::validChanged, this, [this]() {
+         if (m_wifiSecurity->isValid()) {
+@@ -349,6 +266,106 @@ KCMNetworkManagementQml::KCMNetworkManagementQml(QObject *parent, const KPluginM
+     m_timer->start();
+ }
+ 
++void KCMNetworkManagementQml::startDeferredWork()
++{
++    // Check if we can use AP mode to identify security type
++    bool foundInactive = false;
++    bool useApMode = false;
++    NetworkManager::WirelessDevice::Ptr wifiDev;
++
++    for (const NetworkManager::Device::Ptr &device : NetworkManager::networkInterfaces()) {
++        if (device->type() == NetworkManager::Device::Wifi) {
++            wifiDev = device.objectCast<NetworkManager::WirelessDevice>();
++            if (wifiDev) {
++                if (!wifiDev->isActive()) {
++                    foundInactive = true;
++                } else {
++                    // Prefer previous device if it was inactive
++                    if (foundInactive) {
++                        break;
++                    }
++                }
++
++                if (wifiDev->wirelessCapabilities().testFlag(NetworkManager::WirelessDevice::ApCap)) {
++                    useApMode = true;
++                }
++
++                // We prefer inactive wireless card with AP capabilities
++                if (foundInactive && useApMode) {
++                    break;
++                }
++            }
++        }
++    }
++
++    if (useApMode != m_useApMode) {
++        m_useApMode = useApMode;
++        Q_EMIT useApModeChanged();
++    }
++
++    NetworkManager::Connection::Ptr selectedConnection;
++
++    // The user (or a launch argument) may already have chosen a connection while we waited
++    if (!m_currentConnectionPath.isEmpty()) {
++        return;
++    }
++
++    // Pre-select the currently active primary connection
++    if (auto active = NetworkManager::primaryConnection(); active && active->isValid()) {
++        selectedConnection = active->connection();
++        if (selectedConnection) {
++            qCDebug(PLASMA_NM_KCM_QML_LOG) << "Selecting active connection:" << selectedConnection->uuid();
++        }
++    }
++
++    // Select the very first connection as a fallback
++    if (!selectedConnection || !selectedConnection->isValid()) {
++        NetworkManager::Connection::List connectionList = NetworkManager::listConnections();
++        std::sort(connectionList.begin(), connectionList.end(), [](const NetworkManager::Connection::Ptr &left, const NetworkManager::Connection::Ptr &right) {
++            const QString leftName = left->settings()->id();
++            const UiUtils::SortedConnectionType leftType = UiUtils::connectionTypeToSortedType(left->settings()->connectionType());
++            const QDateTime leftDate = left->settings()->timestamp();
++
++            const QString rightName = right->settings()->id();
++            const UiUtils::SortedConnectionType rightType = UiUtils::connectionTypeToSortedType(right->settings()->connectionType());
++            const QDateTime rightDate = right->settings()->timestamp();
++
++            if (leftType < rightType) {
++                return true;
++            } else if (leftType > rightType) {
++                return false;
++            }
++
++            if (leftDate > rightDate) {
++                return true;
++            } else if (leftDate < rightDate) {
++                return false;
++            }
++
++            if (QString::localeAwareCompare(leftName, rightName) > 0) {
++                return true;
++            } else {
++                return false;
++            }
++        });
++
++        for (const NetworkManager::Connection::Ptr &connection : connectionList) {
++            const NetworkManager::ConnectionSettings::ConnectionType type = connection->settings()->connectionType();
++            if (UiUtils::isConnectionTypeSupported(type)) {
++                selectedConnection = connection;
++                qCDebug(PLASMA_NM_KCM_QML_LOG) << "Selecting first connection:" << connection->uuid();
++                break;
++            }
++        }
++    }
++
++    if (selectedConnection && selectedConnection->isValid()) {
++        onSelectedConnectionChanged(selectedConnection->path());
++    } else {
++        qCDebug(PLASMA_NM_KCM_QML_LOG) << "Cannot preselect a connection";
++    }
++}
++
+ KCMNetworkManagementQml::~KCMNetworkManagementQml() = default;
+ 
+ IPv4Settings *KCMNetworkManagementQml::ipv4Settings() const
+diff --git a/kcms/kcm_connections_qml/kcm.h b/kcms/kcm_connections_qml/kcm.h
+index fc8b9fb..ea43b4d 100644
+--- a/kcms/kcm_connections_qml/kcm.h
++++ b/kcms/kcm_connections_qml/kcm.h
+@@ -45,7 +45,7 @@ class KCMNetworkManagementQml : public KQuickConfigModule
+     Q_PROPERTY(WifiSecuritySetting *wifiSecurity READ wifiSecurity CONSTANT)
+     Q_PROPERTY(Handler *handler READ handler CONSTANT)
+     Q_PROPERTY(Security8021xSetting *security8021xSetting READ security8021xSetting CONSTANT)
+-    Q_PROPERTY(bool useApMode READ useApMode CONSTANT)
++    Q_PROPERTY(bool useApMode READ useApMode NOTIFY useApModeChanged)
+     Q_PROPERTY(ConnectionStatus *connectionStatus READ connectionStatus CONSTANT)
+     Q_PROPERTY(Enums::ConnectionType connectionType READ connectionType NOTIFY connectionTypeChanged)
+     Q_PROPERTY(GeneralSetting *generalSettings READ generalSettings CONSTANT)
+@@ -125,6 +125,7 @@ public Q_SLOTS:
+     void save() override;
+ 
+ Q_SIGNALS:
++    void useApModeChanged();
+     void connectionLoaded(const QString &path);
+ 
+     void newConnectionRequested();
+@@ -160,6 +161,7 @@ Q_SIGNALS:
+ private Q_SLOTS:
+     void onConnectionAdded(const QString &connection);
+     void onSecretsArrived(QDBusPendingCallWatcher *watcher);
++    void startDeferredWork();
+ 
+ private:
+     struct ImportResult {
+diff --git a/kcms/kcm_connections_qml/ui/main.qml b/kcms/kcm_connections_qml/ui/main.qml
+index 6ee8e8c..7def0a6 100644
+--- a/kcms/kcm_connections_qml/ui/main.qml
++++ b/kcms/kcm_connections_qml/ui/main.qml
+@@ -106,17 +106,52 @@ Kirigami.Page {
+         Item {
+             id: leftPanel
+             Layout.fillHeight: true
+-            Layout.fillWidth: !rightPanel.visible
++            Layout.fillWidth: false
+             Layout.preferredWidth: Kirigami.Units.gridUnit * 15
+ 
+-            Kirigami.SearchField {
+-                id: searchField
++            // State first: what the computer is connected to. Created shortly after the first frame, because it
++            // reads the NetworkManager state again (same as kcm_networkmanagement).
++            Loader {
++                id: statusLoader
+ 
++                active: false
+                 anchors {
+                     left: parent.left
+                     right: parent.right
+                     top: parent.top
++                    margins: item ? Kirigami.Units.smallSpacing : 0
++                }
++                height: item ? item.implicitHeight : 0
++
++                sourceComponent: QQC2.Label {
++                    wrapMode: Text.Wrap
++                    elide: Text.ElideRight
++                    maximumLineCount: 3
++                    font.weight: Font.DemiBold
++                    text: nmStatus.activeConnections !== "" ? nmStatus.activeConnections : i18nc("@info:status", "Not connected")
++                    textFormat: Text.PlainText
++
++                    PlasmaNM.NetworkStatus {
++                        id: nmStatus
++                    }
++                }
++            }
++
++            Timer {
++                interval: 50
++                running: true
++                onTriggered: statusLoader.active = true
++            }
++
++            Kirigami.SearchField {
++                id: searchField
++
++                anchors {
++                    left: parent.left
++                    right: addConnectionButton.left
++                    top: statusLoader.bottom
+                 }
++                KeyNavigation.right: addConnectionButton
+                 Keys.onDownPressed: event => {
+                     connectionView.currentIndex = 0;
+                     event.accepted = false; // pass to KeyNavigation
+@@ -128,6 +163,26 @@ Kirigami.Page {
+                 }
+             }
+ 
++            // ksr: kcm_networkmanagement_qml/AddNewConnection (icon-only "+" at the bottom -> labelled button beside the search field)
++            QQC2.ToolButton {
++                id: addConnectionButton
++
++                anchors {
++                    right: parent.right
++                    verticalCenter: searchField.verticalCenter
++                }
++
++                text: i18nc("@action:button Opens the list of connection types to add", "Add Connection…")
++                display: QQC2.AbstractButton.TextBesideIcon
++                icon.name: "list-add"
++
++                KeyNavigation.down: scrollView
++
++                onClicked: {
++                    addNewConnectionDialog.show();
++                }
++            }
++
+             QQC2.ScrollView {
+                 id: scrollView
+ 
+@@ -205,15 +260,13 @@ Kirigami.Page {
+                 spacing: Kirigami.Units.smallSpacing
+ 
+                 QQC2.ToolButton {
++                    // ksr: kcm_networkmanagement_qml/ConfigureButton ("Configure" icon-only -> "Configure…")
+                     id: configureButton
+-                    text: QQC2.ToolTip.text
+-                    display: QQC2.AbstractButton.IconOnly
++                    text: i18nc("@action:button Opens connection settings", "Configure…")
++                    display: QQC2.AbstractButton.TextBesideIcon
+                     icon.name: "configure"
+ 
+-                    KeyNavigation.right: addConnectionButton
+-
+-                    QQC2.ToolTip.text: i18nc("@action:button", "Configure")
+-                    QQC2.ToolTip.visible: hovered
++                    KeyNavigation.right: removeConnectionButton
+ 
+                     onClicked: {
+                         root.showConfigurationDialog();
+@@ -231,23 +284,6 @@ Kirigami.Page {
+                 }
+                 spacing: Kirigami.Units.smallSpacing
+ 
+-                QQC2.ToolButton {
+-                    id: addConnectionButton
+-
+-                    text: QQC2.ToolTip.text
+-                    display: QQC2.AbstractButton.IconOnly
+-                    icon.name: "list-add"
+-
+-                    KeyNavigation.right: removeConnectionButton
+-
+-                    QQC2.ToolTip.text: i18nc("@action:button", "Add new connection")
+-                    QQC2.ToolTip.visible: hovered
+-
+-                    onClicked: {
+-                        addNewConnectionDialog.show();
+-                    }
+-                }
+-
+                 QQC2.ToolButton {
+                     id: removeConnectionButton
+ 
+@@ -258,6 +294,7 @@ Kirigami.Page {
+ 
+                     KeyNavigation.right: exportConnectionButton
+ 
++                    Accessible.name: QQC2.ToolTip.text
+                     QQC2.ToolTip.text: i18nc("@action:button", "Forget selected connection")
+                     QQC2.ToolTip.visible: hovered
+ 
+@@ -276,6 +313,7 @@ Kirigami.Page {
+                     enabled: connectionView.currentConnectionExportable
+                     icon.name: "document-export"
+ 
++                    Accessible.name: QQC2.ToolTip.text
+                     QQC2.ToolTip.text: i18nc("@action:button", "Export selected connection")
+                     QQC2.ToolTip.visible: hovered
+ 
+@@ -286,6 +324,18 @@ Kirigami.Page {
+             }
+         }
+ 
++        // Empty state of the editor side
++        QQC2.Label {
++            Layout.fillWidth: true
++            Layout.fillHeight: true
++            visible: !rightPanel.visible
++            enabled: false
++            horizontalAlignment: Text.AlignHCenter
++            verticalAlignment: Text.AlignVCenter
++            wrapMode: Text.Wrap
++            text: i18nc("@info:placeholder", "Select a connection to see and change its settings.")
++        }
++
+         ColumnLayout {
+             id: rightPanel
+ 

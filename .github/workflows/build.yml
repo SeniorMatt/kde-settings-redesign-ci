@@ -1,0 +1,139 @@
+name: build
+on:
+  # Runs only when started (gh workflow run ... -f repos="..."): a push alone would build everything.
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: branch or commit of this repo to build
+        default: main
+      repos:
+        description: space-separated repos to build (empty = all); smoke only opens the pages of the repos built
+        default: ''
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - id: m
+        run: |
+          all=$(tail -n +2 patches/series.tsv | cut -f1 | tr '\n' ' ')   # every repo that has patches
+          want="${{ inputs.repos }}"; [ -n "$want" ] || want="$all"
+          # systemsettings-bench is the shell the smoke job drives: always built
+          case " $want " in *" systemsettings-bench "*) ;; *) want="$want systemsettings-bench" ;; esac
+          for r in $want; do case " $all " in *" $r "*) ;; *) echo "unknown repo $r"; exit 1 ;; esac; done
+          echo "matrix=$(printf '%s\n' $want | sort -u | jq -R . | jq -sc '{repo: .}')" >> $GITHUB_OUTPUT
+
+  env:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - id: k
+        run: echo "key=env-${{ hashFiles('ci/make-env.sh', 'ci/data/packages.txt', 'ci/data/extra-packages.txt') }}" >> $GITHUB_OUTPUT
+      - id: cache
+        uses: actions/cache@v4
+        with:
+          path: env.tar.zst
+          key: ${{ steps.k.outputs.key }}
+          lookup-only: true
+      - if: steps.cache.outputs.cache-hit != 'true'
+        run: ci/free-disk.sh
+      - if: steps.cache.outputs.cache-hit != 'true'
+        run: ci/make-env.sh env.tar.zst
+      # the cache is saved by actions/cache's post step when the key was missing
+
+  build:
+    needs: [env, plan]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - id: k
+        run: echo "key=env-${{ hashFiles('ci/make-env.sh', 'ci/data/packages.txt', 'ci/data/extra-packages.txt') }}" >> $GITHUB_OUTPUT
+      - run: ci/free-disk.sh
+      - uses: actions/cache/restore@v4
+        with:
+          path: env.tar.zst
+          key: ${{ steps.k.outputs.key }}
+          fail-on-cache-miss: true
+      - run: zstd -dc env.tar.zst | docker import - ksr-env && rm env.tar.zst
+      - id: base
+        run: echo "sha=$(awk -F'\t' -v r='${{ matrix.repo }}' '$1==r{print $3}' patches/series.tsv)" >> $GITHUB_OUTPUT
+      # compiler cache per repo: exact key = repo + base commit (kept as it was first saved), else the newest of the repo
+      - uses: actions/cache@v4
+        with:
+          path: ccache/${{ matrix.repo }}
+          key: ccache-${{ matrix.repo }}-${{ steps.base.outputs.sha }}
+          restore-keys: ccache-${{ matrix.repo }}-
+      - name: build ${{ matrix.repo }}
+        run: |
+          mkdir -p out
+          docker run --rm -v "$PWD":/ci ksr-env bash /ci/ci/build-repo.sh '${{ matrix.repo }}'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-${{ matrix.repo }}
+          path: |
+            out/${{ matrix.repo }}/plugins
+            out/${{ matrix.repo }}/lib
+            out/${{ matrix.repo }}/stage
+            out/${{ matrix.repo }}/error.log
+            out/${{ matrix.repo }}/build.log
+          if-no-files-found: ignore
+
+  smoke:
+    needs: [env, build]
+    if: ${{ !cancelled() && needs.env.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - id: k
+        run: echo "key=env-${{ hashFiles('ci/make-env.sh', 'ci/data/packages.txt', 'ci/data/extra-packages.txt') }}" >> $GITHUB_OUTPUT
+      - run: ci/free-disk.sh
+      - uses: actions/cache/restore@v4
+        with:
+          path: env.tar.zst
+          key: ${{ steps.k.outputs.key }}
+          fail-on-cache-miss: true
+      - run: zstd -dc env.tar.zst | docker import - ksr-env && rm env.tar.zst
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: build-*
+          path: out
+      - name: fix artifact layout
+        run: |
+          # each artifact holds plugins/, stage/ ... directly under out/build-<repo>/
+          for d in out/build-*; do mv "$d" "out/${d#out/build-}"; done
+          ls out
+      - name: open every page
+        run: |
+          mkdir -p res
+          docker run --rm -v "$PWD":/ci --shm-size=1g ksr-env bash /ci/ci/smoke.sh 2>&1 | tail -80
+      - name: before pass (stock systemsettings, same pages)
+        continue-on-error: true
+        run: docker run --rm -v "$PWD":/ci --shm-size=1g ksr-env bash /ci/ci/smoke-before.sh 2>&1 | tail -20
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: smoke-results
+          path: |
+            res/shots
+            res/shots-before
+            res/before-*.log
+            res/smoke.tsv
+            res/qml-errors.txt
+            res/pages-built.txt
+            res/*.log
+          if-no-files-found: ignore

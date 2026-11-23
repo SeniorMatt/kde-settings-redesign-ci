@@ -1,0 +1,30 @@
+From b5af8bdf9ebac5565e92757bc12b5440eab31b06 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 08:00:14 +0500
+Subject: [PATCH 22/34] bench: optional screenshots (KSR_SHOT_DIR)
+
+---
+ app/SidebarMode.cpp | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/app/SidebarMode.cpp b/app/SidebarMode.cpp
+index 0662049..e46ccc9 100644
+--- a/app/SidebarMode.cpp
++++ b/app/SidebarMode.cpp
+@@ -1013,6 +1013,16 @@ void SidebarMode::ksrBench()
+                                .arg(*quiet >= 3 ? *quietStart : -1)
+                                .toUtf8());
+                 out->flush();
++                const QString shotDir = qEnvironmentVariable("KSR_SHOT_DIR");
++                if (!shotDir.isEmpty() && round == 1) {
++                    // let late async content (models filled over D-Bus etc.) arrive before the picture
++                    QTimer::singleShot(qEnvironmentVariableIntValue("KSR_SHOT_WAIT") > 0 ? qEnvironmentVariableIntValue("KSR_SHOT_WAIT") : 1500,
++                                       this, [this, shotDir, id, next] {
++                                           d->mainWidget->window()->grab().save(shotDir + u'/' + id + QStringLiteral(".png"));
++                                           (*next)();
++                                       });
++                    return;
++                }
+                 QTimer::singleShot(400, this, [next] { (*next)(); });
+                 return;
+             }

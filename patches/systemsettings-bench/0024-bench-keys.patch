@@ -1,0 +1,62 @@
+From 3bd82f1f46f28654d0201cdc7c87a5730d941ebb Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 08:33:49 +0500
+Subject: [PATCH 24/34] bench: keys
+
+---
+ app/SidebarMode.cpp | 28 ++++++++++++++++++++++++++++
+ 1 file changed, 28 insertions(+)
+
+diff --git a/app/SidebarMode.cpp b/app/SidebarMode.cpp
+index f612722..c379281 100644
+--- a/app/SidebarMode.cpp
++++ b/app/SidebarMode.cpp
+@@ -6,6 +6,7 @@
+  */
+ 
+ #include "SidebarMode.h"
++using namespace Qt::StringLiterals;
+ 
+ #include "MenuItem.h"
+ #include "MenuModel.h"
+@@ -31,6 +32,8 @@
+ #include <QAction>
+ #include <QElapsedTimer>
+ #include <QFile>
++#include <QKeyEvent>
++#include <QHash>
+ #include <QTimer>
+ #include <functional>
+ #include <memory>
+@@ -184,6 +187,31 @@ SidebarMode::SidebarMode(QObject *parent,
+     qmlRegisterAnonymousType<QAbstractItemModel>("", 1);
+     initEvent();
+     connect(moduleView(), &ModuleView::moduleChanged, this, &SidebarMode::viewChanged);
++    if (qEnvironmentVariableIsSet("KSR_KEYS")) {
++        // measurement-only: send keys to the sidebar one by one, picture after each
++        auto keys = std::make_shared<QStringList>(qEnvironmentVariable("KSR_KEYS").split(u','));
++        auto n = std::make_shared<int>(0);
++        auto step = std::make_shared<std::function<void()>>();
++        *step = [this, keys, n, step]() {
++            if (keys->isEmpty()) {
++                QCoreApplication::quit();
++                return;
++            }
++            const QString name = keys->takeFirst();
++            static const QHash<QString, int> map{{u"Down"_s, Qt::Key_Down}, {u"Up"_s, Qt::Key_Up}, {u"Left"_s, Qt::Key_Left}, {u"Right"_s, Qt::Key_Right},
++                                                 {u"Enter"_s, Qt::Key_Return}, {u"Tab"_s, Qt::Key_Tab}};
++            QQuickWindow *win = d->quickWidget->quickWindow();
++            QKeyEvent press(QEvent::KeyPress, map.value(name), Qt::NoModifier);
++            QKeyEvent release(QEvent::KeyRelease, map.value(name), Qt::NoModifier);
++            QCoreApplication::sendEvent(win, &press);
++            QCoreApplication::sendEvent(win, &release);
++            QTimer::singleShot(1200, this, [this, n, step] {
++                d->mainWidget->window()->grab().save(qEnvironmentVariable("KSR_SHOT_DIR", u"/tmp"_s) + u"/keys-%1.png"_s.arg(++*n));
++                (*step)();
++            });
++        };
++        QTimer::singleShot(4000, this, [step] { (*step)(); });
++    }
+     if (qEnvironmentVariableIsSet("KSR_SEARCH")) {
+         // measurement-only: type a search, optionally open the first result (KSR_SEARCH_OPEN), save a picture
+         QTimer::singleShot(4000, this, [this] {

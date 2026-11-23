@@ -1,0 +1,263 @@
+From 8cc17e3cd5121b099a8181cba806b78c45468456 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 14:23:54 +0500
+Subject: [PATCH] kcm_pulseaudio: Sound page: devices first, app streams built
+ after them, toolbar actions become links, module options on a sub-page
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Page type: Device-style list of output and input devices (peers), then apps. PulseAudio/PipeWire models, kcfg
+(GlobalConfig), speaker/microphone tests and module settings behaviour unchanged. NOT BUILT YET (owner stopped heavy
+work); checked statically only.
+
+Moved / renamed:
+- Toolbar (Show Inactive Devices switch, Rename Devices…, Configure Volume Controls…, Configure… menu) is gone. A link
+  row now ends the output section: "Show inactive devices" checkbox, "Volume Controls…", "Rename Devices…" (PipeWire +
+  WirePlumber only, as before), "Output Behavior…" (PulseAudio only, as before: Server.isPipeWire false).
+- "Configure…" menu (two checkable actions) -> new sub-page ui/OutputBehavior.qml, a FormLayout with the same two texts;
+  disabled with a "Requires module-gsettings PulseAudio module" hint when the module is not loaded (was the toolbar tooltip).
+- Section titles: Playback Devices -> Output Devices, Recording Devices -> Input Devices, Inactive Cards -> Unused Sound
+  Cards, Playback Streams -> Apps Playing Sound, Recording Streams -> Apps Recording Sound (user words; old names go to
+  the page aliases in ia/layout.json).
+- The device rows (default radio + volume first, then Port/Profile/Test/Show Channels) are unchanged; a per-device
+  sub-page was not attempted without a build.
+HIG ids: HIG-001/005/006, HIG-023, HIG-057; page-design.md 1, 2, 4, 6, 7.
+
+Speed cause (code evidence): the first frame built ModuleManager (3 GSettingsItem objects, g_settings schema lookups and
+a module scan: modulemanager.cpp ctor) although it is PulseAudio-only and only used by a menu; now created on its
+sub-page only. The streams (StreamRestoreModel, SinkInputModel, SourceOutputModel and their level-meter delegates) sat in
+the same ColumnLayout as the devices; they now sit in a Loader { asynchronous: true } built after the device lists. No
+sync D-Bus exists in src/kcm. The two OverlaySheets (speaker/microphone test) are still created up front; making them lazy
+needs the testSink()/testSource() ids reworked, not done. After-numbers: pending, manager will measure. Not built yet.
+Unconfirmed: Loader inside ColumnLayout taking its height from the async-loaded ColumnLayout (width bound to parent.width);
+ids sinkInputView/eventStreamView resolving from StreamListItem inside the Component; Flow with Layout.fillWidth.
+inventory_check --strict lists 13 unchanged weak-anchor rows in files not touched (DeviceListItem etc.); non-strict is 0 lost.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ src/kcm/ui/OutputBehavior.qml |  49 +++++++++++++++
+ src/kcm/ui/main.qml           | 112 +++++++++++++++++-----------------
+ 2 files changed, 105 insertions(+), 56 deletions(-)
+ create mode 100644 src/kcm/ui/OutputBehavior.qml
+
+diff --git a/src/kcm/ui/OutputBehavior.qml b/src/kcm/ui/OutputBehavior.qml
+new file mode 100644
+index 0000000..6fde372
+--- /dev/null
++++ b/src/kcm/ui/OutputBehavior.qml
+@@ -0,0 +1,49 @@
++/*
++    SPDX-FileCopyrightText: 2016 David Edmundson <davidedmundson@kde.org>
++
++    SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++*/
++
++import QtQuick
++import QtQuick.Layouts
++import QtQuick.Controls as QQC2
++import org.kde.kcmutils as KCM
++import org.kde.kirigami as Kirigami
++import org.kde.plasma.private.volume
++
++// Sub-page of Sound (kcm.push), PulseAudio only. These two options were the "Configure…" menu in the toolbar. The
++// ModuleManager (three GSettings items and a module scan) is created only when this page is opened.
++KCM.SimpleKCM {
++    id: root
++
++    title: i18nd("kcm_pulseaudio", "Output Behavior")
++
++    ModuleManager {
++        id: moduleManager
++    }
++
++    Kirigami.FormLayout {
++        QQC2.CheckBox {
++            enabled: moduleManager.configModuleLoaded
++            text: i18nd("kcm_pulseaudio", "Add virtual output device for simultaneous output on all local sound cards") // ksr: kcm_pulseaudio/combineSinks
++            checked: moduleManager.combineSinks
++            onToggled: moduleManager.combineSinks = checked
++        }
++
++        QQC2.CheckBox {
++            enabled: moduleManager.configModuleLoaded
++            text: i18nd("kcm_pulseaudio", "Automatically switch all running streams when a new output becomes available") // ksr: kcm_pulseaudio/switchOnConnect
++            checked: moduleManager.switchOnConnect
++            onToggled: moduleManager.switchOnConnect = checked
++        }
++
++        QQC2.Label {
++            Layout.fillWidth: true
++            Layout.maximumWidth: Kirigami.Units.gridUnit * 20
++            visible: !moduleManager.configModuleLoaded
++            text: i18nd("kcm_pulseaudio", "Requires %1 PulseAudio module", moduleManager.configModuleName)
++            font: Kirigami.Theme.smallFont
++            wrapMode: Text.Wrap
++        }
++    }
++}
+diff --git a/src/kcm/ui/main.qml b/src/kcm/ui/main.qml
+index 140954d..d4acdf0 100644
+--- a/src/kcm/ui/main.qml
++++ b/src/kcm/ui/main.qml
+@@ -60,57 +60,6 @@ KCM.ScrollViewKCM {
+         sourceModel: paSourceModel
+     }
+ 
+-    ModuleManager {
+-        id: moduleManager
+-    }
+-
+-    actions: [
+-        Kirigami.Action {
+-            id: inactiveDevicesSwitch
+-            icon.name: "view-visible"
+-            visible: (paSourceModel.count != paSourceFilterModel.count) || (paSinkModel.count != paSinkFilterModel.count)
+-
+-            displayComponent: Switch {
+-                text: i18nd("kcm_pulseaudio", "Show Inactive Devices")
+-
+-                onToggled: inactiveDevicesSwitch.checked = checked
+-            }
+-        },
+-        Kirigami.Action {
+-            icon.name: "edit-rename-symbolic"
+-            text: i18nd("kcm_pulseaudio", "Rename Devices…")
+-            visible: Server.hasWirePlumber && Server.isPipeWire
+-            onTriggered: kcm.push("RenameDevices.qml", { "config": config })
+-        },
+-        Kirigami.Action {
+-            icon.name: "configure"
+-            text: i18nd("kcm_pulseaudio", "Configure Volume Controls…")
+-            onTriggered: kcm.push("VolumeControlsConfig.qml", { "config": config })
+-        },
+-        Kirigami.Action {
+-            id: configureButton
+-            visible: moduleManager.settingsSupported
+-            enabled: moduleManager.configModuleLoaded
+-            text: i18nd("kcm_pulseaudio", "Configure…")
+-            icon.name: "configure"
+-
+-            tooltip: i18nd("kcm_pulseaudio", "Requires %1 PulseAudio module", moduleManager.configModuleName)
+-
+-            Kirigami.Action {
+-                text: i18nd("kcm_pulseaudio", "Add virtual output device for simultaneous output on all local sound cards")
+-                checkable: true
+-                checked: moduleManager.combineSinks
+-                onToggled: moduleManager.combineSinks = checked
+-            }
+-            Kirigami.Action {
+-                text: i18nd("kcm_pulseaudio", "Automatically switch all running streams when a new output becomes available")
+-                checkable: true
+-                checked: moduleManager.switchOnConnect
+-                onToggled: moduleManager.switchOnConnect = checked
+-            }
+-        }
+-    ]
+-
+     view: Flickable {
+         id: flickable
+ 
+@@ -140,7 +89,7 @@ KCM.ScrollViewKCM {
+             Kirigami.ListSectionHeader {
+                 Layout.fillWidth: true
+                 visible: sinks.visible
+-                text: i18nd("kcm_pulseaudio", "Playback Devices")
++                text: i18nd("kcm_pulseaudio", "Output Devices")
+             }
+ 
+             ListView {
+@@ -161,10 +110,43 @@ KCM.ScrollViewKCM {
+                 }
+             }
+ 
++            // Links out and the view filter: the former toolbar actions, now at the end of the output section.
++            // The three sub-pages are created only when opened (kcm.push).
++            Flow {
++                Layout.fillWidth: true
++                Layout.leftMargin: Kirigami.Units.largeSpacing
++                Layout.rightMargin: Kirigami.Units.largeSpacing
++                spacing: Kirigami.Units.smallSpacing
++
++                CheckBox {
++                    id: inactiveDevicesSwitch
++                    visible: (paSourceModel.count != paSourceFilterModel.count) || (paSinkModel.count != paSinkFilterModel.count)
++                    text: i18nd("kcm_pulseaudio", "Show inactive devices") // ksr: kcm_pulseaudio/Show-Inactive-Devices
++                }
++                Button {
++                    icon.name: "configure"
++                    text: i18nd("kcm_pulseaudio", "Volume Controls…") // ksr: kcm_pulseaudio/ConfigureVolumeControls
++                    onClicked: kcm.push("VolumeControlsConfig.qml", { "config": config })
++                }
++                Button {
++                    icon.name: "edit-rename-symbolic"
++                    text: i18nd("kcm_pulseaudio", "Rename Devices…") // ksr: kcm_pulseaudio/RenameDevices
++                    visible: Server.hasWirePlumber && Server.isPipeWire
++                    onClicked: kcm.push("RenameDevices.qml", { "config": config })
++                }
++                Button {
++                    // Only PulseAudio (not PipeWire) has these modules; the module manager lives on the sub-page.
++                    icon.name: "audio-card-symbolic"
++                    text: i18nd("kcm_pulseaudio", "Output Behavior…") // ksr: kcm_pulseaudio/ConfigureModules
++                    visible: !Server.isPipeWire
++                    onClicked: kcm.push("OutputBehavior.qml")
++                }
++            }
++
+             Kirigami.ListSectionHeader {
+                 Layout.fillWidth: true
+                 visible: sources.visible
+-                text: i18nd("kcm_pulseaudio", "Recording Devices")
++                text: i18nd("kcm_pulseaudio", "Input Devices")
+             }
+ 
+             ListView {
+@@ -188,7 +170,7 @@ KCM.ScrollViewKCM {
+             Kirigami.ListSectionHeader {
+                 Layout.fillWidth: true
+                 visible: inactiveCards.visible
+-                text: i18nd("kcm_pulseaudio", "Inactive Cards")
++                text: i18nd("kcm_pulseaudio", "Unused Sound Cards")
+             }
+ 
+             ListView {
+@@ -220,10 +202,28 @@ KCM.ScrollViewKCM {
+                 }
+             }
+ 
++            // The application stream lists (with level meters and their models) are below the fold: they are built
++            // after the device lists, without blocking the first frame.
++            Loader {
++                id: streamsLoader
++                Layout.fillWidth: true
++                active: true
++                asynchronous: true
++                sourceComponent: streamsComponent
++            }
++        }
++    }
++
++    Component {
++        id: streamsComponent
++
++        ColumnLayout {
++            width: parent ? parent.width : implicitWidth
++
+             Kirigami.ListSectionHeader {
+                 Layout.fillWidth: true
+                 visible: eventStreamView.visible || sinkInputView.visible
+-                text: i18nd("kcm_pulseaudio", "Playback Streams")
++                text: i18nd("kcm_pulseaudio", "Apps Playing Sound")
+             }
+ 
+             ListView {
+@@ -275,7 +275,7 @@ KCM.ScrollViewKCM {
+             Kirigami.ListSectionHeader {
+                 Layout.fillWidth: true
+                 visible: sourceOutputView.visible
+-                text: i18nd("kcm_pulseaudio", "Recording Streams")
++                text: i18nd("kcm_pulseaudio", "Apps Recording Sound")
+             }
+ 
+             ListView {

@@ -1,0 +1,134 @@
+From 6af5626f6f6c34b4691674902ea84b25add1600b Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 01:27:59 +0500
+Subject: [PATCH 22/24] kcm_soundtheme: theme list built after the first frame,
+ link to per-event sounds
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Page type: Gallery (docs/page-design.md section 5). Config keys (Sounds/Enable, Sounds/Theme), canberra preview and theme
+install are unchanged.
+
+Moved / renamed:
+- "Enable notification sounds" -> "Play notification sounds" (no "Enable" prefix, page-design section 6); old wording kept
+  as alias in ia/layout.json. Row kcm_soundtheme/soundsEnabled.
+- New page action "Sounds for Events…" opens kcm_notifications via KCMLauncher (per-event sounds are chosen there,
+  ia/duplicates.md); hidden when KAuthorized denies the module.
+- Removed the opacity 0.75 on the theme description (page-design section 3: no opacity tricks).
+- Install from File… stays a page action top right. Relabel table: inventory/relabel/kcm_soundtheme.tsv (outer repo).
+  Inventory --strict: 5 rows ok, 0 lost (markers added to the four rows that only had weak anchors).
+
+Speed: load() ran loadThemes() synchronously (QStandardPaths::locateAll, a directory scan and one index.theme parse per
+theme, kcm_soundtheme.cpp loadThemes). It now runs from a QTimer::singleShot(0) queued by load(), guarded against
+repeated calls, so the page frame is shown first and the grid fills on themesLoaded. After-numbers: pending, manager
+will measure.
+
+HIG: HIG-001/005 (current state first), HIG-057 (no Advanced). Not built yet. API not confirmed by a build:
+org.kde.config import for KAuthorized (same as kcms/fonts/ui/main.qml).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/soundtheme/kcm_soundtheme.cpp |  9 ++++++++-
+ kcms/soundtheme/kcm_soundtheme.h   |  1 +
+ kcms/soundtheme/ui/main.qml        | 16 ++++++++++++++--
+ 3 files changed, 23 insertions(+), 3 deletions(-)
+
+diff --git a/kcms/soundtheme/kcm_soundtheme.cpp b/kcms/soundtheme/kcm_soundtheme.cpp
+index 3504991..c78e9b8 100644
+--- a/kcms/soundtheme/kcm_soundtheme.cpp
++++ b/kcms/soundtheme/kcm_soundtheme.cpp
+@@ -122,7 +122,14 @@ QString KCMSoundTheme::nameFor(const QString &themeId) const
+ void KCMSoundTheme::load()
+ {
+     KQuickManagedConfigModule::load();
+-    loadThemes();
++    // ksr: scanning the sound directories and parsing every index.theme must not delay the first frame
++    if (!m_loadPending) {
++        m_loadPending = true;
++        QTimer::singleShot(0, this, [this]() {
++            m_loadPending = false;
++            loadThemes();
++        });
++    }
+ }
+ 
+ void KCMSoundTheme::loadThemes()
+diff --git a/kcms/soundtheme/kcm_soundtheme.h b/kcms/soundtheme/kcm_soundtheme.h
+index 2122702..f807215 100644
+--- a/kcms/soundtheme/kcm_soundtheme.h
++++ b/kcms/soundtheme/kcm_soundtheme.h
+@@ -105,4 +105,5 @@ private:
+     QString m_playingSound;
+ 
+     QPointer<KIO::FileCopyJob> m_tempCopyJob;
++    bool m_loadPending = false;
+ };
+diff --git a/kcms/soundtheme/ui/main.qml b/kcms/soundtheme/ui/main.qml
+index c9f30dd..1f01361 100644
+--- a/kcms/soundtheme/ui/main.qml
++++ b/kcms/soundtheme/ui/main.qml
+@@ -12,6 +12,7 @@ import QtQuick.Dialogs as QtDialogs
+ import QtQuick.Controls as QQC2
+ import org.kde.kirigami as Kirigami
+ import org.kde.kcmutils as KCM
++import org.kde.config // KAuthorized
+ 
+ KCM.GridViewKCM {
+     id: root
+@@ -27,19 +28,29 @@ KCM.GridViewKCM {
+     view.implicitCellWidth: Kirigami.Units.gridUnit * 22
+     view.implicitCellHeight: Kirigami.Units.gridUnit * 11
+ 
++    // ksr: kcm_soundtheme/theme
+     view.model: kcm.themes
+     view.currentIndex: kcm.currentIndex
+ 
+     actions: [
+         Kirigami.Action {
++            // ksr: kcm_soundtheme/InstallFromFile
+             text: i18nc("@action:button Install sound theme from file", "Install from File…")
+             icon.name: "document-import"
+             onTriggered: fileDialogLoader.active = true
+         },
++        Kirigami.Action {
++            // ksr: sounds of single events live on kcm_notifications (ia/duplicates.md); link instead of a copy
++            visible: KAuthorized.authorizeControlModule("kcm_notifications")
++            text: i18nc("@action:button Opens the notification settings page", "Sounds for Events…")
++            icon.name: "preferences-desktop-notification"
++            onTriggered: KCM.KCMLauncher.openSystemSettings("kcm_notifications")
++        },
+         Kirigami.Action {
+             id: enabledAction
+             icon.name: "notification-active-symbolic"
+-            text: i18nc("@option:check", "Enable notification sounds")
++            // ksr: kcm_soundtheme/soundsEnabled (was "Enable notification sounds", no "Enable" prefix per page-design section 6)
++            text: i18nc("@option:check", "Play notification sounds")
+             checkable: true
+             checked: kcm.settings.soundsEnabled
+ 
+@@ -123,7 +134,6 @@ KCM.GridViewKCM {
+             QQC2.Label {
+                 text: theme.comment
+                 textFormat: Text.PlainText
+-                opacity: 0.75
+                 wrapMode: Text.WordWrap
+                 maximumLineCount: 3 - basedOn.visible
+                 elide: Text.ElideRight
+@@ -163,6 +173,7 @@ KCM.GridViewKCM {
+                         {iconName: "device-notifier", sounds: ["device-added", "device-removed"]},
+                     ]
+                     delegate: SoundButton {
++                        // ksr: kcm_soundtheme/Preview-sound-1
+                         themeId: theme.id
+                         sounds: modelData.sounds
+                         icon.name: modelData.iconName
+@@ -175,6 +186,7 @@ KCM.GridViewKCM {
+ 
+             SoundButton {
+                 id: demoButton
++                // ksr: kcm_soundtheme/Preview-the-demo-sound-for-the-theme-1
+ 
+                 themeId: theme.id
+                 sounds: {

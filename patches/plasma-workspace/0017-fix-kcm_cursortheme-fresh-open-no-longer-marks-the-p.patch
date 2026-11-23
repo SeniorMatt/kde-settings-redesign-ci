@@ -1,0 +1,83 @@
+From c51426d0785e2ec37cf5ce0bf090cdd24fbd7473 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 19:05:25 +0500
+Subject: [PATCH 17/24] fix(kcm_cursortheme): fresh open no longer marks the
+ page changed (settle after the deferred fill), not built yet
+
+Cause: loadThemes() cleared needsSave right after updateSizeComboBox(), but assigning the model to the grid in the same turn
+makes GridView pick index 0 and view.onCurrentIndexChanged wrote that theme (and, via cursorThemeChanged -> updateSizeComboBox,
+a size) into the settings, firing settingsChanged() after the clear. Fix: QML ignores currentIndex changes until the grid has
+settled (property settled, set after the model assignment turn), and loadThemes() clears needsSave once more one turn later,
+only when nothing was pending before and no theme deletion is pending (isSaveNeeded()). Cause not proven without a run.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/cursortheme/kcmcursortheme.cpp | 10 ++++++++++
+ kcms/cursortheme/ui/main.qml        | 21 +++++++++++++++++++--
+ 2 files changed, 29 insertions(+), 2 deletions(-)
+
+diff --git a/kcms/cursortheme/kcmcursortheme.cpp b/kcms/cursortheme/kcmcursortheme.cpp
+index 37c17c3..62656bf 100644
+--- a/kcms/cursortheme/kcmcursortheme.cpp
++++ b/kcms/cursortheme/kcmcursortheme.cpp
+@@ -138,6 +138,16 @@ void CursorThemeConfig::loadThemes()
+         setNeedsSave(false);
+     }
+     Q_EMIT themesLoadedChanged();
++
++    // Assigning the model to the grid makes QML run its handlers (current index, size combo) in this turn, and they may emit
++    // settingsChanged() after the reset above. Settle once more after they ran: a fresh open has nothing to apply.
++    if (!hadChanges) {
++        QTimer::singleShot(0, this, [this] {
++            if (!isSaveNeeded()) { // only pending theme deletions count; adopting a size for the theme is not a user change
++                setNeedsSave(false);
++            }
++        });
++    }
+ }
+ 
+ void CursorThemeConfig::setCanResize(bool can)
+diff --git a/kcms/cursortheme/ui/main.qml b/kcms/cursortheme/ui/main.qml
+index 40e917b..a4615de 100644
+--- a/kcms/cursortheme/ui/main.qml
++++ b/kcms/cursortheme/ui/main.qml
+@@ -37,8 +37,12 @@ KCM.GridViewKCM {
+     }
+     view.currentIndex: kcm.themesLoaded ? kcm.cursorThemeIndex(kcm.cursorThemeSettings.cursorTheme) : -1
+ 
++    // false until the grid has taken its model and its first current index: GridView picks index 0 when a model is assigned,
++    // and that must not be written back as the user's choice (it made Apply/Reset enabled on a fresh open).
++    property bool settled: false
++
+     view.onCurrentIndexChanged: {
+-        if (!kcm.themesLoaded) {
++        if (!kcm.themesLoaded || !root.settled) {
+             return;
+         }
+         kcm.cursorThemeSettings.cursorTheme = kcm.cursorThemeFromIndex(view.currentIndex)
+@@ -52,10 +56,23 @@ KCM.GridViewKCM {
+                              + root.previewSpacing * (root.previewCursorRows - 1)
+                              + 2 * root.previewPadding + 4 * Kirigami.Units.gridUnit
+ 
++    Component.onCompleted: {
++        // the scan may already be done when the page is created
++        if (kcm.themesLoaded) {
++            Qt.callLater(function () {
++                root.view.positionViewAtIndex(root.view.currentIndex, GridView.Beginning);
++                root.settled = true;
++            });
++        }
++    }
++
+     Connections {
+         target: kcm
+         function onThemesLoadedChanged() {
+-            root.view.positionViewAtIndex(root.view.currentIndex, GridView.Beginning);
++            Qt.callLater(function () {
++                root.view.positionViewAtIndex(root.view.currentIndex, GridView.Beginning);
++                root.settled = true;
++            });
+         }
+     }
+ 

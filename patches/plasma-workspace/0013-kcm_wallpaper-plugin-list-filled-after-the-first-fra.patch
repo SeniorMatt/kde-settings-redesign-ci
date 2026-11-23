@@ -1,0 +1,211 @@
+From 39ee3c4cf0e79bef46802d417ce64da8dcffb038 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 14:23:13 +0500
+Subject: [PATCH 13/24] kcm_wallpaper: plugin list filled after the first
+ frame, plugin page compiled asynchronously, Get New Plugins as a page action
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Page type: Form (type combo) hosting the chosen wallpaper plugin's config page. The plugin config pages themselves
+(wallpapers/image, slideshow, color, potd, tiled in plasma-workspace and kdeplasma-addons) are outside kcms/wallpaper and
+were not touched (task scope), so the Gallery of images stays as it is. Config keys, KConfigPropertyMap handling, the plasmashell D-Bus
+calls and the plugin loading contract (configDialog / wallpaperConfiguration / cfg_* initial properties) are unchanged.
+NOT BUILT YET (owner stopped heavy work); checked statically only.
+
+Moved / renamed:
+- "Get New Plugins…" was a NewStuff.Button beside the "Wallpaper type:" combo box; now a NewStuff.Action in the page
+  actions top right, next to "Set for all screens" (docs/page-design.md section 5). Wording unchanged.
+- The "Wallpaper type:" combo box now fills its own form row.
+- Relabel table: inventory/relabel/kcm_wallpaper.tsv (outer repo). Full inventory check: LOST 0 (the per-KCM --strict run
+  reports 10 plugin-page rows in wallpapers/ and kdeplasma-addons as "weak anchors", same as before this commit: 11).
+  HIG ids: HIG-001, HIG-006; page-design sections 5, 7.
+
+Speed (cause found in code, not measured):
+- WallpaperConfigModel's constructor ran repopulate() (PackageLoader::listPackages plus loadPackage per wallpaper plugin)
+  inside the first QML binding to kcm.wallpaperConfigModel. Now queued one event-loop turn later; main.qml already
+  handled an empty model (index < 0 loads nothing) and reacts to wallpaperPluginsChanged.
+- main.qml loadSourceFile() compiled the plugin's config.qml synchronously and then built the page TWICE (a hidden temp
+  copy to find which cfg_* keys exist, then the real one through StackView.replace). The compile is now asynchronous
+  (Qt.createComponent with Component.Asynchronous, generation counter drops stale requests, errors fall back to the empty
+  page); the temp-copy workaround for third-party plugins is kept as is. Building the page twice remains (the Image plugin's
+  own model/thumbnail cost is in wallpapers/image, outside this change).
+- After numbers: pending, manager will measure.
+
+Not built yet; uncertain: Component.statusChanged(status) argument in the connected arrow function; that StackView.replace(url)
+hits the engine's component cache after the async compile (it should); that the ComboBox keeps the right currentIndex when
+the model fills after kcm.currentWallpaper is set (updateSourceFile() re-sets it from wallpaperPluginsChanged);
+NewStuff.Action accepting `text` + `configFile` without icon (used that way in kcm_icons).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/wallpaper/ui/main.qml         | 90 +++++++++++++++++++++---------
+ kcms/wallpaper/wallpapermodule.cpp |  6 +-
+ 2 files changed, 68 insertions(+), 28 deletions(-)
+
+diff --git a/kcms/wallpaper/ui/main.qml b/kcms/wallpaper/ui/main.qml
+index 55f5d58..dd32fba 100644
+--- a/kcms/wallpaper/ui/main.qml
++++ b/kcms/wallpaper/ui/main.qml
+@@ -40,6 +40,7 @@ Kirigami.ScrollablePage {
+     actions: [
+         Kirigami.Action {
+             id: allScreensAction
++            // ksr: kcm_wallpaper/allScreens
+             text: i18nc("@option:check Set the wallpaper for all screens", "Set for all screens")
+             visible: kcm.screens.length > 1
+             checkable: true
+@@ -51,6 +52,12 @@ Kirigami.ScrollablePage {
+                 visible: allScreensAction.visible
+                 onToggled: allScreensAction.trigger()
+             }
++        },
++        // "Get New…" belongs with the page actions (docs/page-design.md section 5), not beside the combo box.
++        NewStuff.Action {
++            // ksr: kcm_wallpaper/Get-New-Plugins
++            configFile: "wallpaperplugin.knsrc"
++            text: i18nc("@action:button", "Get New Plugins…")
+         }
+     ]
+ 
+@@ -90,29 +97,20 @@ Kirigami.ScrollablePage {
+             Layout.fillWidth: true
+             Layout.topMargin: Kirigami.Units.largeSpacing
+ 
+-            RowLayout {
+-                Layout.fillWidth: true
++            QQC2.ComboBox {
++                id: wallpaperComboBox
++                // ksr: kcm_wallpaper/wallpaperConfigModel
+                 Kirigami.FormData.label: i18nc("@label:listbox", "Wallpaper type:")
+-                Kirigami.FormData.buddyFor: wallpaperComboBox
+-
+-                QQC2.ComboBox {
+-                    id: wallpaperComboBox
+-                    model: kcm.wallpaperConfigModel
+-                    textRole: "name"
+-                    valueRole: "pluginName"
+-                    onActivated: {
+-                        kcm.currentWallpaper = currentValue
+-                    }
+-
+-                    KCM.SettingHighlighter {
+-                        highlight: kcm.currentWallpaper !== "org.kde.image"
+-                    }
++                Layout.fillWidth: true
++                model: kcm.wallpaperConfigModel
++                textRole: "name"
++                valueRole: "pluginName"
++                onActivated: {
++                    kcm.currentWallpaper = currentValue
+                 }
+-                NewStuff.Button {
+-                    configFile: "wallpaperplugin.knsrc"
+-                    text: i18nc("@action:button", "Get New Plugins…")
+-                    visibleWhenDisabled: true // don't hide on disabled
+-                    Layout.preferredHeight: wallpaperComboBox.height
++
++                KCM.SettingHighlighter {
++                    highlight: kcm.currentWallpaper !== "org.kde.image"
+                 }
+             }
+         }
+@@ -205,11 +203,52 @@ Kirigami.ScrollablePage {
+                 main.currentItem.screen = kcm.selectedScreen;
+             }
+ 
++            // Bumped on every request so a plugin page that finishes compiling late (after the user switched type again)
++            // is dropped.
++            property int loadGeneration: 0
++
+             function loadSourceFile() {
+-                const wallpaperConfig = kcm.configuration;
++                const generation = ++main.loadGeneration;
+                 const wallpaperPluginSource = main.sourceFile
+                 // BUG 407619: wallpaperConfig can be null before calling `ContainmentItem::loadWallpaper()`
+-                if (wallpaperConfig && wallpaperPluginSource) {
++                if (kcm.configuration && wallpaperPluginSource) {
++                    // ksr: compiling the plugin's config page (the Image page is large) used to block here; it is
++                    // compiled on a thread now and the page is instantiated when ready.
++                    const component = Qt.createComponent(Qt.resolvedUrl(wallpaperPluginSource), Component.Asynchronous, main);
++                    const proceed = () => {
++                        if (generation === main.loadGeneration) {
++                            main.instantiatePage(component, wallpaperPluginSource);
++                        }
++                    };
++                    if (component.status === Component.Loading) {
++                        component.statusChanged.connect(status => {
++                            if (status === Component.Ready) {
++                                proceed();
++                            } else if (status === Component.Error) {
++                                console.warn(component.errorString());
++                                if (generation === main.loadGeneration) {
++                                    replace(emptyConfig);
++                                }
++                            }
++                        });
++                    } else if (component.status === Component.Ready) {
++                        proceed();
++                    } else {
++                        console.warn(component.errorString());
++                        replace(emptyConfig);
++                    }
++                } else {
++                    replace(emptyConfig)
++                }
++            }
++
++            function instantiatePage(component, wallpaperPluginSource) {
++                const wallpaperConfig = kcm.configuration;
++                if (!wallpaperConfig) {
++                    replace(emptyConfig);
++                    return;
++                }
++                {
+                     var props = {
+                         "configDialog": kcm,
+                         "wallpaperConfiguration": wallpaperConfig
+@@ -224,8 +263,7 @@ Kirigami.ScrollablePage {
+                     // TODO Plasma 7: consider whether we can drop this workaround
+                     // Hidden because destroy() only takes effect at the end of the event loop,
+                     // so this second copy of the config page would be painted meanwhile.
+-                    const temp = Qt.createComponent(Qt.resolvedUrl(wallpaperPluginSource))
+-                                   .createObject(appearanceRoot, Object.assign({"visible": false}, props))
++                    const temp = component.createObject(appearanceRoot, Object.assign({"visible": false}, props))
+                     wallpaperConfig.keys().forEach(key => {
+                         const cfgKey = "cfg_" + key;
+                         if (cfgKey in temp) {
+@@ -253,8 +291,6 @@ Kirigami.ScrollablePage {
+                     if (configurationChangedSignal) {
+                         configurationChangedSignal.connect(appearanceRoot.onConfigurationChanged)
+                     }
+-                } else {
+-                    replace(emptyConfig)
+                 }
+             }
+         }
+diff --git a/kcms/wallpaper/wallpapermodule.cpp b/kcms/wallpaper/wallpapermodule.cpp
+index 06ef4d1..b38b5ef 100644
+--- a/kcms/wallpaper/wallpapermodule.cpp
++++ b/kcms/wallpaper/wallpapermodule.cpp
+@@ -28,6 +28,7 @@
+ #include <QQuickItem>
+ #include <QQuickWindow>
+ #include <QScreen>
++#include <QTimer>
+ #include <QWindow>
+ 
+ K_PLUGIN_CLASS_WITH_JSON(WallpaperModule, "kcm_wallpaper.json")
+@@ -474,7 +475,10 @@ PlasmaQuick::ConfigModel *WallpaperModule::wallpaperConfigModel()
+ WallpaperConfigModel::WallpaperConfigModel(QObject *parent)
+     : PlasmaQuick::ConfigModel(parent)
+ {
+-    repopulate();
++    // ksr: listPackages() plus one loadPackage() per wallpaper plugin ran here, inside the first QML binding to
++    // kcm.wallpaperConfigModel. Now one event-loop turn later; main.qml already copes with an empty model at start (the combo
++    // box fills, wallpaperPluginsChanged() makes it load the plugin page) and does not load any page while the index is < 0.
++    QTimer::singleShot(0, this, &WallpaperConfigModel::repopulate);
+ }
+ 
+ void WallpaperConfigModel::repopulate()

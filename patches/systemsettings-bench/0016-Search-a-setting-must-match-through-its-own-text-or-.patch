@@ -1,0 +1,442 @@
+From 0aaff79a35950602a1d86115487d3535e7efbfa6 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 09:10:49 +0500
+Subject: [PATCH 16/34] Search: a setting must match through its own text or
+ section, not its page's keywords
+
+Every setting of the Mouse page matched "mouse pointer speed" because the words
+were found in the page name and keywords. Generated index: drop the generic
+dialog buttons (Cancel, OK, Add...), which lead nowhere.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ app/SettingsSearchModel.cpp | 44 +++++++++++++++++----------
+ app/SettingsSearchModel.h   |  4 ++-
+ app/settingsindex_p.h       | 60 -------------------------------------
+ 3 files changed, 32 insertions(+), 76 deletions(-)
+
+diff --git a/app/SettingsSearchModel.cpp b/app/SettingsSearchModel.cpp
+index f2a6b6b..feaa75c 100644
+--- a/app/SettingsSearchModel.cpp
++++ b/app/SettingsSearchModel.cpp
+@@ -10,6 +10,7 @@
+ #include "MenuModel.h"
+ #include "SidebarModel.h"
+ #include "settingsindex_p.h"
++#include "systemsettings_app_debug.h"
+ 
+ #include <KCModuleData>
+ #include <KLocalizedString>
+@@ -17,6 +18,7 @@
+ 
+ #include <QAction>
+ #include <QChar>
++#include <QElapsedTimer>
+ #include <QHash>
+ #include <QRegularExpression>
+ #include <QSet>
+@@ -75,7 +77,8 @@ struct SettingsSearchModel::Page {
+     QString name;
+     QString foldedName;
+     QStringList nameWords;
+-    QString haystack; // folded name, keywords and breadcrumb
++    QString haystack; // folded name, keywords and breadcrumb: what a page result matches
++    QString foldedPath; // folded category and page name: what a setting result of the page may match
+ };
+ 
+ struct SettingsSearchModel::Setting {
+@@ -129,6 +132,7 @@ void SettingsSearchModel::collectPages(MenuItem *item)
+         page.foldedName = fold(page.name);
+         page.nameWords = words(page.foldedName);
+         // Hidden but searchable pages count, like the ones that are in the sidebar
++        page.foldedPath = fold(child->breadcrumb() + u' ' + page.name);
+         page.haystack = fold(child->keywords().join(u' ') + u' ' + child->breadcrumb());
+         m_pages.append(page);
+     }
+@@ -167,6 +171,8 @@ void SettingsSearchModel::translateSettings()
+         return;
+     }
+     m_translated = true;
++    QElapsedTimer timer;
++    timer.start();
+     static const QRegularExpression placeholder(u"%(?:[0-9]+|n|L[0-9]+)"_s);
+     for (Setting &setting : m_settings) {
+         const SettingsIndex::Entry &entry = *setting.entry;
+@@ -180,6 +186,7 @@ void SettingsSearchModel::translateSettings()
+         setting.foldedText = fold(setting.text);
+         setting.foldedSection = fold(QString::fromUtf8(entry.section));
+     }
++    qCDebug(SYSTEMSETTINGS_APP_LOG) << "Translated" << m_settings.size() << "settings in" << timer.elapsed() << "ms";
+ }
+ 
+ QHash<int, QByteArray> SettingsSearchModel::roleNames() const
+@@ -332,22 +339,29 @@ void SettingsSearchModel::setQuery(const QString &query)
+         for (int i = 0; i < m_settings.size(); ++i) {
+             const Setting &setting = m_settings.at(i);
+             const Page &page = m_pages.at(setting.page);
+-            const QString haystack = setting.foldedText + u' ' + setting.foldedSection + u' ' + page.haystack;
+-            if (!containsAll(haystack, queryWords)) {
+-                continue;
++            // Every word must be in the setting's own text, its section, or the page and category name. The page's
++            // keywords do not count: they would make every setting of the page match. A setting needs at least one
++            // word of its own, otherwise the page result covers it.
++            int textWords = 0;
++            int sectionWords = 0;
++            bool all = true;
++            for (const QString &word : queryWords) {
++                if (setting.foldedText.contains(word)) {
++                    ++textWords;
++                } else if (setting.foldedSection.contains(word)) {
++                    ++sectionWords;
++                } else if (!page.foldedPath.contains(word)) {
++                    all = false;
++                    break;
++                }
+             }
+-            int rank = 5;
+-            if (setting.foldedText.startsWith(foldedQuery)) {
+-                rank = 2;
+-            } else if (containsAll(setting.foldedText + u' ' + setting.foldedSection, queryWords)) {
+-                rank = 3;
++            if (!all || textWords + sectionWords == 0) {
++                continue;
+             }
+-            // Within a rank, the settings that say more of the query themselves come first
+-            const QString own = setting.foldedText + u' ' + setting.foldedSection;
+-            const int ownWords = std::count_if(queryWords.cbegin(), queryWords.cend(), [&own](const QString &word) {
+-                return own.contains(word);
+-            });
+-            settings.append({rank, -ownWords, {i, SettingResult}, setting.foldedText});
++            const int rank = setting.foldedText.startsWith(foldedQuery) ? 2 : 5;
++            // Within a rank: more words in the text, then in the section, then in the page or category
++            const int order = -(textWords * 100 + sectionWords);
++            settings.append({rank, order, {i, SettingResult}, setting.foldedText});
+         }
+         std::stable_sort(settings.begin(), settings.end(), [](const Ranked &a, const Ranked &b) {
+             if (a.rank != b.rank) {
+diff --git a/app/SettingsSearchModel.h b/app/SettingsSearchModel.h
+index 318bed1..1ce2aaa 100644
+--- a/app/SettingsSearchModel.h
++++ b/app/SettingsSearchModel.h
+@@ -27,7 +27,9 @@ struct Entry;
+  *
+  * Matching ignores case and accents; every word of the query must match somewhere in a result.
+  * Results are ranked: exact page name, pages whose name words start with the query words, settings whose text starts
+- * with the query, settings with all words in their text or section, other pages, other settings.
++ * with the query, other pages, other settings. A setting matches when every query word is in its text, its section
++ * or the name of its page or category (not the page's keywords), and at least one word is in its text or section.
++ * Settings with more words in their own text come first.
+  */
+ class SettingsSearchModel : public QAbstractListModel
+ {
+diff --git a/app/settingsindex_p.h b/app/settingsindex_p.h
+index abf432d..e1c3749 100644
+--- a/app/settingsindex_p.h
++++ b/app/settingsindex_p.h
+@@ -235,7 +235,6 @@ inline constexpr Entry entries[] = {
+     {"kcm_kded", nullptr, "Per background service: Startup Services (checkbox: load on startup) and Load-on-Demand Services (list only); Accessible names Disable/Enable automatically loading %1 on startup", "service list", "kcm_kded/model-display"},
+     {"kcm_kded", nullptr, "Per background service: Start Service / Stop Service (status Running / Not running)", "service list", "kcm_kded/kdedRunning-2"},
+     {"kcm_keyboard", "kcm_keyboard", "Configure keyboard options", "Key Bindings sub-page (master switch: apply XKB options, resetting options set elsewhere)", "kcm_keyboard/resetOldXkbOptions"},
+-    {"kcm_keyboard", "kcm_keyboard", "Reset", "Key Bindings sub-page", "kcm_keyboard/xkbOptionsModel-clearXkbGroup"},
+     {"kcm_keyboard", nullptr, "Per XKB option group: exclusive option (radio, e.g. Compose key position, Caps Lock behavior, Key to choose the 3rd level)", "option group", "kcm_keyboard/model-checked"},
+     {"kcm_keyboard", nullptr, "Per XKB option group: non-exclusive option (checkbox, e.g. Ctrl position, Miscellaneous compatibility options)", "option group", "kcm_keyboard/model-checked-2"},
+     {"kcm_keyboard", "kcm_keyboard", "Short layout name", "Add Layout dialog", "kcm_keyboard/x"},
+@@ -259,8 +258,6 @@ inline constexpr Entry entries[] = {
+     {"kcm_keys", "kcm_keys", "Default shortcut", "Default shortcut", "kcm_keys/requestKeySequence"},
+     {"kcm_keys", "kcm_keys", "Custom shortcuts", "Custom shortcuts", "kcm_keys/requestKeySequence-2"},
+     {"kcm_keys", "kcm_keys", "Delete shortcut", "Custom shortcuts", "kcm_keys/Delete-shortcut"},
+-    {"kcm_keys", "kcm_keys", "Add…", "Custom shortcuts", "kcm_keys/Add"},
+-    {"kcm_keys", "kcm_keys", "Add…", "Custom shortcuts", "kcm_keys/requestKeySequence-3"},
+     {"kcm_keys", "kcm_keys", "Cancel capturing shortcut", "Custom shortcuts", "kcm_keys/Cancel-capturing-shortcut"},
+     {"kcm_keys", nullptr, "Per shortcut component: list entry (one per application, command, system service, common-action group)", "component list (sections Applications, Commands, System Services, Common Actions)", "kcm_keys/model-display"},
+     {"kcm_keys", "kcm_keys", "Export %1", "component list", "kcm_keys/model-checked"},
+@@ -273,7 +270,6 @@ inline constexpr Entry entries[] = {
+     {"kcm_keys", "kcm_keys", "Select the scheme to import:", "Import Shortcut Scheme dialog", "kcm_keys/defaultSchemes"},
+     {"kcm_konlineaccounts", "kcm_konlineaccounts", "Create Account", "Create Account", "kcm_konlineaccounts/createBuilder"},
+     {"kcm_konlineaccounts", "kcm_konlineaccounts", "Finish", "Apps", "kcm_konlineaccounts/Finish"},
+-    {"kcm_konlineaccounts", "kcm_konlineaccounts", "OK", "Error", "kcm_konlineaccounts/OK"},
+     {"kcm_krdpserver", "kcm_krdpserver", "Save", "Add new user / Modify user dialog", "kcm_krdpserver/Save"},
+     {"kcm_krdpserver", "kcm_krdpserver", "Username:", "Add new user / Modify user dialog", "kcm_krdpserver/userExists"},
+     {"kcm_krdpserver", "kcm_krdpserver", "Password:", "Add new user / Modify user dialog", "kcm_krdpserver/x"},
+@@ -485,12 +481,9 @@ inline constexpr Entry entries[] = {
+     {"kcm_kwinrules", nullptr, "Window rule value: multi-select options (window types, virtual desktops, activities)", "property row", "kcm_kwinrules/model-bitMask"},
+     {"kcm_kwinrules", "kcm_kwinrules", "Add Property...", "bottom bar", "kcm_kwinrules/Add-Property"},
+     {"kcm_kwinrules", nullptr, "Detect Window Properties (pick a window; delay Instantly / After N seconds)", "bottom bar", "kcm_kwinrules/rulesModel-detectWindowProperties"},
+-    {"kcm_kwinrules", "kcm_kwinrules", "Yes", "Yes/No properties", "kcm_kwinrules/Yes"},
+     {"kcm_kwinrules", nullptr, "Rule enabled (checkbox on each rule in the list)", "rule list", "kcm_kwinrules/model-isEnabled"},
+     {"kcm_kwinrules", "kcm_kwinrules", "Description", "rule list / Rule editor", "kcm_kwinrules/setRuleDescription"},
+-    {"kcm_kwinrules", "kcm_kwinrules", "Edit", "rule list", "kcm_kwinrules/editRule"},
+     {"kcm_kwinrules", "kcm_kwinrules", "Duplicate", "rule list", "kcm_kwinrules/duplicateRule"},
+-    {"kcm_kwinrules", "kcm_kwinrules", "Delete", "rule list", "kcm_kwinrules/removeRule"},
+     {"kcm_kwinscreenedges", nullptr, "Maximize: windows dragged to top edge", "Window drag actions", "kcm_kwinscreenedges/ElectricBorderMaximize"},
+     {"kcm_kwinscreenedges", nullptr, "Tile: windows dragged to left or right edge", "Window drag actions", "kcm_kwinscreenedges/ElectricBorderTiling"},
+     {"kcm_kwinscreenedges", nullptr, "Remain active when windows are fullscreen", "Behavior", "kcm_kwinscreenedges/remainActiveOnFullscreen"},
+@@ -543,7 +536,6 @@ inline constexpr Entry entries[] = {
+     {"kcm_networkmanagement", nullptr, "Per saved connection: entry in the connection list (name, type section, status Connected/Connecting/Available)", "Connection list", "kcm_networkmanagement/model-Name"},
+     {"kcm_networkmanagement", "plasmanetworkmanagement-kcm", "Export selected connection", "Toolbar", "kcm_networkmanagement/onRequestExportConnection"},
+     {"kcm_networkmanagement", "plasmanetworkmanagement-kcm", "Connect", "", "kcm_networkmanagement/Connect"},
+-    {"kcm_networkmanagement", "plasmanetworkmanagement-kcm", "Cancel", "", "kcm_networkmanagement/Cancel"},
+     {"kcm_nightlight", nullptr, "Switching times: Always off / Always on / Sunrise and sunset", "Main page", "kcm_nightlight/Active"},
+     {"kcm_nightlight", "kcm_nightlight", "Configure…", "Main page", "kcm_nightlight/nightLightSettings-active"},
+     {"kcm_nightlight", nullptr, "Day light temperature: (Cool (no filter) … Warm, in Kelvin)", "Main page", "kcm_nightlight/DayTemperature"},
+@@ -565,7 +557,6 @@ inline constexpr Entry entries[] = {
+     {"kcm_notifications", "kcm_notifications", "Play a sound", "Configure Events", "kcm_notifications/Play-a-sound"},
+     {"kcm_notifications", "kcm_notifications", "Preview sound", "Configure Events", "kcm_notifications/playSound"},
+     {"kcm_notifications", nullptr, "Per event: sound file (path or name)", "Configure Events", "kcm_notifications/model-sound"},
+-    {"kcm_notifications", "kcm_notifications", "Reset", "Configure Events", "kcm_notifications/Reset"},
+     {"kcm_notifications", "kcm_notifications", "Choose sound file", "Configure Events", "kcm_notifications/Choose-sound-file"},
+     {"kcm_notifications", nullptr, "Do Not Disturb mode > Enable automatically: When screens are mirrored", "Do Not Disturb mode", "kcm_notifications/WhenScreensMirrored"},
+     {"kcm_notifications", nullptr, "Do Not Disturb mode > During screen sharing", "Do Not Disturb mode", "kcm_notifications/WhenScreenSharing"},
+@@ -587,7 +578,6 @@ inline constexpr Entry entries[] = {
+     {"kcm_plasmakeyboard", nullptr, "Per available layout: enable (checkbox, stored in General/enabledKeyboardLayoutIds)", "Add Layout sub-page", "kcm_plasmakeyboard/enableKeyboardLayout"},
+     {"kcm_plasmakeyboard", nullptr, "Move Up", "On-Screen Keyboard Layouts sub-page", "kcm_plasmakeyboard/moveKeyboardLayout"},
+     {"kcm_plasmakeyboard", nullptr, "Move Down", "On-Screen Keyboard Layouts sub-page", "kcm_plasmakeyboard/moveKeyboardLayout-2"},
+-    {"kcm_plasmakeyboard", nullptr, "Remove", "On-Screen Keyboard Layouts sub-page", "kcm_plasmakeyboard/disableKeyboardLayout"},
+     {"kcm_plasmakeyboard", nullptr, "Configure…", "Keyboard layouts (opens On-Screen Keyboard Layouts sub-page)", "kcm_plasmakeyboard/Configure"},
+     {"kcm_plasmakeyboard", nullptr, "Sound", "Key press feedback", "kcm_plasmakeyboard/plasmaKeyboardSettings-soundEnabled"},
+     {"kcm_plasmakeyboard", nullptr, "Vibration", "Key press feedback", "kcm_plasmakeyboard/plasmaKeyboardSettings-vibrationEnabled"},
+@@ -786,7 +776,6 @@ inline constexpr Entry entries[] = {
+     {"kcm_tablet", "kcm_tablet", "Button 1", "Send pen button", "kcm_tablet/Button-1"},
+     {"kcm_tablet", "kcm_tablet", "Refine Existing Calibration", "Pen Calibration sub-page", "kcm_tablet/Refine-Existing-Calibration"},
+     {"kcm_tablet", "kcm_tablet", "Reset and Try Again", "Pen Calibration sub-page", "kcm_tablet/Reset-and-Try-Again"},
+-    {"kcm_tablet", "kcm_tablet", "Close", "Pen Calibration sub-page", "kcm_tablet/Close"},
+     {"kcm_tablet", "kcm_tablet", "Map to screen:", "Display tab (options: Follow the Current Screen, All Screens, one entry per output)", "kcm_tablet/Map-to-screen"},
+     {"kcm_tablet", "kcm_tablet", "Orientation:", "Display tab (Default, Portrait, Landscape, Inverted Portrait, Inverted Landscape; Not Applicable if unsupported)", "kcm_tablet/root-device-orientation"},
+     {"kcm_tablet", "kcm_tablet", "Mapped Area:", "Display tab (Stretch and Fill, Keep Aspect Ratio and Fit, Map to Portion)", "kcm_tablet/Mapped-Area"},
+@@ -838,7 +827,6 @@ inline constexpr Entry entries[] = {
+     {"kcm_users", "kcm_users", "Password:", "Create User", "kcm_users/Password-2"},
+     {"kcm_users", "kcm_users", "Confirm password:", "Create User", "kcm_users/Confirm-password-2"},
+     {"kcm_users", "kcm_users", "Create", "Create User", "kcm_users/mainUi-createUser"},
+-    {"kcm_users", "kcm_users", "Cancel", "Create User", "kcm_users/mainUi-createUserEnabled"},
+     {"kcm_users", "kcm_users", "Re-enroll finger", "Fingerprints", "kcm_users/Re-enroll-finger"},
+     {"kcm_users", "kcm_users", "Delete fingerprint", "Fingerprints", "kcm_users/Delete-fingerprint"},
+     {"kcm_users", "kcm_users", "Go Back", "Change Avatar", "kcm_users/Go-Back"},
+@@ -875,8 +863,6 @@ inline constexpr Entry entries[] = {
+     {"kcm_webshortcuts", "kio-extras_kcms", "Search...", "Web Search Keywords (above the list)", "kcm_webshortcuts/searchLineEdit"},
+     {"kcm_webshortcuts", "kio-extras_kcms", "Name", "Web Search Keywords", "kcm_webshortcuts/lvSearchProviders"},
+     {"kcm_webshortcuts", "kio-extras_kcms", "New…", "Web Search Keywords", "kcm_webshortcuts/pbNew"},
+-    {"kcm_webshortcuts", "kio-extras_kcms", "Edit…", "Web Search Keywords", "kcm_webshortcuts/pbChange"},
+-    {"kcm_webshortcuts", "kio-extras_kcms", "Delete", "Web Search Keywords", "kcm_webshortcuts/pbDelete"},
+     {"kcm_webshortcuts", "kio-extras_kcms", "Default Web search keyword:", "Web Search Keywords", "kcm_webshortcuts/cmbDefaultEngine"},
+     {"kcm_webshortcuts", "kio-extras_kcms", "Keyword delimiter:", "Web Search Keywords", "kcm_webshortcuts/cmbDelimiter"},
+     {"kcm_webshortcuts", "kio-extras_kcms", "URL:", "New/Edit provider dialog", "kcm_webshortcuts/leQuery"},
+@@ -967,8 +953,6 @@ inline constexpr Entry entries[] = {
+     {"kcm_cellular_network", nullptr, "Add APN", "APNs (APN List)", "kcm_cellular_network/AddApn"},
+     {"kcm_cellular_network", nullptr, "Automatically detect APN", "APNs (APN List)", "kcm_cellular_network/AutoDetectApn"},
+     {"kcm_cellular_network", nullptr, "Per APN: choose the active APN profile", "APNs (APN List)", "kcm_cellular_network/ApnActive"},
+-    {"kcm_cellular_network", nullptr, "Edit", "APNs (APN List)", "kcm_cellular_network/ApnEdit"},
+-    {"kcm_cellular_network", nullptr, "Delete", "APNs (APN List)", "kcm_cellular_network/ApnDelete"},
+     {"kcm_cellular_network", nullptr, "Name", "New/Edit APN", "kcm_cellular_network/ApnName"},
+     {"kcm_cellular_network", nullptr, "APN", "New/Edit APN", "kcm_cellular_network/ApnApn"},
+     {"kcm_cellular_network", nullptr, "Username", "New/Edit APN", "kcm_cellular_network/ApnUsername"},
+@@ -1045,21 +1029,14 @@ inline constexpr Entry entries[] = {
+     {"kcm_feedback", "kcm_feedback", "The following information will be sent:", "Sent data", "kcm_feedback/SentDataItems"},
+     {"kcm_filetypes", "kcm_filetypes", "Search for file type or filename pattern...", "File Associations (left)", "kcm_filetypes/Search"},
+     {"kcm_filetypes", "kcm_filetypes", "Known Types", "File Associations (left)", "kcm_filetypes/KnownTypes"},
+-    {"kcm_filetypes", "kcm_filetypes", "Add...", "File Associations (left)", "kcm_filetypes/Add"},
+-    {"kcm_filetypes", "kcm_filetypes", "Remove", "File Associations (left)", "kcm_filetypes/Remove"},
+     {"kcm_filetypes", "kcm_filetypes", "Group:", "Create New File Type dialog", "kcm_filetypes/NewGroup"},
+     {"kcm_filetypes", "kcm_filetypes", "Type name:", "Create New File Type dialog", "kcm_filetypes/NewName"},
+     {"kcm_filetypes", nullptr, "Per file type: icon button (choose the icon of the file type)", "File Associations (right)", "kcm_filetypes/Icon"},
+     {"kcm_filetypes", "kcm_filetypes", "Filename Patterns", "Filename Patterns", "kcm_filetypes/Patterns"},
+-    {"kcm_filetypes", "kcm_filetypes", "Add...", "Filename Patterns", "kcm_filetypes/PatternAdd"},
+-    {"kcm_filetypes", "kcm_filetypes", "Remove", "Filename Patterns", "kcm_filetypes/PatternRemove"},
+     {"kcm_filetypes", "kcm_filetypes", "Description:", "File Associations (right)", "kcm_filetypes/Description"},
+     {"kcm_filetypes", "kcm_filetypes", "Application Preference Order", "Application Preference Order", "kcm_filetypes/AppOrder"},
+     {"kcm_filetypes", "kcm_filetypes", "Move Up", "Application Preference Order", "kcm_filetypes/AppUp"},
+     {"kcm_filetypes", "kcm_filetypes", "Move Down", "Application Preference Order", "kcm_filetypes/AppDown"},
+-    {"kcm_filetypes", "kcm_filetypes", "Add...", "Application Preference Order", "kcm_filetypes/AppAdd"},
+-    {"kcm_filetypes", "kcm_filetypes", "Edit...", "Application Preference Order", "kcm_filetypes/AppEdit"},
+-    {"kcm_filetypes", "kcm_filetypes", "Remove", "Application Preference Order", "kcm_filetypes/AppRemove"},
+     {"kcm_filetypes", "kcm_filetypes", "Apply To...", "Application Preference Order", "kcm_filetypes/AppApplyTo"},
+     {"kcm_firewall", "kcm_firewall", "Add Rule…", "Main (toolbar)", "kcm_firewall/AddRule"},
+     {"kcm_firewall", "kcm_firewall", "View Connections", "Connections page", "kcm_firewall/ViewConnections"},
+@@ -1092,12 +1069,10 @@ inline constexpr Entry entries[] = {
+     {"kcm_kded", nullptr, "Search services (search field)", "search row", "kcm_kded/SearchField"},
+     {"kcm_keyboard", "kcm_keyboard", "Configure Switching…", "Layouts (opens Configure Switching sub-page)", "kcm_keyboard/ConfigureSwitching"},
+     {"kcm_keyboard", "kcm_keyboard", "Key Bindings", "Main page (opens Key Bindings sub-page: XKB options)", "kcm_keyboard/KeyBindings"},
+-    {"kcm_keyboard", "kcm_keyboard", "Add…", "Layouts (opens Add Layout dialog)", "kcm_keyboard/AddLayout"},
+     {"kcm_keyboard", nullptr, "Per layout: list entry (layout name, variant, short name, shortcut) in the user layout list", "Layouts", "kcm_keyboard/userLayoutModel"},
+     {"kcm_keyboard", "kcm_keyboard", "Move Up", "Layouts", "kcm_keyboard/layout-MoveUp"},
+     {"kcm_keyboard", "kcm_keyboard", "Move Down", "Layouts", "kcm_keyboard/layout-MoveDown"},
+     {"kcm_keyboard", "kcm_keyboard", "Preview", "Layouts", "kcm_keyboard/layout-Preview"},
+-    {"kcm_keyboard", "kcm_keyboard", "Remove", "Layouts", "kcm_keyboard/layout-Remove"},
+     {"kcm_keyboard", "kcm_keyboard", "Shortcut:", "Add Layout dialog", "kcm_keyboard/layoutDialogShortcut"},
+     {"kcm_keyboard", nullptr, "Per available layout/variant: pick layout and variant (searchable list, layout and variant)", "Add Layout dialog", "kcm_keyboard/layoutDialogSearch"},
+     {"kcm_keys", "kcm_keys", "Import…", "toolbar (opens Import Shortcut Scheme dialog)", "kcm_keys/Import"},
+@@ -1111,7 +1086,6 @@ inline constexpr Entry entries[] = {
+     {"kcm_keys", "kcm_keys", "Import", "Import Shortcut Scheme dialog", "kcm_keys/ImportConfirm"},
+     {"kcm_keys", "kcm_keys", "Export", "export bar", "kcm_keys/ExportConfirm"},
+     {"kcm_konlineaccounts", "kcm_konlineaccounts", "Add Account…", "Main (toolbar)", "kcm_konlineaccounts/AddAccount"},
+-    {"kcm_konlineaccounts", "kcm_konlineaccounts", "Remove", "account page", "kcm_konlineaccounts/Remove"},
+     {"kcm_konlineaccounts", "kcm_konlineaccounts", "These applications are authorized to use %1:", "account page", "kcm_konlineaccounts/AuthorizedApp"},
+     {"kcm_konlineaccounts", "kcm_konlineaccounts", "Give access to relevant apps:", "Apps", "kcm_konlineaccounts/SuggestedApp"},
+     {"kcm_konlineaccounts", "kcm_konlineaccounts", "No accounts configured", "Main", "kcm_konlineaccounts/AccountList"},
+@@ -1132,7 +1106,6 @@ inline constexpr Entry entries[] = {
+     {"kcm_kup", "kup", "Add New Plan…", "Main", "kcm_kup/AddPlan"},
+     {"kcm_kup", "kup", "Open and restore from existing backups", "Main", "kcm_kup/OpenRestore"},
+     {"kcm_kup", "kup", "Configure", "plan status", "kcm_kup/PlanConfigure"},
+-    {"kcm_kup", "kup", "Remove", "plan status", "kcm_kup/PlanRemove"},
+     {"kcm_kup", "kup", "Duplicate", "plan status", "kcm_kup/PlanDuplicate"},
+     {"kcm_kup", "kup", "Description:", "top", "kcm_kup/Description"},
+     {"kcm_kup", "kup", "Back to overview", "top", "kcm_kup/BackToOverview"},
+@@ -1189,7 +1162,6 @@ inline constexpr Entry entries[] = {
+     {"kcm_kwin_effects", "kcm_kwin_effects", "Toggle Cube", "Effect config: Desktop Cube", "kcm_kwin_effects/shortcut-cube"},
+     {"kcm_kwin_scripts", nullptr, "Script: Enabled (checkbox on each installed KWin script)", "script list", "kcm_kwin_scripts/script-enabled"},
+     {"kcm_kwin_scripts", nullptr, "Script: Configure… (for scripts that ship a configuration dialog)", "script list", "kcm_kwin_scripts/script-configure"},
+-    {"kcm_kwin_scripts", "kcm_kwin_scripts", "Delete…", "script list", "kcm_kwin_scripts/script-delete"},
+     {"kcm_kwin_scripts", nullptr, "Script options (each script defines its own options in contents/config/main.xml; stored in kwinrc [Script-<name>])", "Configure… dialog", "kcm_kwin_scripts/script-config-values"},
+     {"kcm_kwin_scripts", "kcm_kwin_scripts", "Install from File…", "toolbar", "kcm_kwin_scripts/install-from-file"},
+     {"kcm_kwin_scripts", "kcm_kwin_scripts", "Get New…", "toolbar", "kcm_kwin_scripts/get-new"},
+@@ -1202,7 +1174,6 @@ inline constexpr Entry entries[] = {
+     {"kcm_kwin_virtualdesktops", "kcm_kwin_virtualdesktops", "Add Desktop", "toolbar", "kcm_kwin_virtualdesktops/add-desktop"},
+     {"kcm_kwin_virtualdesktops", nullptr, "Desktop name (one text field per desktop, shown when renaming)", "Rename", "kcm_kwin_virtualdesktops/desktop-name"},
+     {"kcm_kwin_virtualdesktops", "kcm_kwin_virtualdesktops", "Rename", "desktop list", "kcm_kwin_virtualdesktops/rename-desktop"},
+-    {"kcm_kwin_virtualdesktops", "kcm_kwin_virtualdesktops", "Remove", "desktop list", "kcm_kwin_virtualdesktops/remove-desktop"},
+     {"kcm_kwindecoration", "kcm_kwindecoration", "Window menu", "available buttons", "kcm_kwindecoration/titlebar-button-kind"},
+     {"kcm_kwindecoration", nullptr, "Window border size:", "toolbar", "kcm_kwindecoration/borderSize"},
+     {"kcm_kwindecoration", "kcm_kwindecoration", "Configure Titlebar Buttons…", "toolbar", "kcm_kwindecoration/configure-titlebar"},
+@@ -1319,7 +1290,6 @@ inline constexpr Entry entries[] = {
+     {"kcm_mobile_wifi", nullptr, "Saved Networks", "Saved Networks", "kcm_mobile_wifi/SavedNetwork"},
+     {"kcm_mobile_wifi", nullptr, "Available Networks", "Available Networks", "kcm_mobile_wifi/AvailableNetwork"},
+     {"kcm_mobile_wifi", nullptr, "Add Custom Connection", "Main", "kcm_mobile_wifi/AddCustom"},
+-    {"kcm_mobile_wifi", nullptr, "Edit", "toolbar", "kcm_mobile_wifi/Edit"},
+     {"kcm_mobile_wifi", nullptr, "SSID", "General", "kcm_mobile_wifi/Ssid"},
+     {"kcm_mobile_wifi", nullptr, "Hidden Network", "General", "kcm_mobile_wifi/Hidden"},
+     {"kcm_mobile_wifi", nullptr, "Security type", "Security", "kcm_mobile_wifi/SecurityType"},
+@@ -1359,7 +1329,6 @@ inline constexpr Entry entries[] = {
+     {"kcm_mobileshell", nullptr, "Hide", "Quick Settings", "kcm_mobileshell/QsItem"},
+     {"kcm_mouse", "kcmmouse", "Configure Extra Buttons…", "toolbar action (opens Extra Mouse Buttons sub-page; visible only if device has extra buttons)", "kcm_mouse/ConfigureExtraButtons"},
+     {"kcm_mouse", "kcmmouse", "Add Binding…", "Extra Mouse Buttons sub-page (press a mouse button, then enter key combination)", "kcm_mouse/AddBinding"},
+-    {"kcm_mouse", "kcmmouse", "Cancel", "Extra Mouse Buttons sub-page", "kcm_mouse/CancelBinding"},
+     {"kcm_navigation", nullptr, "Navigation Mode", "Navigation", "kcm_navigation/Mode"},
+     {"kcm_navigation", nullptr, "Always show keyboard toggle", "Navigation", "kcm_navigation/KeyboardToggle"},
+     {"kcm_navigation", nullptr, "Show gesture handle", "Navigation", "kcm_navigation/GestureHandle"},
+@@ -1473,9 +1442,6 @@ inline constexpr Entry entries[] = {
+     {"kcm_networkmanagement", "plasmanetworkmanagement-kcm", "MTU:", "Infiniband (connection type: Infiniband)", "kcm_networkmanagement/infiniband-mtu"},
+     {"kcm_networkmanagement", "plasmanetworkmanagement-kcm", "Interface name:", "Bond (connection type: Bond)", "kcm_networkmanagement/bond-ifaceName"},
+     {"kcm_networkmanagement", "plasmanetworkmanagement-kcm", "Bonded connections:", "Bond (connection type: Bond)", "kcm_networkmanagement/bond-bonds"},
+-    {"kcm_networkmanagement", "plasmanetworkmanagement-kcm", "Add…", "Bond (connection type: Bond)", "kcm_networkmanagement/bond-btnAdd"},
+-    {"kcm_networkmanagement", "plasmanetworkmanagement-kcm", "Edit…", "Bond (connection type: Bond)", "kcm_networkmanagement/bond-btnEdit"},
+-    {"kcm_networkmanagement", "plasmanetworkmanagement-kcm", "Delete", "Bond (connection type: Bond)", "kcm_networkmanagement/bond-btnDelete"},
+     {"kcm_networkmanagement", "plasmanetworkmanagement-kcm", "Mode:", "Bond (connection type: Bond)", "kcm_networkmanagement/bond-mode"},
+     {"kcm_networkmanagement", "plasmanetworkmanagement-kcm", "Link monitoring:", "Bond (connection type: Bond)", "kcm_networkmanagement/bond-linkMonitoring"},
+     {"kcm_networkmanagement", "plasmanetworkmanagement-kcm", "Monitoring frequency:", "Bond (connection type: Bond)", "kcm_networkmanagement/bond-monitorFreq"},
+@@ -1484,9 +1450,6 @@ inline constexpr Entry entries[] = {
+     {"kcm_networkmanagement", "plasmanetworkmanagement-kcm", "ARP targets:", "Bond (connection type: Bond)", "kcm_networkmanagement/bond-arpTargets"},
+     {"kcm_networkmanagement", "plasmanetworkmanagement-kcm", "Interface name:", "Bridge (connection type: Bridge)", "kcm_networkmanagement/bridge-ifaceName"},
+     {"kcm_networkmanagement", "plasmanetworkmanagement-kcm", "Bridged connections:", "Bridge (connection type: Bridge)", "kcm_networkmanagement/bridge-bridges"},
+-    {"kcm_networkmanagement", "plasmanetworkmanagement-kcm", "Add…", "Bridge (connection type: Bridge)", "kcm_networkmanagement/bridge-btnAdd"},
+-    {"kcm_networkmanagement", "plasmanetworkmanagement-kcm", "Edit…", "Bridge (connection type: Bridge)", "kcm_networkmanagement/bridge-btnEdit"},
+-    {"kcm_networkmanagement", "plasmanetworkmanagement-kcm", "Delete", "Bridge (connection type: Bridge)", "kcm_networkmanagement/bridge-btnDelete"},
+     {"kcm_networkmanagement", "plasmanetworkmanagement-kcm", "Aging time:", "Bridge (connection type: Bridge)", "kcm_networkmanagement/bridge-agingTime"},
+     {"kcm_networkmanagement", "plasmanetworkmanagement-kcm", "Enable STP (Spanning Tree Protocol)", "Bridge (connection type: Bridge)", "kcm_networkmanagement/bridge-stpGroup"},
+     {"kcm_networkmanagement", "plasmanetworkmanagement-kcm", "Priority:", "Enable STP (Spanning Tree Protocol) (connection type: Bridge)", "kcm_networkmanagement/bridge-priority"},
+@@ -1501,9 +1464,6 @@ inline constexpr Entry entries[] = {
+     {"kcm_networkmanagement", "plasmanetworkmanagement-kcm", "Loose binding", "Vlan (connection type: VLAN)", "kcm_networkmanagement/vlan-looseBinding"},
+     {"kcm_networkmanagement", "plasmanetworkmanagement-kcm", "Interface name:", "Team (connection type: Team)", "kcm_networkmanagement/team-ifaceName"},
+     {"kcm_networkmanagement", "plasmanetworkmanagement-kcm", "Teamed connections:", "Team (connection type: Team)", "kcm_networkmanagement/team-teams"},
+-    {"kcm_networkmanagement", "plasmanetworkmanagement-kcm", "Add…", "Team (connection type: Team)", "kcm_networkmanagement/team-btnAdd"},
+-    {"kcm_networkmanagement", "plasmanetworkmanagement-kcm", "Edit…", "Team (connection type: Team)", "kcm_networkmanagement/team-btnEdit"},
+-    {"kcm_networkmanagement", "plasmanetworkmanagement-kcm", "Delete", "Team (connection type: Team)", "kcm_networkmanagement/team-btnDelete"},
+     {"kcm_networkmanagement", "plasmanetworkmanagement-kcm", "JSON config:", "Team (connection type: Team)", "kcm_networkmanagement/team-config"},
+     {"kcm_networkmanagement", "plasmanetworkmanagement-kcm", "Import configuration from file…", "Team (connection type: Team)", "kcm_networkmanagement/team-btnImport"},
+     {"kcm_networkmanagement", "plasmanetworkmanagement-kcm", "Interface name:", "Interface (connection type: WireGuard)", "kcm_networkmanagement/wireguardinterfacewidget-interfaceNameLineEdit"},
+@@ -1531,14 +1491,10 @@ inline constexpr Entry entries[] = {
+     {"kcm_networkmanagement", "plasmanetworkmanagement-kcm", "DNS Servers:", "IPv4 (connection type: All except slaves)", "kcm_networkmanagement/ipv4-dns"},
+     {"kcm_networkmanagement", nullptr, "dnsMorePushButton", "IPv4 (connection type: All except slaves)", "kcm_networkmanagement/ipv4-dnsMorePushButton"},
+     {"kcm_networkmanagement", "plasmanetworkmanagement-kcm", "IPv4 is required for this connection", "IPv4 (connection type: All except slaves)", "kcm_networkmanagement/ipv4-ipv4RequiredCB"},
+-    {"kcm_networkmanagement", "plasmanetworkmanagement-kcm", "Add", "IPv4 (connection type: All except slaves)", "kcm_networkmanagement/ipv4-btnAdd"},
+-    {"kcm_networkmanagement", "plasmanetworkmanagement-kcm", "Remove", "IPv4 (connection type: All except slaves)", "kcm_networkmanagement/ipv4-btnRemove"},
+     {"kcm_networkmanagement", nullptr, "tableViewAddresses", "IPv4 (connection type: All except slaves)", "kcm_networkmanagement/ipv4-tableViewAddresses"},
+     {"kcm_networkmanagement", "plasmanetworkmanagement-kcm", "IPv6 is required for this connection", "IPv6 (connection type: Wired, Wi-Fi, Infiniband, Team, CDMA, GSM, Bond, Bridge, VLAN, WireGuard, OpenVPN)", "kcm_networkmanagement/ipv6-ipv6RequiredCB"},
+     {"kcm_networkmanagement", "plasmanetworkmanagement-kcm", "DNS Servers:", "IPv6 (connection type: Wired, Wi-Fi, Infiniband, Team, CDMA, GSM, Bond, Bridge, VLAN, WireGuard, OpenVPN)", "kcm_networkmanagement/ipv6-dns"},
+     {"kcm_networkmanagement", nullptr, "dnsMorePushButton", "IPv6 (connection type: Wired, Wi-Fi, Infiniband, Team, CDMA, GSM, Bond, Bridge, VLAN, WireGuard, OpenVPN)", "kcm_networkmanagement/ipv6-dnsMorePushButton"},
+-    {"kcm_networkmanagement", "plasmanetworkmanagement-kcm", "Remove", "IPv6 (connection type: Wired, Wi-Fi, Infiniband, Team, CDMA, GSM, Bond, Bridge, VLAN, WireGuard, OpenVPN)", "kcm_networkmanagement/ipv6-btnRemove"},
+-    {"kcm_networkmanagement", "plasmanetworkmanagement-kcm", "Add", "IPv6 (connection type: Wired, Wi-Fi, Infiniband, Team, CDMA, GSM, Bond, Bridge, VLAN, WireGuard, OpenVPN)", "kcm_networkmanagement/ipv6-btnAdd"},
+     {"kcm_networkmanagement", nullptr, "tableViewAddresses", "IPv6 (connection type: Wired, Wi-Fi, Infiniband, Team, CDMA, GSM, Bond, Bridge, VLAN, WireGuard, OpenVPN)", "kcm_networkmanagement/ipv6-tableViewAddresses"},
+     {"kcm_networkmanagement", "plasmanetworkmanagement-kcm", "Privacy:", "IPv6 (connection type: Wired, Wi-Fi, Infiniband, Team, CDMA, GSM, Bond, Bridge, VLAN, WireGuard, OpenVPN)", "kcm_networkmanagement/ipv6-privacyCombo"},
+     {"kcm_networkmanagement", "plasmanetworkmanagement-kcm", "Method:", "IPv6 (connection type: Wired, Wi-Fi, Infiniband, Team, CDMA, GSM, Bond, Bridge, VLAN, WireGuard, OpenVPN)", "kcm_networkmanagement/ipv6-method"},
+@@ -1547,13 +1503,9 @@ inline constexpr Entry entries[] = {
+     {"kcm_networkmanagement", "plasmanetworkmanagement-kcm", "Routes…", "IPv6 (connection type: Wired, Wi-Fi, Infiniband, Team, CDMA, GSM, Bond, Bridge, VLAN, WireGuard, OpenVPN)", "kcm_networkmanagement/ipv6-btnRoutes"},
+     {"kcm_networkmanagement", "plasmanetworkmanagement-kcm", "Route Metric:", "IPv6 (connection type: Wired, Wi-Fi, Infiniband, Team, CDMA, GSM, Bond, Bridge, VLAN, WireGuard, OpenVPN)", "kcm_networkmanagement/ipv6-routeMetric"},
+     {"kcm_networkmanagement", "plasmanetworkmanagement-kcm", "Use only for resources on this connection", "Routes dialog (connection type: All except slaves)", "kcm_networkmanagement/ipv4routes-cbNeverDefault"},
+-    {"kcm_networkmanagement", "plasmanetworkmanagement-kcm", "Remove", "Routes dialog (connection type: All except slaves)", "kcm_networkmanagement/ipv4routes-pushButtonRemove"},
+     {"kcm_networkmanagement", nullptr, "tableViewAddresses", "Routes dialog (connection type: All except slaves)", "kcm_networkmanagement/ipv4routes-tableViewAddresses"},
+-    {"kcm_networkmanagement", "plasmanetworkmanagement-kcm", "Add", "Routes dialog (connection type: All except slaves)", "kcm_networkmanagement/ipv4routes-pushButtonAdd"},
+     {"kcm_networkmanagement", "plasmanetworkmanagement-kcm", "Ignore automatically obtained routes", "Routes dialog (connection type: All except slaves)", "kcm_networkmanagement/ipv4routes-cbIgnoreAutoRoutes"},
+     {"kcm_networkmanagement", nullptr, "tableViewAddresses", "Routes dialog (connection type: IPv6-capable types)", "kcm_networkmanagement/ipv6routes-tableViewAddresses"},
+-    {"kcm_networkmanagement", "plasmanetworkmanagement-kcm", "Add", "Routes dialog (connection type: IPv6-capable types)", "kcm_networkmanagement/ipv6routes-pushButtonAdd"},
+-    {"kcm_networkmanagement", "plasmanetworkmanagement-kcm", "Remove", "Routes dialog (connection type: IPv6-capable types)", "kcm_networkmanagement/ipv6routes-pushButtonRemove"},
+     {"kcm_networkmanagement", "plasmanetworkmanagement-kcm", "Ignore automatically obtained routes", "Routes dialog (connection type: IPv6-capable types)", "kcm_networkmanagement/ipv6routes-cbIgnoreAutoRoutes"},
+     {"kcm_networkmanagement", "plasmanetworkmanagement-kcm", "Use only for resources on this connection", "Routes dialog (connection type: IPv6-capable types)", "kcm_networkmanagement/ipv6routes-cbNeverDefault"},
+     {"kcm_networkmanagement", "plasmanetworkmanagement-kcm", "Available Users", "Advanced permissions dialog (connection type: All connection types)", "kcm_networkmanagement/advancedpermissionswidget-availUsers"},
+@@ -1910,7 +1862,6 @@ inline constexpr Entry entries[] = {
+     {"kcm_powerdevilprofilesconfig", "kcm_powerdevilprofilesconfig", "Screen Locking", "Related pages", "kcm_powerdevilprofilesconfig/RelatedScreenLocking"},
+     {"kcm_powerdevilprofilesconfig", "kcm_powerdevilprofilesconfig", "Desktop Session", "Related pages", "kcm_powerdevilprofilesconfig/RelatedDesktopSession"},
+     {"kcm_powerdevilprofilesconfig", "kcm_powerdevilprofilesconfig", "Activities", "Related pages", "kcm_powerdevilprofilesconfig/RelatedActivities"},
+-    {"kcm_printer_manager", "print-manager", "Add…", "toolbar (opens Set up a Printer Connection)", "kcm_printer_manager/AddPrinter"},
+     {"kcm_printer_manager", "print-manager", "Add Group…", "toolbar", "kcm_printer_manager/AddGroup"},
+     {"kcm_printer_manager", "print-manager", "Configure Print Server…", "toolbar", "kcm_printer_manager/ConfigurePrintServer"},
+     {"kcm_printer_manager", "print-manager", "Install It", "banner", "kcm_printer_manager/InstallHelper"},
+@@ -1918,7 +1869,6 @@ inline constexpr Entry entries[] = {
+     {"kcm_printer_manager", "print-manager", "Open Print Queue", "list", "kcm_printer_manager/PrinterListEntry"},
+     {"kcm_printer_manager", "print-manager", "Pause", "list", "kcm_printer_manager/PausePrinter"},
+     {"kcm_printer_manager", "print-manager", "Configure…", "toolbar", "kcm_printer_manager/ConfigurePrinter"},
+-    {"kcm_printer_manager", "print-manager", "Remove", "toolbar", "kcm_printer_manager/RemovePrinter"},
+     {"kcm_printer_manager", "print-manager", "Default printer", "Printer page", "kcm_printer_manager/DefaultPrinter"},
+     {"kcm_printer_manager", "print-manager", "Share this printer", "Printer page", "kcm_printer_manager/SharePrinter"},
+     {"kcm_printer_manager", "print-manager", "Accepting print jobs", "Printer page", "kcm_printer_manager/AcceptingJobs"},
+@@ -1928,9 +1878,6 @@ inline constexpr Entry entries[] = {
+     {"kcm_printer_manager", "print-manager", "Connection:", "details", "kcm_printer_manager/Connection"},
+     {"kcm_printer_manager", "print-manager", "Member Printers:", "details (groups)", "kcm_printer_manager/MemberPrinters"},
+     {"kcm_printer_manager", "print-manager", "Make/Model:", "details", "kcm_printer_manager/MakeModel"},
+-    {"kcm_printer_manager", "print-manager", "Add", "footer", "kcm_printer_manager/ApplyPrinter"},
+-    {"kcm_printer_manager", "print-manager", "Reset", "footer", "kcm_printer_manager/ServerReset"},
+-    {"kcm_printer_manager", "print-manager", "Apply", "footer", "kcm_printer_manager/ServerApply"},
+     {"kcm_printer_manager", "print-manager", "Refresh", "Set up a Printer Connection", "kcm_printer_manager/RefreshDevices"},
+     {"kcm_printer_manager", "print-manager", "Show Detected Devices", "Set up a Printer Connection", "kcm_printer_manager/ShowManualOptions"},
+     {"kcm_printer_manager", "print-manager", "Select Driver…", "Recommended Drivers", "kcm_printer_manager/SelectDriver"},
+@@ -1960,7 +1907,6 @@ inline constexpr Entry entries[] = {
+     {"kcm_pulseaudio", "kcm_pulseaudio", "Rename Devices", "Rename Devices sub-page", "kcm_pulseaudio/RenameDeviceName"},
+     {"kcm_pulseaudio", "kcm_pulseaudio", "Save", "Rename Devices sub-page", "kcm_pulseaudio/RenameSave"},
+     {"kcm_regionandlang", "kcm_regionandlang", "Move to top", "Language", "kcm_regionandlang/LangMoveTop"},
+-    {"kcm_regionandlang", "kcm_regionandlang", "Remove", "Language", "kcm_regionandlang/LangRemove"},
+     {"kcm_regionandlang", "kcm_regionandlang", "Restart now", "Messages", "kcm_regionandlang/RestartNow"},
+     {"kcm_samba", "kcm_samba", "Open folder properties to change share settings", "User-Created Shares", "kcm_samba/OpenProperties"},
+     {"kcm_screenlocker", "kcm_screenlocker", "Custom Duration", "Screen Locking", "kcm_screenlocker/CustomTimeoutDialog"},
+@@ -1986,7 +1932,6 @@ inline constexpr Entry entries[] = {
+     {"kcm_sensors", "kcm_sensors", "Report to %1", "placeholder", "kcm_sensors/ReportError"},
+     {"kcm_smserver", "kcm_smserver", "Restart Now", "Firmware", "kcm_smserver/RestartNow"},
+     {"kcm_soundtheme", "kcm_soundtheme", "Install from File…", "Toolbar", "kcm_soundtheme/InstallFromFile"},
+-    {"kcm_spellchecking", nullptr, "Delete", "Ignored Words dialog", "kcm_spellchecking/IgnoredWord"},
+     {"kcm_splashscreen", "kcm_splashscreen", "&Get New…", "Toolbar", "kcm_splashscreen/GetNew"},
+     {"kcm_splashscreen", "kcm_splashscreen", "Preview splash screen", "Theme list", "kcm_splashscreen/Preview"},
+     {"kcm_splashscreen", "kcm_splashscreen", "Remove splash screen", "Theme list", "kcm_splashscreen/RemoveTheme"},
+@@ -2015,8 +1960,6 @@ inline constexpr Entry entries[] = {
+     {"kcm_usb", "kcmusb", "Report to %1", "placeholder", "kcm_usb/ReportError"},
+     {"kcm_users", "kcm_users", "Set Password", "Change Password", "kcm_users/SetPassword"},
+     {"kcm_users", "kcm_users", "Add New…", "Toolbar", "kcm_users/AddNew"},
+-    {"kcm_users", "kcm_users", "Add", "Fingerprints", "kcm_users/FingerprintAdd"},
+-    {"kcm_users", "kcm_users", "Done", "Fingerprints", "kcm_users/FingerprintDone"},
+     {"kcm_users", "kcm_users", "Username:", "User", "kcm_users/Username-2"},
+     {"kcm_users", nullptr, "Crop avatar picture (crop sheet)", "Change Avatar", "kcm_users/CropSheet"},
+     {"kcm_users", "kcm_users", "Change Wallet Password", "Change Wallet Password", "kcm_users/ChangeWallet-Buttons"},
+@@ -2030,7 +1973,6 @@ inline constexpr Entry entries[] = {
+     {"kcm_vulkan", "kcm_vulkan", "Report to %1", "placeholder", "kcm_vulkan/ReportError"},
+     {"kcm_wallpaper", "kcm_wallpaper", "Set for all screens", "Toolbar switch", "kcm_wallpaper/allScreens"},
+     {"kcm_wallpaper", nullptr, "Per display: choose the screen to set the wallpaper for (screen picker, shown when more than one screen and not all screens)", "Screen picker", "kcm_wallpaper/selectedScreen"},
+-    {"kcm_wallpaper", "kcm_wallpaper", "Add…", "Images", "kcm_wallpaper/Images-Add"},
+     {"kcm_wallpaper", "kcm_wallpaper", "Get New…", "Images", "kcm_wallpaper/Images-GetNew"},
+     {"kcm_wallpaper", "kcm_wallpaper", "Select All", "Images", "kcm_wallpaper/Images-SelectAll"},
+     {"kcm_wallpaper", "kcm_wallpaper", "Select None", "Images", "kcm_wallpaper/Images-SelectNone"},
+@@ -2070,8 +2012,6 @@ inline constexpr Entry entries[] = {
+     {"systemsettings", nullptr, "Quit (Ctrl+Q)", "Window shortcut (not in the hamburger menu)", "systemsettings/Quit"},
+     {"systemsettings", nullptr, "Show menu", "Sidebar header", "systemsettings/HamburgerButton"},
+     {"systemsettings", nullptr, "No items matching your search", "Sidebar top", "systemsettings/Search"},
+-    {"systemsettings", nullptr, "Back", "Sidebar", "systemsettings/CategoryList"},
+-    {"systemsettings", nullptr, "Back", "sub-category page", "systemsettings/SubBack"},
+     {"systemsettings", nullptr, "Per page: auxiliary action or switch shown at the end of a sidebar row (e.g. a quick toggle declared by a KCM)", "Sidebar rows", "systemsettings/AuxAction"},
+     {"systemsettings", nullptr, "Apply (page button, enabled when the page has changes)", "Page footer", "systemsettings/Apply"},
+     {"systemsettings", nullptr, "Defaults (page button; only on pages that support it)", "Page footer", "systemsettings/Defaults"},

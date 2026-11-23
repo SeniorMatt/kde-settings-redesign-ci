@@ -1,0 +1,45 @@
+From a7eb6c43e04a58fc6b3d391a5894b0239ca4ba07 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 02:07:53 +0500
+Subject: [PATCH 17/31] kcm_baloofile: no Pause button while baloo_file is not
+ running; offer Start Indexer
+
+Monitor.toggleSuspendState needs the running baloo_file; with balooRunning false the state line also drops
+the meaningless '0% complete'. Start uses Monitor.startBaloo (qmltypes in the container). Pause/Resume as before while it runs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/baloo/ui/IndexerStatus.qml | 13 +++++++++----
+ 1 file changed, 9 insertions(+), 4 deletions(-)
+
+diff --git a/kcms/baloo/ui/IndexerStatus.qml b/kcms/baloo/ui/IndexerStatus.qml
+index 2f027a8..fd93d8e 100644
+--- a/kcms/baloo/ui/IndexerStatus.qml
++++ b/kcms/baloo/ui/IndexerStatus.qml
+@@ -42,16 +42,21 @@ ColumnLayout {
+         QQC2.Label {
+             // ksr: kcm_baloofile/IndexerStatus
+             Layout.fillWidth: true
+-            text: i18nc("State and a percentage of progress", "%1, %2% complete", monitor.stateString, monitor.completionPercentage)
++            text: monitor.balooRunning ? i18nc("State and a percentage of progress", "%1, %2% complete", monitor.stateString, monitor.completionPercentage)
++                                       : monitor.stateString
+             textFormat: Text.PlainText
+             wrapMode: Text.Wrap
+         }
+ 
++        // Pause/Resume only means something while baloo_file runs (Monitor.toggleSuspendState talks to it);
++        // when it is not running the action is to start it (Monitor.startBaloo).
+         QQC2.Button {
+             // ksr: kcm_baloofile/PauseResume
+-            icon.name: monitor.state !== Baloo.Global.Suspended ? "media-playback-pause" : "media-playback-start"
+-            text: monitor.state !== Baloo.Global.Suspended ? i18nc("@action:button", "Pause Indexer") : i18nc("@action:button", "Resume Indexer")
+-            onClicked: monitor.toggleSuspendState()
++            icon.name: !monitor.balooRunning ? "media-playback-start"
++                     : monitor.state !== Baloo.Global.Suspended ? "media-playback-pause" : "media-playback-start"
++            text: !monitor.balooRunning ? i18nc("@action:button", "Start Indexer")
++                : monitor.state !== Baloo.Global.Suspended ? i18nc("@action:button", "Pause Indexer") : i18nc("@action:button", "Resume Indexer")
++            onClicked: monitor.balooRunning ? monitor.toggleSuspendState() : monitor.startBaloo()
+         }
+     }
+ 

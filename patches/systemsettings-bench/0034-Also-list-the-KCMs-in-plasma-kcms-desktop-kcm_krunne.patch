@@ -1,0 +1,25 @@
+From 5f09ec5eb8bfb5be01c91b97b1b93bf670237e16 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 16:01:05 +0500
+Subject: [PATCH 34/34] Also list the KCMs in plasma/kcms/desktop
+ (kcm_krunnersettings), which the layout places as Search Box Behavior
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ app/kcmmetadatahelpers.h | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/app/kcmmetadatahelpers.h b/app/kcmmetadatahelpers.h
+index 2a97ec5..ef339cf 100644
+--- a/app/kcmmetadatahelpers.h
++++ b/app/kcmmetadatahelpers.h
+@@ -115,6 +115,8 @@ inline QList<KPluginMetaData> findKCMsMetaData(MetaDataSource source)
+     if (source & SystemSettings) {
+         metaDataList << KPluginMetaData::findPlugins(QStringLiteral("plasma/kcms/systemsettings"), filter);
+         metaDataList << KPluginMetaData::findPlugins(QStringLiteral("plasma/kcms/systemsettings_qwidgets"), filter);
++        // KRunner's settings (kcm_krunnersettings) live here; the redesigned layout gives them a page ("Search Box Behavior")
++        metaDataList << KPluginMetaData::findPlugins(QStringLiteral("plasma/kcms/desktop"), filter);
+     }
+     if (source & KInfoCenter) {
+         metaDataList << KPluginMetaData::findPlugins(QStringLiteral("plasma/kcms/kinfocenter"), filter);

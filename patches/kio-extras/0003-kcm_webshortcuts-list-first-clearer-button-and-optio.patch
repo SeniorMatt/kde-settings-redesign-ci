@@ -1,0 +1,169 @@
+From c3421cbdde06a16cfbbd349b9837df05ffef15ad Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 15:06:54 +0500
+Subject: [PATCH 3/4] kcm_webshortcuts: list first, clearer button and option
+ labels (QtWidgets kept)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Page type: List (docs/page-design.md sections 1, 4, 8). Stays QtWidgets (ui file edit only). The provider list with its search
+field and buttons now comes right after the master checkbox; Default search engine, Keyword delimiter and the preferred-only
+checkbox move below the list (the checkbox used to sit between master switch and list). Settings, kuriikwsfilterrc keys and
+providers unchanged.
+
+Renamed (inventory/relabel/kcm_webshortcuts.tsv): 'Enable Web search keywords' -> 'Use web search keywords';
+'Use preferred keywords only' -> 'Only show preferred keywords'; 'New…' -> 'Add Keyword…'; 'Delete' -> 'Remove';
+'Default Web search keyword:' -> 'Default search engine:'. Page name unchanged, so no new aliases. ksr: markers in the ui files.
+
+Speed (from code): FilterOptions::load() reads every provider .desktop file synchronously (ikwsopts.cpp:319); not changed,
+needs a worker thread, too risky unbuilt. After: pending, manager will measure.
+
+HIG: HIG-005, HIG-006, HIG-019.
+
+Not built yet (freeze). Grid row/colspan changes in the .ui unverified visually.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/webshortcuts/ikwsopts_ui.ui          | 30 ++++++++++++++---------
+ kcms/webshortcuts/searchproviderdlg_ui.ui |  1 +
+ 2 files changed, 19 insertions(+), 12 deletions(-)
+
+diff --git a/kcms/webshortcuts/ikwsopts_ui.ui b/kcms/webshortcuts/ikwsopts_ui.ui
+index 1a6623b..c492bfb 100644
+--- a/kcms/webshortcuts/ikwsopts_ui.ui
++++ b/kcms/webshortcuts/ikwsopts_ui.ui
+@@ -12,12 +12,13 @@
+   </property>
+   <layout class="QGridLayout" name="gridLayout">
+    <item row="0" column="0">
++    <!-- ksr: kcm_webshortcuts/cbEnableShortcuts -->
+     <widget class="QCheckBox" name="cbEnableShortcuts">
+      <property name="toolTip">
+       <string>Check to recognise and use the web search keywords in applications that can use them</string>
+      </property>
+      <property name="text">
+-      <string>&amp;Enable Web search keywords</string>
++      <string>&amp;Use web search keywords</string>
+      </property>
+     </widget>
+    </item>
+@@ -43,20 +44,21 @@
+        </property>
+      </widget>
+    </item>
+-   <item row="1" column="0">
++   <item row="4" column="0" colspan="2">
++    <!-- ksr: kcm_webshortcuts/cbUseSelectedShortcutsOnly -->
+     <widget class="QCheckBox" name="cbUseSelectedShortcutsOnly">
+      <property name="enabled">
+       <bool>false</bool>
+      </property>
+      <property name="toolTip">
+-      <string>&lt;p&gt;Check to only use the preferred web search keywords, as selected in the list below, where necessary.&lt;/p&gt;&lt;p&gt;If this is checked, then applications that can only show a limited number of search keywords (for example, Konqueror when text on a page is selected) will only show the preferred keywords.&lt;/p&gt;</string>
++      <string>&lt;p&gt;Check to only use the preferred web search keywords, as selected in the list above, where necessary.&lt;/p&gt;&lt;p&gt;If this is checked, then applications that can only show a limited number of search keywords (for example, Konqueror when text on a page is selected) will only show the preferred keywords.&lt;/p&gt;</string>
+      </property>
+      <property name="text">
+-      <string>&amp;Use preferred keywords only</string>
++      <string>Only show &amp;preferred keywords</string>
+      </property>
+     </widget>
+    </item>
+-   <item row="2" column="0">
++   <item row="1" column="0">
+     <widget class="QLineEdit" name="searchLineEdit">
+      <property name="placeholderText">
+       <string>Search...</string>
+@@ -66,7 +68,7 @@
+      </property>
+     </widget>
+    </item>
+-   <item row="3" column="0">
++   <item row="2" column="0">
+     <widget class="QTreeView" name="lvSearchProviders">
+      <property name="rootIsDecorated">
+       <bool>false</bool>
+@@ -88,19 +90,21 @@
+      </property>
+     </widget>
+    </item>
+-   <item row="3" column="1">
++   <item row="2" column="1">
+     <layout class="QVBoxLayout" name="verticalLayout">
+      <item>
++      <!-- ksr: kcm_webshortcuts/pbNew -->
+       <widget class="QPushButton" name="pbNew">
+        <property name="toolTip">
+         <string>Add a new Web search keyword</string>
+        </property>
+        <property name="text">
+-        <string>&amp;New…</string>
++        <string>&amp;Add Keyword…</string>
+        </property>
+       </widget>
+      </item>
+      <item>
++      <!-- ksr: kcm_webshortcuts/pbChange -->
+       <widget class="QPushButton" name="pbChange">
+        <property name="enabled">
+         <bool>false</bool>
+@@ -109,11 +113,12 @@
+         <string>Modify the highlighted Web search keyword</string>
+        </property>
+        <property name="text">
+-        <string>Ed&amp;it…</string>
++        <string>&amp;Edit…</string>
+        </property>
+       </widget>
+      </item>
+      <item>
++      <!-- ksr: kcm_webshortcuts/pbDelete -->
+       <widget class="QPushButton" name="pbDelete">
+        <property name="enabled">
+         <bool>false</bool>
+@@ -122,7 +127,7 @@
+         <string>Delete the highlighted Web search keyword</string>
+        </property>
+        <property name="text">
+-        <string>De&amp;lete</string>
++        <string>&amp;Remove</string>
+        </property>
+       </widget>
+      </item>
+@@ -141,12 +146,13 @@
+      </item>
+     </layout>
+    </item>
+-   <item row="4" column="0">
++   <item row="3" column="0" colspan="2">
+     <layout class="QFormLayout" name="formLayout">
+      <property name="fieldGrowthPolicy">
+       <enum>QFormLayout::AllNonFixedFieldsGrow</enum>
+      </property>
+      <item row="0" column="0">
++      <!-- ksr: kcm_webshortcuts/cmbDefaultEngine -->
+       <widget class="QLabel" name="lbDefaultEngine">
+        <property name="enabled">
+         <bool>true</bool>
+@@ -158,7 +164,7 @@
+         </sizepolicy>
+        </property>
+        <property name="text">
+-        <string>Default Web &amp;search keyword:</string>
++        <string>Default &amp;search engine:</string>
+        </property>
+        <property name="wordWrap">
+         <bool>false</bool>
+diff --git a/kcms/webshortcuts/searchproviderdlg_ui.ui b/kcms/webshortcuts/searchproviderdlg_ui.ui
+index bf80860..e0d9f96 100644
+--- a/kcms/webshortcuts/searchproviderdlg_ui.ui
++++ b/kcms/webshortcuts/searchproviderdlg_ui.ui
+@@ -99,6 +99,7 @@ The keywords entered here can be used as a pseudo-URI scheme in KDE. For example
+     </widget>
+    </item>
+    <item row="0" column="2" colspan="2">
++    <!-- ksr: kcm_webshortcuts/leName (unchanged) -->
+     <widget class="QLineEdit" name="leName">
+      <property name="toolTip">
+       <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Enter the human-readable name of the Web search keyword here.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>

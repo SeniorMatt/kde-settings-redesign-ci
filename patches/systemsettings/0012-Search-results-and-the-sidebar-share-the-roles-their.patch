@@ -1,0 +1,114 @@
+From 65a136cdc3ba4f2481416478d094cc5861333528 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 09:04:46 +0500
+Subject: [PATCH 12/22] Search results and the sidebar share the roles their
+ delegates need
+
+The list switches between the two models and their delegates one after the
+other, which logged "Required property ... was not initialized" for the
+moment in between.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ app/SettingsSearchModel.cpp | 12 ++++++++++++
+ app/SettingsSearchModel.h   |  5 +++++
+ app/SidebarModel.cpp        |  9 +++++++++
+ app/SidebarModel.h          |  4 ++++
+ 4 files changed, 30 insertions(+)
+
+diff --git a/app/SettingsSearchModel.cpp b/app/SettingsSearchModel.cpp
+index c8bb14e..229bac9 100644
+--- a/app/SettingsSearchModel.cpp
++++ b/app/SettingsSearchModel.cpp
+@@ -8,6 +8,7 @@
+ 
+ #include "MenuItem.h"
+ #include "MenuModel.h"
++#include "SidebarModel.h"
+ #include "settingsindex_p.h"
+ 
+ #include <KCModuleData>
+@@ -193,6 +194,11 @@ QHash<int, QByteArray> SettingsSearchModel::roleNames() const
+     names[MenuModel::AuxiliaryActionRole] = "auxiliaryAction";
+     names[MenuModel::DescriptionRole] = "description";
+     names[ResultKindRole] = "resultKind";
++    // What the delegates of the sidebar need as well, see SidebarModel
++    names[SidebarKindRole] = "kind";
++    names[SidebarExpandableRole] = "expandable";
++    names[SidebarExpandedRole] = "expanded";
++    names[SidebarCurrentRole] = "isCurrent";
+     return names;
+ }
+ 
+@@ -243,6 +249,12 @@ QVariant SettingsSearchModel::data(const QModelIndex &index, int role) const
+         return {};
+     case ResultKindRole:
+         return result.kind;
++    case SidebarKindRole:
++        return SidebarModel::PageRow;
++    case SidebarExpandableRole:
++    case SidebarExpandedRole:
++    case SidebarCurrentRole:
++        return false;
+     default:
+         return {};
+     }
+diff --git a/app/SettingsSearchModel.h b/app/SettingsSearchModel.h
+index 00c3897..696b988 100644
+--- a/app/SettingsSearchModel.h
++++ b/app/SettingsSearchModel.h
+@@ -42,6 +42,11 @@ public:
+ 
+     enum Roles {
+         ResultKindRole = Qt::UserRole + 100,
++        // Roles of SidebarModel, which the sidebar's delegates need. Their values there collide with MenuModel's.
++        SidebarKindRole,
++        SidebarExpandableRole,
++        SidebarExpandedRole,
++        SidebarCurrentRole,
+     };
+ 
+     /**
+diff --git a/app/SidebarModel.cpp b/app/SidebarModel.cpp
+index 957fadb..8bff92f 100644
+--- a/app/SidebarModel.cpp
++++ b/app/SidebarModel.cpp
+@@ -49,6 +49,9 @@ QHash<int, QByteArray> SidebarModel::roleNames() const
+         {DescriptionRole, "description"},
+         {DefaultIndicatorRole, "showDefaultIndicator"},
+         {AuxiliaryActionRole, "auxiliaryAction"},
++        {IsCategoryRole, "isCategory"},
++        {IsKCMRole, "isKCM"},
++        {BreadcrumbRole, "breadcrumb"},
+     };
+ }
+ 
+@@ -99,6 +102,12 @@ QVariant SidebarModel::data(const QModelIndex &index, int role) const
+             return QVariant::fromValue(row.item->moduleData()->auxiliaryAction());
+         }
+         return {};
++    case IsCategoryRole:
++        return row.kind == CategoryRow;
++    case IsKCMRole:
++        return row.kind == PageRow;
++    case BreadcrumbRole:
++        return row.item ? row.item->breadcrumb() : QString();
+     default:
+         return {};
+     }
+diff --git a/app/SidebarModel.h b/app/SidebarModel.h
+index 949ccc7..43c9016 100644
+--- a/app/SidebarModel.h
++++ b/app/SidebarModel.h
+@@ -50,6 +50,10 @@ public:
+         DescriptionRole,
+         DefaultIndicatorRole,
+         AuxiliaryActionRole,
++        // The same roles as the search results have, so that a view can show either with the same delegate
++        IsCategoryRole,
++        IsKCMRole,
++        BreadcrumbRole,
+     };
+ 
+     /**

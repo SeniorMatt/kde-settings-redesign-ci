@@ -1,0 +1,292 @@
+From d7f38432e40ab1ee4515ca33ad3eb819d9d5f57e Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 01:31:35 +0500
+Subject: [PATCH 10/12] =?UTF-8?q?kcm=5Fkwinrules:=20labelled=20actions,=20?=
+ =?UTF-8?q?row=20opens=20the=20editor,=20"=E2=80=A6"=20menu,=20empty=20sta?=
+ =?UTF-8?q?tes=20with=20an=20action?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Page type: List with the rule editor as the existing sub-page (docs/page-design.md 1, 4). Rule storage (kwinrulesrc), policies,
+properties, the uuid/whole-app launch arguments and the window-info D-Bus calls are unchanged.
+
+Moved / renamed:
+- Toolbar: "Add New…" -> "Add Rule…", "Import…" -> "Import Rules…", "Export…" -> "Export Rules…" (names say what is added).
+  Old wording added to the page aliases in ia/layout.json ("special window settings", "add new rule").
+- Rule row: clicking the row opens the editor (was only the Edit button); two inline icon actions (Edit, Delete) and a "…"
+  menu with Duplicate (was three icon buttons). Buttons are flat, have tooltips and Accessible.name.
+- Empty list: placeholder "No window rules yet" with an "Add Rule…" button (was text that told to click a toolbar button).
+- Editor: "Add Property..." -> "Add Property…", "Detect Window Properties" -> "Detect Window Properties…" (opens a picker or
+  waits for a click), empty state gets an "Add Property…" button, the per-property remove button gets a tooltip and name
+  ("Remove Property"; was an unnamed icon button).
+- Markers and relabel table (inventory/relabel/kcm_kwinrules.tsv); markers also added on the weak rows (policy combo,
+  value editors, add-property sheet, delay spin, export buttons, launch args) so --strict can prove them. --strict: 68 ok, 0 lost.
+HIG ids: HIG-001/005/006, HIG-019, HIG-047 (empty state with action), HIG-058, HIG-066 (accessible names). Page-design 3, 4.
+
+Speed: no blocking work found. The constructor only builds the 44 RuleItems (in memory), kwinrulesrc is read in load(),
+getWindowInfo and the detect call are already async (kcmrules.cpp parseArguments, rulesmodel.cpp), and the editor is created
+only by kcm.push when a rule is opened. Nothing changed there; the section/row count stays (4 sections: Window matching,
+Size & Position, Arrangement & Access, Appearance & Fixes, left as the model names them).
+After-numbers: pending, manager will measure. Not built yet. Unconfirmed without a build: QQC2.Menu.popup(item, x, y) and
+icon "overflow-menu" in the delegate; the row onClicked sharing space with the borderless description TextField.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ src/kcms/rules/kcmrules.cpp            |  1 +
+ src/kcms/rules/ui/RuleItemDelegate.qml |  7 ++++
+ src/kcms/rules/ui/RulesEditor.qml      | 16 +++++---
+ src/kcms/rules/ui/ValueEditor.qml      | 10 ++---
+ src/kcms/rules/ui/main.qml             | 53 +++++++++++++++++++-------
+ 5 files changed, 63 insertions(+), 24 deletions(-)
+
+diff --git a/src/kcms/rules/kcmrules.cpp b/src/kcms/rules/kcmrules.cpp
+index 19cea24..0f0b473 100644
+--- a/src/kcms/rules/kcmrules.cpp
++++ b/src/kcms/rules/kcmrules.cpp
+@@ -44,6 +44,7 @@ KCMKWinRules::KCMKWinRules(QObject *parent, const KPluginMetaData &metaData, con
+ 
+ void KCMKWinRules::parseArguments(const QStringList &args)
+ {
++    // ksr: kcm_kwinrules/kcm-args-uuid
+     // When called from window menu, "uuid" and "whole-app" are set in arguments list
+     bool nextArgIsUuid = false;
+     QUuid uuid = QUuid();
+diff --git a/src/kcms/rules/ui/RuleItemDelegate.qml b/src/kcms/rules/ui/RuleItemDelegate.qml
+index fbb7873..d46b1fa 100644
+--- a/src/kcms/rules/ui/RuleItemDelegate.qml
++++ b/src/kcms/rules/ui/RuleItemDelegate.qml
+@@ -70,6 +70,8 @@ QQC2.ItemDelegate {
+ 
+             OptionsComboBox {
+                 id: policyCombo
++                // ksr: kcm_kwinrules/rule-policy-set
++                // ksr: kcm_kwinrules/rule-policy-match
+                 Layout.preferredWidth: 50  // 50%
+                 Layout.fillWidth: true
+                 Layout.alignment: Qt.AlignVCenter
+@@ -100,6 +102,11 @@ QQC2.ItemDelegate {
+             QQC2.ToolButton {
+                 id: itemEnabled
+                 icon.name: "edit-delete"
++                display: QQC2.AbstractButton.IconOnly
++                text: i18n("Remove Property") // ksr: kcm_kwinrules/rule-remove-property
++                Accessible.name: text
++                QQC2.ToolTip.text: text
++                QQC2.ToolTip.visible: hovered || visualFocus
+                 visible: model.selectable
+                 Layout.alignment: Qt.AlignVCenter
+                 onClicked: {
+diff --git a/src/kcms/rules/ui/RulesEditor.qml b/src/kcms/rules/ui/RulesEditor.qml
+index 12d1971..3d4456c 100644
+--- a/src/kcms/rules/ui/RulesEditor.qml
++++ b/src/kcms/rules/ui/RulesEditor.qml
+@@ -63,8 +63,13 @@ KCM.ScrollViewKCM {
+                 id: hintArea
+                 anchors.centerIn: parent
+                 width: parent.width - (Kirigami.Units.largeSpacing * 4)
+-                text: i18n("No window properties changed")
+-                explanation: xi18nc("@info", "Click the <interface>Add Property...</interface> button below to add some window properties that will be affected by the rule")
++                text: i18n("This rule does not change anything yet")
++                explanation: i18n("Add the window properties this rule should set, for example its size or position.")
++                helpfulAction: Kirigami.Action {
++                    icon.name: "list-add"
++                    text: i18n("Add Property…")
++                    onTriggered: propertySheet.visible = true
++                }
+             }
+         }
+     }
+@@ -85,7 +90,7 @@ KCM.ScrollViewKCM {
+ 
+     footer:  RowLayout {
+         QQC2.Button {
+-            text: i18n("Add Property...")
++            text: i18n("Add Property…") // ksr: kcm_kwinrules/Add-Property
+             icon.name: "list-add"
+             onClicked: {
+                 propertySheet.visible = true;
+@@ -96,7 +101,7 @@ KCM.ScrollViewKCM {
+         }
+         QQC2.Button {
+             id: detectButton
+-            text: i18n("Detect Window Properties")
++            text: i18n("Detect Window Properties…") // ksr: kcm_kwinrules/rulesModel-detectWindowProperties
+             icon.name: "edit-find"
+             enabled: !propertySheet.visible && !errorDialog.visible
+             onClicked: {
+@@ -107,6 +112,7 @@ KCM.ScrollViewKCM {
+         }
+         QQC2.SpinBox {
+             id: delaySpin
++            // ksr: kcm_kwinrules/detect-delay
+             enabled: detectButton.enabled
+             Layout.preferredWidth: Math.max(metricsInstant.advanceWidth, metricsAfter.advanceWidth) + Kirigami.Units.gridUnit * 4
+             from: 0
+@@ -175,7 +181,7 @@ KCM.ScrollViewKCM {
+     Kirigami.OverlaySheet {
+         id: propertySheet
+ 
+-        title: i18n("Add property to the rule")
++        title: i18n("Add property to the rule") // ksr: kcm_kwinrules/rule-add-property
+ 
+         footer: Kirigami.SearchField {
+             id: searchField
+diff --git a/src/kcms/rules/ui/ValueEditor.qml b/src/kcms/rules/ui/ValueEditor.qml
+index a3df75c..b48da3b 100644
+--- a/src/kcms/rules/ui/ValueEditor.qml
++++ b/src/kcms/rules/ui/ValueEditor.qml
+@@ -27,14 +27,14 @@ Loader {
+         switch (controlType) {
+             case RuleItem.Boolean: return booleanEditor
+             case RuleItem.String: return stringEditor
+-            case RuleItem.Integer: return integerEditor
++            case RuleItem.Integer: return integerEditor // ksr: kcm_kwinrules/rule-value-int
+             case RuleItem.Option: return optionEditor
+             case RuleItem.NetTypes: return netTypesEditor
+-            case RuleItem.Percentage: return percentageEditor
++            case RuleItem.Percentage: return percentageEditor // ksr: kcm_kwinrules/rule-value-percentage
+             case RuleItem.Point: return coordinateEditor
+             case RuleItem.Size: return coordinateEditor
+-            case RuleItem.Shortcut: return shortcutEditor
+-            case RuleItem.OptionList: return optionListEditor
++            case RuleItem.Shortcut: return shortcutEditor // ksr: kcm_kwinrules/rule-value-shortcut
++            case RuleItem.OptionList: return optionListEditor // ksr: kcm_kwinrules/rule-types
+             default: return emptyEditor
+         }
+     }
+@@ -51,7 +51,7 @@ Loader {
+                 Layout.fillWidth: true
+             }
+             QQC2.RadioButton {
+-                text: i18n("Yes")
++                text: i18n("Yes") // ksr: kcm_kwinrules/Yes
+                 checked: ruleValue
+                 Layout.margins: Kirigami.Units.smallSpacing
+                 onToggled: valueEditor.valueEdited(checked)
+diff --git a/src/kcms/rules/ui/main.qml b/src/kcms/rules/ui/main.qml
+index 1228c6d..7aadf01 100644
+--- a/src/kcms/rules/ui/main.qml
++++ b/src/kcms/rules/ui/main.qml
+@@ -25,19 +25,19 @@ KCM.ScrollViewKCM {
+     actions: [
+         Kirigami.Action {
+             enabled: !exportInfo.visible
+-            text: i18n("Add New…")
++            text: i18n("Add Rule…") // ksr: kcm_kwinrules/create-rule
+             icon.name: "list-add-symbolic"
+             displayHint: Kirigami.DisplayHint.KeepVisible
+             onTriggered: kcm.createRule();
+         },
+         Kirigami.Action {
+             enabled: !exportInfo.visible
+-            text: i18n("Import…")
++            text: i18n("Import Rules…") // ksr: kcm_kwinrules/import-rules
+             icon.name: "document-import-symbolic"
+             onTriggered: importDialog.active = true;
+         },
+         Kirigami.Action {
+-            text: checked ? i18n("Cancel Export") : i18n("Export…")
++            text: checked ? i18n("Cancel Export") : i18n("Export Rules…") // ksr: kcm_kwinrules/export-rules
+             icon.name: exportInfo.visible ? "dialog-cancel-symbolic" : "document-export-symbolic"
+             checkable: true
+             checked: exportInfo.visible
+@@ -85,8 +85,14 @@ KCM.ScrollViewKCM {
+             anchors.centerIn: parent
+             width: parent.width - (Kirigami.Units.largeSpacing * 4)
+             icon.name: "preferences-system-windows-actions"
+-            text: i18n("No rules for specific windows are currently set");
+-            explanation: xi18nc("@info", "Click <interface>Add New…</interface> to add some")
++            text: i18n("No window rules yet")
++            explanation: i18n("A rule changes how KWin treats a window that matches it, for example its size, position or titlebar.")
++            helpfulAction: Kirigami.Action {
++                enabled: !exportInfo.visible
++                icon.name: "list-add-symbolic"
++                text: i18n("Add Rule…")
++                onTriggered: kcm.createRule()
++            }
+         }
+     }
+ 
+@@ -98,7 +104,7 @@ KCM.ScrollViewKCM {
+         actions: [
+             Kirigami.Action {
+                 icon.name: "dialog-ok-apply"
+-                text: checked ? i18n("Unselect All") : i18n("Select All")
++                text: checked ? i18n("Unselect All") : i18n("Select All") // ksr: kcm_kwinrules/export-select-all
+                 checkable: true
+                 checked: selectedIndexes.length === ruleBookView.count
+                 onToggled: {
+@@ -112,7 +118,7 @@ KCM.ScrollViewKCM {
+             ,
+             Kirigami.Action {
+                 icon.name: "document-save"
+-                text: i18n("Save Rules")
++                text: i18n("Save Rules") // ksr: kcm_kwinrules/export-save
+                 enabled: selectedIndexes.length > 0
+                 onTriggered: {
+                     exportDialog.active = true;
+@@ -146,6 +152,12 @@ KCM.ScrollViewKCM {
+ 
+             width: ruleBookView.width
+             down: false  // Disable press effect
++            hoverEnabled: !exportInfo.visible
++            onClicked: {
++                if (!exportInfo.visible) {
++                    kcm.editRule(index);
++                }
++            }
+ 
+             // use alternating background colors to visually connect list items'
+             // left and right side content elements
+@@ -202,22 +214,33 @@ KCM.ScrollViewKCM {
+                     }
+                 }
+ 
++                // Two inline actions; Duplicate is in the "…" menu (page-design.md 4)
+                 DelegateButton {
+-                    text: i18n("Edit")
++                    text: i18n("Edit") // ksr: kcm_kwinrules/editRule
+                     icon.name: "edit-entry"
+                     onClicked: kcm.editRule(index);
+                 }
+ 
+                 DelegateButton {
+-                    text: i18n("Duplicate")
+-                    icon.name: "edit-duplicate"
+-                    onClicked: kcm.duplicateRule(index);
++                    text: i18n("Delete") // ksr: kcm_kwinrules/removeRule
++                    icon.name: "edit-delete-remove"
++                    onClicked: kcm.removeRule(index);
+                 }
+ 
+                 DelegateButton {
+-                    text: i18n("Delete")
+-                    icon.name: "edit-delete-remove"
+-                    onClicked: kcm.removeRule(index);
++                    id: moreButton
++                    text: i18n("More Actions")
++                    icon.name: "overflow-menu"
++                    onClicked: moreMenu.popup(moreButton, 0, moreButton.height)
++
++                    QQC2.Menu {
++                        id: moreMenu
++                        QQC2.MenuItem {
++                            text: i18n("Duplicate") // ksr: kcm_kwinrules/duplicateRule
++                            icon.name: "edit-duplicate"
++                            onTriggered: kcm.duplicateRule(index);
++                        }
++                    }
+                 }
+ 
+                 QQC2.CheckBox {
+@@ -241,6 +264,8 @@ KCM.ScrollViewKCM {
+     component DelegateButton: QQC2.Button {
+         visible: !exportInfo.visible
+         display: QQC2.AbstractButton.IconOnly
++        flat: true
++        Accessible.name: text
+         QQC2.ToolTip.text: text
+         QQC2.ToolTip.visible: hovered || visualFocus
+     }

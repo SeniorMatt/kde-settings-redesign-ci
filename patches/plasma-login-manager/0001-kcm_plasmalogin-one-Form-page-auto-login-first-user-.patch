@@ -1,0 +1,590 @@
+From 1bb7e6b43cf8ba31a6f438b35fc56b2f8c75ab6a Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 02:25:05 +0500
+Subject: [PATCH] kcm_plasmalogin: one Form page, auto-login first, user and
+ session as plain form rows
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Page type: Form (docs/page-design.md). KAuth save/sync/reset actions, config keys, defaults and the wallet check are
+unchanged. Appearance.qml (sub-page with the wallpaper plugin config) is not touched: its FormLayout must stay
+aligned with the wallpaper plugin's own config.qml (parentLayout alias).
+
+Moved / renamed:
+- Kirigami.Form/FormGroup/FormEntry -> Kirigami.FormLayout with separator sections (noun titles).
+- Section 1 (no title): "Auto-login:" checkbox "Log in automatically" (was "Automatically log in: as user:"),
+  then "User:" and "Session:" combo boxes as ordinary labelled rows (were two sentence fragments "as user:" /
+  "with session:"), "Log in again immediately after logging off". The combos are disabled while auto-login is off
+  instead of hidden (kcm_plasmalogin/settings-user, User, Session, Relogin).
+- The KDE Wallet warning is its own form row with a capped width (24 gridUnit) so it cannot push the form into
+  narrow mode (kcm_plasmalogin/OpenWallet).
+- "Defaults" -> "Pre-selected at login": "User:" Last logged-in user / Specific user: [combo], "Session:" likewise
+  (kcm_plasmalogin/settings-preselectedUser, settings-preselectedSession).
+- Toolbar actions "Apply Plasma Settings…" and "Configure Appearance…" became buttons in a new "Appearance"
+  section at the end, with a one-line hint for what Apply copies (kcm_plasmalogin/ApplyPlasmaSettings, ConfigureAppearance).
+- Same structure and wording as kcm_sddm Behavior (auto-login rows), see the sddm-kcm commit.
+- Relabel table: inventory/relabel/kcm_plasmalogin.tsv (outer repo).
+
+Speed (read from code, not changed here): PlasmaLoginKcm::load() builds the wallpaper plugin (WallpaperIntegration::init,
+KPackage lookup, KConfigLoader) before the first frame (src/frontend/kcm/kcm.cpp load, settings/wallpapersettings.cpp
+loadWallpaperConfig), although only the Appearance sub-page shows it; moving it is not safe because isDefaults and
+isSaveNeeded read it. PlasmaLoginData's constructor makes a blocking system-bus call to systemd (plasmalogindata.cpp:20-28),
+which runs in the module-data hook, not at page open. The main page itself is now lighter (no per-row Loader-less
+nesting, no Form/FormGroup). After: pending, manager will measure.
+
+HIG: HIG-001, HIG-005, HIG-006, HIG-013, HIG-017, HIG-019, HIG-020, HIG-023, HIG-058.
+Not built yet. Combo boxes in the auto-login rows show an empty box while auto-login is off and no user is set.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ src/frontend/kcm/ui/main.qml | 471 +++++++++++++++++------------------
+ 1 file changed, 225 insertions(+), 246 deletions(-)
+
+diff --git a/src/frontend/kcm/ui/main.qml b/src/frontend/kcm/ui/main.qml
+index 90cff34..c5b3df8 100644
+--- a/src/frontend/kcm/ui/main.qml
++++ b/src/frontend/kcm/ui/main.qml
+@@ -23,19 +23,6 @@ KCM.SimpleKCM {
+     implicitHeight: Kirigami.Units.gridUnit * 45
+     implicitWidth: Kirigami.Units.gridUnit * 45
+ 
+-    actions: [
+-        Kirigami.Action {
+-            text: i18nc("@action:button", "Apply Plasma Settings…")
+-            icon.name: "plasma"
+-            onTriggered: syncSheet.open()
+-        },
+-        Kirigami.Action {
+-            text: i18nc("@action:button", "Configure Appearance…")
+-            icon.name: "edit-image-symbolic"
+-            onTriggered: kcm.push("Appearance.qml")
+-        }
+-    ]
+-
+     header: Kirigami.InlineMessage {
+         id: errorMessage
+         position: Kirigami.InlineMessage.Position.Header
+@@ -80,296 +67,288 @@ KCM.SimpleKCM {
+         ]
+     }
+ 
+-    Kirigami.Form {
+-
+-        Kirigami.FormGroup {
+-            title: i18nc("@title:group", "Auto-login")
+-
+-            Kirigami.FormEntry {
+-                title: i18nc("part of a sentence: 'Automatically log in [as user: foo / with session: bar]'", "Automatically log in:")
+-
+-                contentItem: ColumnLayout {
+-                    Kirigami.FormData.buddyFor: autologinBox
+-
+-                    spacing: Kirigami.Units.smallSpacing
+-
+-                    RowLayout {
+-                        spacing: Kirigami.Units.smallSpacing
+-
+-                        QQC2.CheckBox {
+-                            id: autologinBox
+-                            Layout.preferredWidth: Math.max(width, autoLoginSessionLabel.width)
+-
+-                            text: i18nc("@label:listbox part of a sentence: '[Automatically log in] as user: [foo / with session: bar]'", "as user:")
+-                            checked: kcm.settings.user != ""
+-                            onToggled: {
+-                                if (checked) {
+-                                    kcm.settings.user = autologinUser.indexOfValue(kcm.currentUser) !== -1 ? kcm.currentUser : autologinUser.valueAt(0);
+-                                    kcm.settings.session = autologinSession.valueAt(0);
+-                                } else {
+-                                    kcm.settings.user = "";
+-                                    kcm.settings.session = "";
+-                                }
+-
+-                                // Deliberately imperative because we only want the message
+-                                // to appear when the user checks the checkbox, not all the
+-                                // time when the checkbox is checked.
+-                                if (checked && kcm.KDEWalletAvailable()) {
+-                                    autologinMessage.visible = true;
+-                                }
+-                            }
+-
+-                            KCM.SettingHighlighter {
+-                                highlight: (kcm.settings.user != "" && kcm.settings.defaultUser == "")
+-                                            || (kcm.settings.user == "" && kcm.settings.defaultUser != "")
+-                            }
+-
+-                            Accessible.name: i18n("Automatically log in with a specific user and session")
+-                        }
++    Kirigami.FormLayout {
++
++        // Section 1 (no title): automatic login. The user and session are disabled, not hidden, while it is off.
++        QQC2.CheckBox {
++            id: autologinBox
++            // ksr: kcm_plasmalogin/settings-user
++            Kirigami.FormData.label: i18nc("@label", "Auto-login:")
++            text: i18nc("@option:check", "Log in automatically")
++            checked: kcm.settings.user != ""
++            onToggled: {
++                if (checked) {
++                    kcm.settings.user = autologinUser.indexOfValue(kcm.currentUser) !== -1 ? kcm.currentUser : autologinUser.valueAt(0);
++                    kcm.settings.session = autologinSession.valueAt(0);
++                } else {
++                    kcm.settings.user = "";
++                    kcm.settings.session = "";
++                }
+ 
+-                        QQC2.ComboBox {
+-                            id: autologinUser
++                // Deliberately imperative because we only want the message
++                // to appear when the user checks the checkbox, not all the
++                // time when the checkbox is checked.
++                if (checked && kcm.KDEWalletAvailable()) {
++                    autologinMessage.visible = true;
++                }
++            }
+ 
+-                            implicitWidth: Kirigami.Units.gridUnit * 12
++            KCM.SettingHighlighter {
++                highlight: (kcm.settings.user != "" && kcm.settings.defaultUser == "")
++                            || (kcm.settings.user == "" && kcm.settings.defaultUser != "")
++            }
+ 
+-                            model: kcm.userModel
+-                            textRole: "display"
+-                            valueRole: "name"
++            Accessible.name: i18n("Automatically log in with a specific user and session")
++        }
+ 
+-                            currentValue: kcm.settings.user
+-                            onActivated: kcm.settings.user = currentValue
++        QQC2.ComboBox {
++            id: autologinUser
++            // ksr: kcm_plasmalogin/User
++            Kirigami.FormData.label: i18nc("@label:listbox", "User:")
++            implicitWidth: Kirigami.Units.gridUnit * 12
+ 
+-                            KCM.SettingStateBinding {
+-                                visible: autologinBox.checked
+-                                configObject: kcm.settings
+-                                settingName: "User"
+-                                extraEnabledConditions: autologinBox.checked
+-                            }
++            model: kcm.userModel
++            textRole: "display"
++            valueRole: "name"
+ 
+-                            Accessible.description: i18n("Select a user for automatic log in")
+-                        }
+-                    }
++            currentValue: kcm.settings.user
++            onActivated: kcm.settings.user = currentValue
+ 
+-                    RowLayout {
+-                        spacing: Kirigami.Units.smallSpacing
++            KCM.SettingStateBinding {
++                configObject: kcm.settings
++                settingName: "User"
++                extraEnabledConditions: autologinBox.checked
++            }
+ 
+-                        QQC2.Label {
+-                            id: autoLoginSessionLabel
+-                            Layout.preferredWidth: Math.max(width, autoLoginSessionLabel.width)
+-                            leftPadding: autologinBox.indicator.width + autologinBox.spacing
++            Accessible.description: i18n("Select a user for automatic log in")
++        }
+ 
+-                            text: i18nc("@label:listbox part of a sentence: '[Automatically log in as user: foo / ] with session: [bar]'", "with session:")
+-                        }
++        QQC2.ComboBox {
++            id: autologinSession
++            // ksr: kcm_plasmalogin/Session
++            Kirigami.FormData.label: i18nc("@label:listbox", "Session:")
++            implicitWidth: Kirigami.Units.gridUnit * 12
+ 
+-                        QQC2.ComboBox {
+-                            id: autologinSession
++            model: kcm.sessionModel
++            textRole: "display"
++            valueRole: "fileName"
+ 
+-                            implicitWidth: Kirigami.Units.gridUnit * 12
++            currentValue: kcm.settings.session
++            onActivated: kcm.settings.session = currentValue
+ 
+-                            model: kcm.sessionModel
+-                            textRole: "display"
+-                            valueRole: "fileName"
++            KCM.SettingStateBinding {
++                configObject: kcm.settings
++                settingName: "Session"
++                extraEnabledConditions: autologinBox.checked
++            }
+ 
+-                            currentValue: kcm.settings.session
+-                            onActivated: kcm.settings.session = currentValue
++            Accessible.description: i18n("Select a session for automatic log in")
++        }
+ 
+-                            KCM.SettingStateBinding {
+-                                visible: autologinBox.checked
+-                                configObject: kcm.settings
+-                                settingName: "Session"
+-                                extraEnabledConditions: autologinBox.checked
+-                            }
++        QQC2.CheckBox {
++            // ksr: kcm_plasmalogin/Relogin
++            text: i18nc("@option:check", "Log in again immediately after logging off")
++            checked: kcm.settings.relogin
++            onToggled: kcm.settings.relogin = checked
+ 
+-                            Accessible.description: i18n("Select a session for automatic log in")
+-                        }
+-                    }
++            KCM.SettingStateBinding {
++                configObject: kcm.settings
++                settingName: "Relogin"
++                extraEnabledConditions: autologinBox.checked
++            }
++        }
+ 
+-                    Kirigami.InlineMessage {
+-                        id: autologinMessage
++        // Own form row with a capped width, so that this long message does not push the form into narrow mode.
++        Kirigami.InlineMessage {
++            id: autologinMessage
++            // ksr: kcm_plasmalogin/OpenWallet
+ 
+-                        Layout.fillWidth: true
+-                        Layout.topMargin: Kirigami.Units.largeSpacing - Kirigami.Units.smallSpacing // account for existing layout spacing
++            Layout.fillWidth: true
++            Layout.preferredWidth: Kirigami.Units.gridUnit * 24
++            Layout.maximumWidth: Kirigami.Units.gridUnit * 24
+ 
+-                        type: Kirigami.MessageType.Warning
++            type: Kirigami.MessageType.Warning
+ 
+-                        text: xi18nc("@info", "Auto-login does not support unlocking your KDE Wallet automatically, so it will ask you to unlock it every time you log in.\
++            text: xi18nc("@info", "Auto-login does not support unlocking your KDE Wallet automatically, so it will ask you to unlock it every time you log in.\
+ <nl/><nl/>\
+ To avoid this, you can change the wallet to have a blank password. Note that this is insecure and should only be done in a trusted environment.")
+ 
+-                        actions: Kirigami.Action {
+-                            text: i18n("Open KDE Wallet Settings")
+-                            icon.name: "kwalletmanager"
+-                            onTriggered: kcm.openKDEWallet();
+-                        }
+-                    }
+-                }
++            actions: Kirigami.Action {
++                text: i18n("Open KDE Wallet Settings")
++                icon.name: "kwalletmanager"
++                onTriggered: kcm.openKDEWallet();
+             }
++        }
+ 
+-            Kirigami.FormEntry {
+-                contentItem: QQC2.CheckBox {
+-                    text: i18nc("@option:check", "Log in again immediately after logging off")
+-                    checked: kcm.settings.relogin
+-                    onToggled: kcm.settings.relogin = checked
++        Kirigami.Separator {
++            Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18nc("@title:group", "Pre-selected at login")
++        }
+ 
+-                    KCM.SettingStateBinding {
+-                        configObject: kcm.settings
+-                        settingName: "Relogin"
+-                        extraEnabledConditions: autologinBox.checked
+-                    }
++        QQC2.RadioButton {
++            id: lastUserRadio
++            // ksr: kcm_plasmalogin/settings-preselectedUser
++            Kirigami.FormData.label: i18n("User:")
++            QQC2.ButtonGroup.group: preselectedUserGroup
++
++            autoExclusive: false
++            text: i18nc("@option:radio", "Last logged-in user")
++            checked: kcm.settings.preselectedUser == ""
++            onToggled: {
++                if (checked) {
++                    kcm.settings.preselectedUser = "";
+                 }
+             }
+-        }
+-
+-        Kirigami.FormGroup {
+-            title: i18nc("@title:group", "Defaults")
+ 
+-            Kirigami.FormEntry {
+-                title: i18n("Default user:")
+-
+-                contentItem: QQC2.RadioButton {
+-                    QQC2.ButtonGroup.group: QQC2.ButtonGroup {
+-                        id: preselectedUserGroup
+-                    }
++            KCM.SettingHighlighter {
++                highlight: kcm.settings.preselectedUser != kcm.settings.defaultPreselectedUser
++            }
++        }
+ 
+-                    autoExclusive: false
+-                    text: i18nc("@option:radio", "Last logged-in user")
+-                    checked: kcm.settings.preselectedUser == ""
+-                    onToggled: {
+-                        if (checked) {
+-                            kcm.settings.preselectedUser = "";
+-                        }
++        RowLayout {
++            Kirigami.FormData.buddyFor: customPreselectedUserRadioButton
++            spacing: Kirigami.Units.smallSpacing
++
++            QQC2.RadioButton {
++                id: customPreselectedUserRadioButton
++                QQC2.ButtonGroup.group: preselectedUserGroup
++
++                autoExclusive: false
++                text: i18nc("@option:radio", "Specific user:")
++                checked: kcm.settings.preselectedUser != ""
++                onToggled: {
++                    if (checked) {
++                        kcm.settings.preselectedUser = customPreselectedUserComboBox.indexOfValue(kcm.currentUser) !== -1
++                            ? kcm.currentUser
++                            : customPreselectedUserComboBox.valueAt(0);
+                     }
++                }
++                onClicked: customPreselectedUserComboBox.popup.open()
+ 
+-                    KCM.SettingHighlighter {
+-                        highlight: kcm.settings.preselectedUser != kcm.settings.defaultPreselectedUser
+-                    }
++                KCM.SettingHighlighter {
++                    highlight: kcm.settings.preselectedUser != kcm.settings.defaultPreselectedUser
+                 }
+             }
+ 
+-            Kirigami.FormEntry {
+-                contentItem: RowLayout {
+-                    Kirigami.FormData.buddyFor: customPreselectedUserRadioButton
+-
+-                    spacing: Kirigami.Units.smallSpacing
+-
+-                    QQC2.RadioButton {
+-                        id: customPreselectedUserRadioButton
+-                        Layout.maximumWidth: indicator.width
+-                        QQC2.ButtonGroup.group: preselectedUserGroup
+-
+-                        autoExclusive: false
+-                        checked: kcm.settings.preselectedUser != ""
+-                        onToggled: {
+-                            if (checked) {
+-                                kcm.settings.preselectedUser = customPreselectedUserComboBox.indexOfValue(kcm.currentUser) !== -1
+-                                    ? kcm.currentUser
+-                                    : customPreselectedUserComboBox.valueAt(0);
+-                            }
+-                        }
+-                        onClicked: customPreselectedUserComboBox.popup.open()
+-
+-                        KCM.SettingHighlighter {
+-                            highlight: kcm.settings.preselectedUser != kcm.settings.defaultPreselectedUser
+-                        }
+-                    }
++            QQC2.ComboBox {
++                id: customPreselectedUserComboBox
+ 
+-                    QQC2.ComboBox {
+-                        id: customPreselectedUserComboBox
++                implicitWidth: Kirigami.Units.gridUnit * 12
+ 
+-                        implicitWidth: Kirigami.Units.gridUnit * 12
++                model: kcm.userModel
++                textRole: "display"
++                valueRole: "name"
+ 
+-                        model: kcm.userModel
+-                        textRole: "display"
+-                        valueRole: "name"
++                currentValue: kcm.settings.preselectedUser
++                onActivated: kcm.settings.preselectedUser = currentValue
+ 
+-                        currentValue: kcm.settings.preselectedUser
+-                        onActivated: kcm.settings.preselectedUser = currentValue
++                KCM.SettingStateBinding {
++                    configObject: kcm.settings
++                    settingName: "PreselectedUser"
++                    extraEnabledConditions: customPreselectedUserRadioButton.checked
++                }
+ 
+-                        KCM.SettingStateBinding {
+-                            visible: customPreselectedUserRadioButton.checked
+-                            configObject: kcm.settings
+-                            settingName: "PreselectedUser"
+-                            extraEnabledConditions: customPreselectedUserRadioButton.checked
+-                        }
++                Accessible.description: i18n("Select the default user to be shown at the login screen")
++            }
++        }
+ 
+-                        Accessible.description: i18n("Select the default user to be shown at the login screen")
+-                    }
++        QQC2.RadioButton {
++            id: lastSessionRadio
++            // ksr: kcm_plasmalogin/settings-preselectedSession
++            Kirigami.FormData.label: i18n("Session:")
++            QQC2.ButtonGroup.group: preselectedSessionGroup
++
++            autoExclusive: false
++            text: i18nc("@option:radio", "Last logged-in session")
++            checked: kcm.settings.preselectedSession == ""
++            onToggled: {
++                if (checked) {
++                    kcm.settings.preselectedSession = "";
+                 }
+             }
+ 
+-            Kirigami.FormSeparator {}
++            KCM.SettingHighlighter {
++                highlight: kcm.settings.preselectedSession != kcm.settings.defaultPreselectedSession
++            }
++        }
+ 
+-            Kirigami.FormEntry {
+-                title: i18n("Default session:")
++        RowLayout {
++            Kirigami.FormData.buddyFor: customPreselectedSessionRadioButton
++            spacing: Kirigami.Units.smallSpacing
+ 
+-                contentItem: QQC2.RadioButton {
+-                    QQC2.ButtonGroup.group: QQC2.ButtonGroup {
+-                        id: preselectedSessionGroup
+-                    }
++            QQC2.RadioButton {
++                id: customPreselectedSessionRadioButton
++                QQC2.ButtonGroup.group: preselectedSessionGroup
+ 
+-                    autoExclusive: false
+-                    text: i18nc("@option:radio", "Last logged-in session")
+-                    checked: kcm.settings.preselectedSession == ""
+-                    onToggled: {
+-                        if (checked) {
+-                            kcm.settings.preselectedSession = "";
+-                        }
++                autoExclusive: false
++                text: i18nc("@option:radio", "Specific session:")
++                checked: kcm.settings.preselectedSession != ""
++                onToggled: {
++                    if (checked) {
++                        kcm.settings.preselectedSession = customPreselectedSessionComboBox.valueAt(0);
+                     }
++                }
++                onClicked: customPreselectedSessionComboBox.forceActiveFocus()
+ 
+-                    KCM.SettingHighlighter {
+-                        highlight: kcm.settings.preselectedSession != kcm.settings.defaultPreselectedSession
+-                    }
++                KCM.SettingHighlighter {
++                    highlight: kcm.settings.preselectedSession != kcm.settings.defaultPreselectedSession
+                 }
+             }
+ 
+-            Kirigami.FormEntry {
+-                contentItem: RowLayout {
+-                    Kirigami.FormData.buddyFor: customPreselectedSessionRadioButton
+-
+-                    spacing: Kirigami.Units.smallSpacing
+-
+-                    QQC2.RadioButton {
+-                        id: customPreselectedSessionRadioButton
+-                        Layout.maximumWidth: indicator.width
+-                        QQC2.ButtonGroup.group: preselectedSessionGroup
+-
+-                        autoExclusive: false
+-                        checked: kcm.settings.preselectedSession != ""
+-                        onToggled: {
+-                            if (checked) {
+-                                kcm.settings.preselectedSession = customPreselectedSessionComboBox.valueAt(0);
+-                            }
+-                        }
+-                        onClicked: customPreselectedSessionComboBox.forceActiveFocus()
+-
+-                        KCM.SettingHighlighter {
+-                            highlight: kcm.settings.preselectedSession != kcm.settings.defaultPreselectedSession
+-                        }
+-                    }
+-
+-                    QQC2.ComboBox {
+-                        id: customPreselectedSessionComboBox
++            QQC2.ComboBox {
++                id: customPreselectedSessionComboBox
+ 
+-                        implicitWidth: Kirigami.Units.gridUnit * 12
++                implicitWidth: Kirigami.Units.gridUnit * 12
+ 
+-                        model: kcm.sessionModel
+-                        textRole: "display"
+-                        valueRole: "fileName"
++                model: kcm.sessionModel
++                textRole: "display"
++                valueRole: "fileName"
+ 
+-                        currentValue: kcm.settings.preselectedSession
+-                        onActivated: kcm.settings.preselectedSession = currentValue
++                currentValue: kcm.settings.preselectedSession
++                onActivated: kcm.settings.preselectedSession = currentValue
+ 
+-                        KCM.SettingStateBinding {
+-                            visible: customPreselectedSessionRadioButton.checked
+-                            configObject: kcm.settings
+-                            settingName: "PreselectedSession"
+-                            extraEnabledConditions: customPreselectedSessionRadioButton.checked
+-                        }
+-
+-                        Accessible.description: i18n("Select the default session to be shown at the login screen")
+-                    }
++                KCM.SettingStateBinding {
++                    configObject: kcm.settings
++                    settingName: "PreselectedSession"
++                    extraEnabledConditions: customPreselectedSessionRadioButton.checked
+                 }
++
++                Accessible.description: i18n("Select the default session to be shown at the login screen")
+             }
+         }
++
++        Kirigami.Separator {
++            Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18nc("@title:group", "Appearance")
++        }
++
++        QQC2.Button {
++            // ksr: kcm_plasmalogin/ConfigureAppearance
++            text: i18nc("@action:button", "Configure Appearance…")
++            icon.name: "edit-image-symbolic"
++            onClicked: kcm.push("Appearance.qml")
++        }
++
++        QQC2.Button {
++            // ksr: kcm_plasmalogin/ApplyPlasmaSettings
++            text: i18nc("@action:button", "Apply Plasma Settings…")
++            icon.name: "plasma"
++            onClicked: syncSheet.open()
++        }
++
++        QQC2.Label {
++            Layout.maximumWidth: Kirigami.Units.gridUnit * 16
++            Layout.fillWidth: true
++            text: i18nc("@info", "Copies your language, keyboard layouts, screen layout, fonts, colors and cursor to the login screen.")
++            font: Kirigami.Theme.smallFont
++            wrapMode: Text.Wrap
++        }
++    }
++
++    QQC2.ButtonGroup {
++        id: preselectedUserGroup
++    }
++    QQC2.ButtonGroup {
++        id: preselectedSessionGroup
+     }
+ }

@@ -1,0 +1,263 @@
+From ef8b6f9c2e5cdd0cf3ddbe84de7c3cd580783063 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 02:22:09 +0500
+Subject: [PATCH] kcm_bolt: Device page grammar: device rows with icon, device
+ page in sections Status and Trust, buttons and hint as form rows
+
+Page type: Device (docs/page-design.md 1). Bolt::Manager/Device, authorization and enroll/forget calls, auth modes and the kded module are unchanged.
+
+Moved / renamed:
+- Device page: the Details form is now one FormLayout (the old ColumnLayout with a FormLayout and centred buttons is gone). Order by use:
+  Status, Vendor, UID, then the time that applies to the state (Authorized/Connected/Enrolled at), then section 'Trust' with Trusted: Yes/No,
+  the action buttons (Authorize / Trust This Device / Revoke Trust) as a form row and the hint under them in the small font, left aligned.
+  The hint has Layout.maximumWidth gridUnit*24 and the UID wraps anywhere, so the form keeps its wide layout (lesson of plasma-desktop bae85da).
+  'Trust this Device' -> 'Trust This Device' (title case on buttons). Rows kcm_bolt/Trust-this-Device, Revoke-Trust, DeviceStatus, DeviceVendor,
+  DeviceUid, DeviceAuthorizedAt, DeviceConnectedAt, DeviceEnrolledAt, DeviceTrusted (all carry markers). Relabel: inventory/relabel/kcm_bolt.tsv.
+- Device list: each row has the Thunderbolt icon (busy indicator on top while authorizing, was a separate spinner that always took space) and a chevron.
+- Markers added on the Enable switch, the three empty states and the list row (no wording change). Inventory --strict: 0 lost.
+HIG ids: HIG-001/005/006, HIG-019, HIG-058.
+
+Speed cause (code): none found; kcm_bolt.cpp only creates Bolt::Manager (async D-Bus to boltd), the QML only fills the list from the model.
+The 2 s re-evaluation timers (list and device page) stay: they refresh the relative status text. After-numbers: pending, manager will measure.
+Not built yet. Unconfirmed without a build: Layout.maximumWidth on a Label that is a FormLayout child, as used in plasma-desktop 56095d1; QQC2.BusyIndicator
+anchored inside Kirigami.Icon.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ src/kcm/ui/DeviceList.qml | 26 ++++++++---
+ src/kcm/ui/DeviceView.qml | 92 +++++++++++++++++++++++----------------
+ src/kcm/ui/main.qml       |  5 +++
+ 3 files changed, 79 insertions(+), 44 deletions(-)
+
+diff --git a/src/kcm/ui/DeviceList.qml b/src/kcm/ui/DeviceList.qml
+index 31c34d6..e108c17 100644
+--- a/src/kcm/ui/DeviceList.qml
++++ b/src/kcm/ui/DeviceList.qml
+@@ -48,20 +48,28 @@ ListView {
+ 
+         width: ListView.view.width - ListView.view.leftMargin - ListView.view.rightMargin
+ 
++        // ksr: kcm_bolt/device-label
+         text: device.label
+ 
+         contentItem: RowLayout {
+-            spacing: Kirigami.Units.smallSpacing
+-
+-            QQC2.BusyIndicator {
+-                running: delegate.device.status === Bolt.Bolt.Status.Authorizing
+-                implicitWidth: Kirigami.Units.iconSizes.smallMedium
+-                implicitHeight: Kirigami.Units.iconSizes.smallMedium
++            spacing: Kirigami.Units.largeSpacing
++
++            Kirigami.Icon {
++                source: "preferences-desktop-thunderbolt"
++                implicitWidth: Kirigami.Units.iconSizes.medium
++                implicitHeight: Kirigami.Units.iconSizes.medium
++
++                QQC2.BusyIndicator {
++                    anchors.fill: parent
++                    running: delegate.device.status === Bolt.Bolt.Status.Authorizing
++                    visible: running
++                }
+             }
+ 
+             KD.TitleSubtitle {
+                 Layout.fillWidth: true
+                 title: delegate.text
++                // ksr: kcm_bolt/device-status
+                 subtitle: view.evalTrigger, delegate.deviceStatus.text
+                 font: delegate.font
+                 selected: delegate.highlighted || delegate.down
+@@ -70,6 +78,12 @@ ListView {
+                     : Platform.ColorUtils.linearInterpolation(Kirigami.Theme[delegate.deviceStatus.color], Platform.Theme.backgroundColor, 0.3)
+                 wrapMode: Text.Wrap
+             }
++
++            Kirigami.Icon {
++                source: "go-next-symbolic"
++                implicitWidth: Kirigami.Units.iconSizes.small
++                implicitHeight: Kirigami.Units.iconSizes.small
++            }
+         }
+ 
+         onClicked: {
+diff --git a/src/kcm/ui/DeviceView.qml b/src/kcm/ui/DeviceView.qml
+index 582a52a..384aa8f 100644
+--- a/src/kcm/ui/DeviceView.qml
++++ b/src/kcm/ui/DeviceView.qml
+@@ -47,46 +47,58 @@ KCMUtils.SimpleKCM {
+         }
+     }
+ 
+-    ColumnLayout {
+-        spacing: Kirigami.Units.gridUnit
++    // Page type: Device sub-page (docs/page-design.md 1): state first, then Trust, the one thing the user can change.
++    Kirigami.FormLayout {
++        QQC2.Label {
++            // ksr: kcm_bolt/DeviceStatus
++            text: page.evalTrigger, page.device !== null ? Utils.deviceStatus(page.device, false).text : ""
++            Kirigami.FormData.label: i18n("Status:")
++        }
++        QQC2.Label {
++            // ksr: kcm_bolt/DeviceVendor
++            text: page.evalTrigger, (page.device?.vendor ?? "")
++            Kirigami.FormData.label: i18n("Vendor:")
++        }
++        QQC2.Label {
++            // ksr: kcm_bolt/DeviceUid
++            text: page.evalTrigger, (page.device?.uid ?? "")
++            Kirigami.FormData.label: i18n("UID:")
++            wrapMode: Text.WrapAnywhere
++            Layout.maximumWidth: Kirigami.Units.gridUnit * 24
++        }
++        QQC2.Label {
++            // ksr: kcm_bolt/DeviceAuthorizedAt
++            visible: page.device !== null && page.device.status === Bolt.Bolt.Status.Authorized
++            text: page.evalTrigger, page.device !== null ? Qt.formatDateTime(page.device.authorizeTime) : ""
++            Kirigami.FormData.label: i18n("Authorized at:")
++        }
++        QQC2.Label {
++            // ksr: kcm_bolt/DeviceConnectedAt
++            visible: page.device !== null && page.device.status === Bolt.Bolt.Status.Connected
++            text: page.evalTrigger, page.device !== null ? Qt.formatDateTime(page.device.connectTime) : ""
++            Kirigami.FormData.label: i18n("Connected at:")
++        }
++        QQC2.Label {
++            // ksr: kcm_bolt/DeviceEnrolledAt
++            visible: page.device !== null && page.device.status === Bolt.Bolt.Status.Disconnected
++            text: page.evalTrigger, page.device !== null ? Qt.formatDateTime(page.device.storeTime) : ""
++            Kirigami.FormData.label: i18n("Enrolled at:")
++        }
+ 
+-        Kirigami.FormLayout {
+-            QQC2.Label {
+-                text: page.evalTrigger, (page.device?.vendor ?? "")
+-                Kirigami.FormData.label: i18n("Vendor:")
+-            }
+-            QQC2.Label {
+-                text: page.evalTrigger, (page.device?.uid ?? "")
+-                Kirigami.FormData.label: i18n("UID:")
+-            }
+-            QQC2.Label {
+-                text: page.evalTrigger, page.device !== null ? Utils.deviceStatus(page.device, false).text : ""
+-                Kirigami.FormData.label: i18n("Status:")
+-            }
+-            QQC2.Label {
+-                visible: page.device !== null && page.device.status === Bolt.Bolt.Status.Authorized
+-                text: page.evalTrigger, page.device !== null ? Qt.formatDateTime(page.device.authorizeTime) : ""
+-                Kirigami.FormData.label: i18n("Authorized at:")
+-            }
+-            QQC2.Label {
+-                visible: page.device !== null && page.device.status === Bolt.Bolt.Status.Connected
+-                text: page.evalTrigger, page.device !== null ? Qt.formatDateTime(page.device.connectTime) : ""
+-                Kirigami.FormData.label: i18n("Connected at:")
+-            }
+-            QQC2.Label {
+-                visible: page.device !== null && page.device.status === Bolt.Bolt.Status.Disconnected
+-                text: page.evalTrigger, page.device !== null ? Qt.formatDateTime(page.device.storeTime) : ""
+-                Kirigami.FormData.label: i18n("Enrolled at:")
+-            }
+-            QQC2.Label {
+-                visible: page.device !== null && (page.device.status === Bolt.Bolt.Status.Authorized || page.device.status === Bolt.Bolt.Status.Disconnected)
+-                text: page.evalTrigger, page.device !== null && page.device.stored ? i18n("Yes") : i18n("No")
+-                Kirigami.FormData.label: i18n("Trusted:")
+-            }
++        Kirigami.Separator {
++            Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18nc("@title:group", "Trust")
++        }
++
++        QQC2.Label {
++            // ksr: kcm_bolt/DeviceTrusted
++            visible: page.device !== null && (page.device.status === Bolt.Bolt.Status.Authorized || page.device.status === Bolt.Bolt.Status.Disconnected)
++            text: page.evalTrigger, page.device !== null && page.device.stored ? i18n("Yes") : i18n("No")
++            Kirigami.FormData.label: i18n("Trusted:")
+         }
+ 
+         RowLayout {
+-            Layout.alignment: Qt.AlignHCenter
++            visible: authorizeBtn.visible || storeBtn.visible || forgetBtn.visible
+             spacing: Kirigami.Units.smallSpacing
+ 
+             QQC2.Button {
+@@ -109,7 +121,8 @@ KCMUtils.SimpleKCM {
+             }
+             QQC2.Button {
+                 id: storeBtn
+-                text: i18n("Trust this Device")
++                // ksr: kcm_bolt/Trust-this-Device
++                text: i18n("Trust This Device")
+                 visible: page.device !== null && page.device.status === Bolt.Bolt.Status.Authorized && !page.device.stored
+                 onClicked: {
+                     enabled = false;
+@@ -130,6 +143,7 @@ KCMUtils.SimpleKCM {
+ 
+             QQC2.Button {
+                 id: forgetBtn
++                // ksr: kcm_bolt/Revoke-Trust
+                 text: i18n("Revoke Trust")
+                 visible: page.device !== null && page.device.stored
+                 onClicked: {
+@@ -155,14 +169,16 @@ KCMUtils.SimpleKCM {
+         }
+ 
+         QQC2.Label {
++            // Long hint on its own row; maximumWidth keeps FormLayout out of narrow mode.
+             Layout.fillWidth: true
++            Layout.maximumWidth: Kirigami.Units.gridUnit * 24
+ 
+             text: page.device !== null && !page.device.stored
+                 ? i18n("Hint: trusted device will be automatically authorized the next time it is connected to the computer.")
+                 : i18n("Hint: an untrusted device needs to be manually authorized each time it is connected to the computer.")
+             visible: storeBtn.visible || forgetBtn.visible
+             wrapMode: Text.WordWrap
+-            horizontalAlignment: Qt.AlignHCenter
++            font: Kirigami.Theme.smallFont
+         }
+     }
+ }
+diff --git a/src/kcm/ui/main.qml b/src/kcm/ui/main.qml
+index 0ab9991..62ad767 100644
+--- a/src/kcm/ui/main.qml
++++ b/src/kcm/ui/main.qml
+@@ -28,6 +28,7 @@ KCMUtils.ScrollViewKCM {
+     actions: Kirigami.Action {
+         id: toggleAuthModeAction
+ 
++        // ksr: kcm_bolt/EnableThunderbolt
+         text: i18nc("@option:check Enable Thunderbolt subsystem", "Enable")
+         Accessible.name: i18nc("@option:check", "Enable Thunderbolt subsystem")
+         checkable: true
+@@ -53,6 +54,7 @@ KCMUtils.ScrollViewKCM {
+         showHosts: false
+     }
+ 
++    // Page type: Device (docs/page-design.md 1): the list of devices is the page; each opens its own sub-page.
+     readonly property var placeholderMessage: {
+         const icon = "preferences-desktop-thunderbolt";
+         if (boltManager.isAvailable) {
+@@ -60,6 +62,7 @@ KCMUtils.ScrollViewKCM {
+                 return {
+                     visible: true,
+                     icon,
++                    // ksr: kcm_bolt/BiosDisabled
+                     text: i18n("Thunderbolt support has been disabled in BIOS"),
+                     explanation: i18n("Follow your system manufacturer's guide to enable Thunderbolt support"),
+                 };
+@@ -67,6 +70,7 @@ KCMUtils.ScrollViewKCM {
+                 return {
+                     visible: true,
+                     icon,
++                    // ksr: kcm_bolt/NoDevices
+                     text: i18n("No Thunderbolt devices connected"),
+                     explanation: i18n("Plug in a Thunderbolt device"),
+                 };
+@@ -82,6 +86,7 @@ KCMUtils.ScrollViewKCM {
+             return {
+                 visible: true,
+                 icon: "preferences-desktop-thunderbolt",
++                // ksr: kcm_bolt/SubsystemUnavailable
+                 text: i18n("Thunderbolt subsystem is disabled or unavailable"),
+                 explanation: i18n("If the device supports Thunderbolt, try plugging in a Thunderbolt device"),
+             }

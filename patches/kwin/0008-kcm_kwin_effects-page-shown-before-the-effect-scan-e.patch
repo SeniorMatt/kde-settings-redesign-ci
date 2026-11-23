@@ -1,0 +1,261 @@
+From 4e73f0c9abf638aada2804c60355e85cd0d14d56 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 14:22:29 +0500
+Subject: [PATCH 08/12] kcm_kwin_effects: page shown before the effect scan,
+ empty/busy states, no opacity text; labels unchanged
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Page type: List (ScrollViewKCM: search, category sections, per-effect Configure… as inline action, Get New… top right);
+already the right type, so structure and wording stay. kwinrc keys, effect config dialogs, KNS and excluded effects
+unchanged. Overview, Invert and colour blindness correction stay here (ia/duplicates.md): nothing removed. NOT BUILT YET.
+
+Changes:
+- DesktopEffectsKCM::load() no longer scans on the first call: ui/main.qml calls the new kcm.startLoading() on the first
+  frameSwapped of its window (a 1.5 s timer calls it if no QML does); later load() calls (Reset, GHNS) scan as before.
+  New property `loading` (true until EffectsModel::loaded).
+- While the list is empty: QQC2.BusyIndicator after 150 ms of loading; Kirigami.PlaceholderMessage "No effects match
+  your search" / "No effects found" afterwards (HIG empty states).
+- Effect rows: description/author lines use Kirigami.Theme.smallFont instead of opacity 0.6/0.8 (page-design.md 3);
+  checkbox/radio got Accessible.name = effect name, Configure button Accessible.name "Configure <effect>…";
+  search field Accessible.name.
+HIG ids: HIG-001, HIG-023, empty-state and accessibility rows; page-design.md 3, 4, 7.
+
+Speed cause (code evidence): inventory/structure notes and common/effectsmodel.cpp:373-380: load() runs
+loadBuiltInEffects (QDirIterator over JSON, :214), loadJavascriptEffects (KPackage scan, :272) and loadPluginEffects
+(KPluginMetaData::findPlugins, :317) synchronously, then publishes the model only after the async areEffectsSupported
+reply (:430). All of it ran in DesktopEffectsKCM::load() before the page could draw; now the empty page draws first.
+Note the scan itself still blocks the GUI thread once, right after the first frame (making it incremental needs changes
+in the shared EffectsModel, not done). After-numbers: pending, manager will measure. Not built yet.
+Unconfirmed: Window.window / frameSwapped from a ScrollViewKCM root (attached Window property on an Item); that load()
+is called after construction and before the UI exists in systemsettings (assumed from KQuickConfigModule).
+inventory_check --strict still lists unchanged weak-anchor rows in plugin .ui files (not touched); without --strict 0 lost,
+and the two rows of this page's QML (search, Configure-Filter) carry markers.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ src/kcms/effects/kcm.cpp       | 31 +++++++++++++++++++++++++++++
+ src/kcms/effects/kcm.h         |  9 +++++++++
+ src/kcms/effects/ui/Effect.qml |  7 +++++--
+ src/kcms/effects/ui/main.qml   | 36 +++++++++++++++++++++++++++++++++-
+ 4 files changed, 80 insertions(+), 3 deletions(-)
+
+diff --git a/src/kcms/effects/kcm.cpp b/src/kcms/effects/kcm.cpp
+index 7c9be20..8133d45 100644
+--- a/src/kcms/effects/kcm.cpp
++++ b/src/kcms/effects/kcm.cpp
+@@ -12,6 +12,8 @@
+ #include <KLocalizedString>
+ #include <KPluginFactory>
+ 
++#include <QTimer>
++
+ K_PLUGIN_FACTORY_WITH_JSON(DesktopEffectsKCMFactory,
+                            "kcm_kwin_effects.json",
+                            registerPlugin<KWin::DesktopEffectsKCM>();
+@@ -30,6 +32,12 @@ DesktopEffectsKCM::DesktopEffectsKCM(QObject *parent, const KPluginMetaData &met
+ 
+     connect(m_model, &EffectsModel::dataChanged, this, &DesktopEffectsKCM::updateNeedsSave);
+     connect(m_model, &EffectsModel::loaded, this, &DesktopEffectsKCM::updateNeedsSave);
++    connect(m_model, &EffectsModel::loaded, this, [this]() {
++        if (m_loading) {
++            m_loading = false;
++            Q_EMIT loadingChanged();
++        }
++    });
+ 
+     // These are handled in kcm_animations
+     m_model->setExcludeExclusiveGroups({"toplevel-open-close-animation", "maximize", "minimize", "fullscreen", "show-desktop", "desktop-animations"});
+@@ -45,8 +53,31 @@ QAbstractItemModel *DesktopEffectsKCM::effectsModel() const
+     return m_model;
+ }
+ 
++bool DesktopEffectsKCM::loading() const
++{
++    return m_loading;
++}
++
+ void DesktopEffectsKCM::load()
+ {
++    // EffectsModel::load() scans built-in, scripted (KPackage) and plugin effects synchronously. On the first load
++    // the page is shown first and the scan starts after its first frame (startLoading(), called from main.qml); a
++    // timer starts it anyway if no QML ever asks (e.g. the module is loaded without its UI).
++    if (!m_loadStarted) {
++        QTimer::singleShot(1500, this, &DesktopEffectsKCM::startLoading);
++        setNeedsSave(false);
++        return;
++    }
++    m_model->load();
++    setNeedsSave(false);
++}
++
++void DesktopEffectsKCM::startLoading()
++{
++    if (m_loadStarted) {
++        return;
++    }
++    m_loadStarted = true;
+     m_model->load();
+     setNeedsSave(false);
+ }
+diff --git a/src/kcms/effects/kcm.h b/src/kcms/effects/kcm.h
+index 9463962..a5b48fc 100644
+--- a/src/kcms/effects/kcm.h
++++ b/src/kcms/effects/kcm.h
+@@ -19,26 +19,35 @@ class DesktopEffectsKCM : public KQuickConfigModule
+ {
+     Q_OBJECT
+     Q_PROPERTY(QAbstractItemModel *effectsModel READ effectsModel CONSTANT)
++    Q_PROPERTY(bool loading READ loading NOTIFY loadingChanged)
+ 
+ public:
+     explicit DesktopEffectsKCM(QObject *parent, const KPluginMetaData &metaData);
+     ~DesktopEffectsKCM() override;
+ 
+     QAbstractItemModel *effectsModel() const;
++    bool loading() const;
+ 
+ public Q_SLOTS:
+     void load() override;
+     void save() override;
+     void defaults() override;
+ 
++    // Starts the effect scan. QML calls it after the first frame was shown; a timer calls it if QML never does.
++    void startLoading();
+     void onGHNSEntriesChanged();
+     void configure(const QString &pluginId, QQuickItem *context) const;
+ 
++Q_SIGNALS:
++    void loadingChanged();
++
+ private Q_SLOTS:
+     void updateNeedsSave();
+ 
+ private:
+     EffectsModel *m_model;
++    bool m_loadStarted = false;
++    bool m_loading = true;
+ 
+     Q_DISABLE_COPY(DesktopEffectsKCM)
+ };
+diff --git a/src/kcms/effects/ui/Effect.qml b/src/kcms/effects/ui/Effect.qml
+index b7b5066..236e054 100644
+--- a/src/kcms/effects/ui/Effect.qml
++++ b/src/kcms/effects/ui/Effect.qml
+@@ -40,6 +40,7 @@ QQC2.ItemDelegate {
+             property bool _toggled: false
+ 
+             checked: model.StatusRole
++            Accessible.name: model.NameRole
+             visible: _exclusive
+             QQC2.ButtonGroup.group: _exclusive ? effectsList.findButtonGroup(model.ExclusiveRole) : null
+ 
+@@ -64,6 +65,7 @@ QQC2.ItemDelegate {
+         QQC2.CheckBox {
+             checkState: model.StatusRole
+             visible: model.ExclusiveRole == ""
++            Accessible.name: model.NameRole
+ 
+             onToggled: model.StatusRole = checkState
+ 
+@@ -90,7 +92,7 @@ QQC2.ItemDelegate {
+                 Layout.fillWidth: true
+ 
+                 text: model.DescriptionRole
+-                opacity: listItem.hovered ? 0.8 : 0.6
++                font: Kirigami.Theme.smallFont
+                 wrapMode: Text.Wrap
+             }
+ 
+@@ -100,7 +102,7 @@ QQC2.ItemDelegate {
+                 Layout.fillWidth: true
+ 
+                 text: i18n("Author: %1\nLicense: %2", model.AuthorNameRole, model.LicenseRole)
+-                opacity: listItem.hovered ? 0.8 : 0.6
++                font: Kirigami.Theme.smallFont
+                 visible: listItem.ListView.isCurrentItem
+                 wrapMode: Text.Wrap
+             }
+@@ -113,6 +115,7 @@ QQC2.ItemDelegate {
+             icon.name: "configure"
+             text: i18nc("@info:tooltip", "Configure…")
+             display: QQC2.AbstractButton.IconOnly
++            Accessible.name: i18nc("@action:button %1 is an effect name", "Configure %1…", model.NameRole)
+             QQC2.ToolTip.text: text
+             QQC2.ToolTip.visible: hovered || visualFocus
+             onClicked: kcm.configure(model.ServiceNameRole, listItem)
+diff --git a/src/kcms/effects/ui/main.qml b/src/kcms/effects/ui/main.qml
+index aa8be72..2715085 100644
+--- a/src/kcms/effects/ui/main.qml
++++ b/src/kcms/effects/ui/main.qml
+@@ -18,6 +18,8 @@ import org.kde.newstuff as NewStuff
+ import org.kde.private.kcms.kwin.effects as Private
+ 
+ ScrollViewKCM {
++    id: root
++
+     implicitHeight: Kirigami.Units.gridUnit * 30
+     implicitWidth: Kirigami.Units.gridUnit * 40
+ 
+@@ -32,6 +34,23 @@ ScrollViewKCM {
+         }
+     }
+ 
++    // List page (docs/page-design.md): the page is shown first; the effect scan (synchronous in C++) starts after the
++    // first frame was swapped. Busy indicator only if it takes more than 150 ms.
++    Connections {
++        target: root.Window.window
++        enabled: !root._loadRequested
++        function onFrameSwapped() {
++            root._loadRequested = true;
++            kcm.startLoading();
++        }
++    }
++    property bool _loadRequested: false
++    Timer {
++        id: busyDelay
++        interval: 150
++        running: kcm.loading
++    }
++
+     header: RowLayout {
+         spacing: Kirigami.Units.smallSpacing
+ 
+@@ -39,12 +58,13 @@ ScrollViewKCM {
+             id: searchField
+ 
+             Layout.fillWidth: true
++            Accessible.name: i18n("Search effects") // ksr: kcm_kwin_effects/search
+         }
+ 
+         QQC2.ToolButton {
+             id: filterButton
+ 
+-            text: i18n("Configure Filter")
++            text: i18n("Configure Filter") // ksr: kcm_kwin_effects/Configure-Filter
+             icon.name: "view-filter"
+ 
+             display: QQC2.AbstractButton.IconOnly
+@@ -87,6 +107,20 @@ ScrollViewKCM {
+             sourceModel: kcm.effectsModel
+         }
+ 
++        Kirigami.PlaceholderMessage {
++            anchors.centerIn: parent
++            width: parent.width - Kirigami.Units.gridUnit * 4
++            visible: effectsList.count === 0 && !kcm.loading
++            icon.name: "preferences-desktop-effects"
++            text: searchField.text.length > 0 ? i18nc("@info:placeholder", "No effects match your search") : i18nc("@info:placeholder", "No effects found")
++        }
++
++        QQC2.BusyIndicator {
++            anchors.centerIn: parent
++            running: visible
++            visible: kcm.loading && !busyDelay.running && root._loadRequested
++        }
++
+         delegate: Effect {
+             width: ListView.view.width - ListView.view.leftMargin - ListView.view.rightMargin
+         }

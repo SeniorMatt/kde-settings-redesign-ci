@@ -1,0 +1,208 @@
+From d1dc7e15498f30cb65553abd31c96653fcc04996 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 14:20:11 +0500
+Subject: [PATCH 10/24] kcm_icons: theme list read after the first frame,
+ previews staggered, empty and busy states
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Page type: Gallery (docs/page-design.md section 5). Config key (kdeglobals Icons/Theme), pending deletion, KNS, install from
+file and the preview rendering code are unchanged. NOT BUILT YET (owner stopped heavy work); checked statically only.
+
+Moved / renamed: nothing visible changed in wording: Install from File… and Get New… were already page actions top right,
+per-theme Remove stays a GridDelegate action. There are no icon-size options in this KCM in master (kcm_icons rows: Theme,
+Install, Get New, Remove only), so no sub-page was needed. New: "No icon themes found" empty state, busy indicator only
+after 150 ms. Relabel table: inventory/relabel/kcm_icons.tsv (outer repo). Inventory --strict: 4 rows ok, 0 lost.
+HIG ids: HIG-001, HIG-006; page-design sections 5, 7.
+
+Speed (cause found in code, not measured):
+- IconModule::load() ran IconsModel::load() synchronously: KIconTheme::list() then one KIconTheme (index.theme read and
+  parse) per installed theme (iconsmodel.cpp load()), plus QFileInfo writability checks, before the page existed.
+  Now load() queues it one event-loop turn later (generation counter, new property IconModule.loaded); the grid has no
+  model until loaded.
+- Every card rendered its six preview icons in Component.onCompleted via Qt.callLater (previewIcons: KIconTheme, PNG/SVG
+  loads per icon, main thread), all in the same turn. Now a Timer per card, 30 ms + 40 ms * min(index, 11), so frames keep
+  coming. Widgets/pixmaps stay on the main thread: this spreads the cost, it does not remove it.
+- After numbers: pending, manager will measure.
+
+Not built yet; uncertain: that `index` resolves inside the Flow's Timer (delegate context property, should); the
+unchanged downstream callers of IconsModel::load() (installThemes) still run it synchronously on purpose.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/icons/main.cpp    | 22 +++++++++++++++++++---
+ kcms/icons/main.h      |  9 +++++++++
+ kcms/icons/ui/main.qml | 42 ++++++++++++++++++++++++++++++++++--------
+ 3 files changed, 62 insertions(+), 11 deletions(-)
+
+diff --git a/kcms/icons/main.cpp b/kcms/icons/main.cpp
+index 84c99f9..a300231 100644
+--- a/kcms/icons/main.cpp
++++ b/kcms/icons/main.cpp
+@@ -25,6 +25,7 @@
+ #include <QQuickItem>
+ #include <QQuickWindow>
+ #include <QStringList>
++#include <QTimer>
+ #include <QSvgRenderer>
+ 
+ #include <KConfigGroup>
+@@ -90,9 +91,24 @@ bool IconModule::downloadingFile() const
+ void IconModule::load()
+ {
+     KQuickManagedConfigModule::load();
+-    m_model->load();
+-    // Model has been cleared so pretend the theme name changed to force view update
+-    Q_EMIT(iconsSettings()->ThemeChanged());
++
++    // ksr: the theme list (one KIconTheme per theme, each reading its index.theme) is read one event-loop turn later, so the
++    // page is on screen first. A newer load() makes an older pending one a no-op.
++    if (m_loaded) {
++        m_loaded = false;
++        Q_EMIT loadedChanged();
++    }
++    const int generation = ++m_loadGeneration;
++    QTimer::singleShot(0, this, [this, generation] {
++        if (generation != m_loadGeneration) {
++            return;
++        }
++        m_model->load();
++        m_loaded = true;
++        Q_EMIT loadedChanged();
++        // Model has been cleared so pretend the theme name changed to force view update
++        Q_EMIT(iconsSettings()->ThemeChanged());
++    });
+ }
+ 
+ void IconModule::save()
+diff --git a/kcms/icons/main.h b/kcms/icons/main.h
+index 913a4ac..bb2b542 100644
+--- a/kcms/icons/main.h
++++ b/kcms/icons/main.h
+@@ -36,6 +36,8 @@ class IconModule : public KQuickManagedConfigModule
+     Q_PROPERTY(IconsSettings *iconsSettings READ iconsSettings CONSTANT)
+     Q_PROPERTY(IconsModel *iconsModel READ iconsModel CONSTANT)
+     Q_PROPERTY(bool downloadingFile READ downloadingFile NOTIFY downloadingFileChanged)
++    // false until the theme list has been read; that happens one event-loop turn after load(), so the page is shown first
++    Q_PROPERTY(bool loaded READ loaded NOTIFY loadedChanged)
+ 
+ public:
+     IconModule(QObject *parent, const KPluginMetaData &data);
+@@ -52,6 +54,10 @@ public:
+     IconsModel *iconsModel() const;
+ 
+     bool downloadingFile() const;
++    bool loaded() const
++    {
++        return m_loaded;
++    }
+ 
+     void load() override;
+     Q_INVOKABLE void reloadConfig()
+@@ -72,6 +78,7 @@ public:
+ 
+ Q_SIGNALS:
+     void downloadingFileChanged();
++    void loadedChanged();
+ 
+     void showSuccessMessage(const QString &message);
+     void showErrorMessage(const QString &message);
+@@ -92,6 +99,8 @@ private:
+ 
+     IconsData *m_data;
+     IconsModel *m_model;
++    bool m_loaded = false;
++    int m_loadGeneration = 0;
+ 
+     mutable QCache<QString, KIconTheme> m_kiconThemeCache;
+ 
+diff --git a/kcms/icons/ui/main.qml b/kcms/icons/ui/main.qml
+index a5dc80b..deb74a2 100644
+--- a/kcms/icons/ui/main.qml
++++ b/kcms/icons/ui/main.qml
+@@ -19,10 +19,31 @@ import org.kde.kcmutils as KCM
+ KCM.GridViewKCM {
+     id: root
+ 
+-    view.model: kcm.iconsModel
+-    view.currentIndex: kcm.pluginIndex(kcm.iconsSettings.theme)
++    // The theme list is read one event-loop turn after load() (kcm.loaded), so the page is shown first.
++    view.model: kcm.loaded ? kcm.iconsModel : null
++    view.currentIndex: kcm.loaded ? kcm.pluginIndex(kcm.iconsSettings.theme) : -1
+     enabled: !kcm.downloadingFile
+ 
++    // Busy only when reading takes longer than 150 ms (docs/page-design.md section 3).
++    Timer {
++        id: busyDelay
++        interval: 150
++        running: !kcm.loaded
++    }
++    QtControls.BusyIndicator {
++        anchors.centerIn: parent
++        z: 1
++        running: visible
++        visible: !kcm.loaded && !busyDelay.running
++    }
++    Kirigami.PlaceholderMessage {
++        anchors.centerIn: parent
++        width: parent.width - Kirigami.Units.gridUnit * 4
++        visible: kcm.loaded && root.view.count === 0
++        icon.name: "preferences-desktop-icons"
++        text: i18nc("@info", "No icon themes found")
++    }
++
+     KCM.SettingStateBinding {
+         configObject: kcm.iconsSettings
+         settingName: "Theme"
+@@ -63,12 +84,14 @@ KCM.GridViewKCM {
+ 
+     actions: [
+         Kirigami.Action {
++            // ksr: kcm_icons/InstallFromFile
+             enabled: root.view.enabled
+             text: i18n("Install from File…")
+             icon.name: "document-import"
+             onTriggered: fileDialogLoader.active = true
+         },
+         NewStuff.Action {
++            // ksr: kcm_icons/GetNew
+             text: i18n("Get New…")
+             configFile: "icons.knsrc"
+             onEntryEvent: function (entry, event) {
+@@ -84,6 +107,7 @@ KCM.GridViewKCM {
+     view.delegate: KCM.GridDelegate {
+         id: delegate
+ 
++        // ksr: kcm_icons/Theme
+         text: model.display
+         toolTip: model.description
+ 
+@@ -172,18 +196,20 @@ KCM.GridViewKCM {
+                     }
+                 }
+ 
+-                Component.onCompleted: {
+-                    // avoid reloading it when icon sizes or dpr changes on startup
+-                    Qt.callLater(function() {
+-                        // We show 6 icons initially (3x2 grid), only load those
+-                        thumbFlow.loadPreviews(6 /*limit*/);
+-                    });
++                // Rendering six previews (a KIconTheme plus SVG/PNG loads each) is main-thread work. Every card used to do it in
++                // the same event-loop turn at start; now the cards load one after another, a few ms apart, so frames keep coming.
++                // The delay also avoids reloading when icon sizes or dpr change on startup.
++                Timer {
++                    interval: 30 + Math.min(index, 11) * 40
++                    running: true
++                    onTriggered: thumbFlow.loadPreviews(6 /*limit*/)
+                 }
+             }
+         }
+ 
+         actions: [
+             Kirigami.Action {
++                // ksr: kcm_icons/RemoveTheme
+                 icon.name: "edit-delete"
+                 tooltip: if (enabled) {
+                     return i18nc("@info:tooltip", "Remove icon theme");

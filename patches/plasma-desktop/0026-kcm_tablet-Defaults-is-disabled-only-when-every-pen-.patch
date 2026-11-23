@@ -1,0 +1,38 @@
+From 0f05eec385e762543e692017857f930287cf019e Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 02:54:31 +0500
+Subject: [PATCH 26/31] kcm_tablet: Defaults is disabled only when every pen
+ and pad is at defaults (and with no tablet)
+
+TabletsModel::isDefaults() used any_of with |=, so one device at defaults made the whole page count as
+defaults, and an empty list counted as changed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/tablet/tabletsmodel.cpp | 12 +++---------
+ 1 file changed, 3 insertions(+), 9 deletions(-)
+
+diff --git a/kcms/tablet/tabletsmodel.cpp b/kcms/tablet/tabletsmodel.cpp
+index b65190d..a33930b 100644
+--- a/kcms/tablet/tabletsmodel.cpp
++++ b/kcms/tablet/tabletsmodel.cpp
+@@ -150,15 +150,9 @@ bool TabletsModel::isSaveNeeded() const
+ 
+ bool TabletsModel::isDefaults() const
+ {
+-    return std::any_of(m_devices.cbegin(), m_devices.cend(), [](auto &dev) {
+-        bool isDefaults = false;
+-        if (dev.penDevice) {
+-            isDefaults |= dev.penDevice->isDefaults();
+-        }
+-        if (dev.padDevice) {
+-            isDefaults |= dev.padDevice->isDefaults();
+-        }
+-        return isDefaults;
++    // at defaults only when every pen and pad is (and so with no tablet at all): Defaults stays disabled then
++    return std::all_of(m_devices.cbegin(), m_devices.cend(), [](auto &dev) {
++        return (!dev.penDevice || dev.penDevice->isDefaults()) && (!dev.padDevice || dev.padDevice->isDefaults());
+     });
+ }
+ 

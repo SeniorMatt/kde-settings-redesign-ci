@@ -1,0 +1,304 @@
+From 578e7502b5aa5563a5b52a295b2187740db1695c Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 14:21:30 +0500
+Subject: [PATCH 07/12] kcm_kwin_virtualdesktops: desktop list first, switching
+ options in two noun sections; animation scan no longer runs twice
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Page type: List (ScrollViewKCM, desktop list) with a Form footer. D-Bus calls to org.kde.KWin.VirtualDesktopManager,
+kcfg keys and defaults unchanged. NOT BUILT YET.
+
+Moved / renamed (footer FormLayout):
+- "Options:" label gone; sections "Switching" (Navigation wraps around, Switch desktops independently for each screen,
+  Show animation when switching + indented animation combo, Configure…, About) and "On-screen display" (Show on-screen
+  display when switching, indented Show desktop layout indicators, "Hide after:" spin box).
+- Checkbox texts lost their trailing colons ("Show animation when switching", "Show on-screen display when switching");
+  the combo + buttons moved to their own row under the parent checkbox (dependent options indented); the animation
+  Configure… button got a text, the About button an Accessible.name and tooltip; combo got an Accessible.name.
+  The hide-delay spin box got the label "Hide after:" in place of sitting beside the checkbox.
+HIG ids: HIG-001/005/006, HIG-023, HIG-057. page-design.md 1, 2, 3, 6.
+
+Speed cause (code evidence): AnimationsModel inherits EffectsModel::load (common/effectsmodel.cpp:373), which
+synchronously scans built-in, JavaScript (KPackage) and plugin effects before posting the async areEffectsSupported
+call; it ran twice before the first frame: VirtualDesktopsData ctor (virtualdesktopsdata.cpp:26) and again in
+VirtualDesktops::load(). The first load() now skips the second scan (m_animationsModelLoaded); later loads (reset
+after Apply) still reload. The remaining scan is still synchronous in the data ctor: moving it off the first frame
+needs an async EffectsModel::load and was not attempted without a build. DesktopsModel D-Bus is already async.
+After-numbers: pending, manager will measure. Not built yet. Unconfirmed: skipping the second load() has no side
+effect on KCModuleData::loaded (emitted by the first load's commit).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ src/kcms/desktop/ui/main.qml         | 134 +++++++++++++++------------
+ src/kcms/desktop/virtualdesktops.cpp |  12 ++-
+ src/kcms/desktop/virtualdesktops.h   |   1 +
+ 3 files changed, 85 insertions(+), 62 deletions(-)
+
+diff --git a/src/kcms/desktop/ui/main.qml b/src/kcms/desktop/ui/main.qml
+index 6f937fa..cafd33c 100644
+--- a/src/kcms/desktop/ui/main.qml
++++ b/src/kcms/desktop/ui/main.qml
+@@ -23,6 +23,7 @@ KCM.ScrollViewKCM {
+                 spacing: Kirigami.Units.smallSpacing
+ 
+                 QQC2.Label {
++                    // ksr: kcm_kwin_virtualdesktops/desktopsModel-rows
+                     text: i18nc("@text:label Number of rows, label associated to a number input field", "Rows:")
+                 }
+                 QQC2.SpinBox {
+@@ -88,6 +89,7 @@ KCM.ScrollViewKCM {
+                             id: renameAction
+                             icon.name: "edit-entry-symbolic"
+                             enabled: !renameLayout.visible
++                            // ksr: kcm_kwin_virtualdesktops/rename-desktop
+                             text: i18nc("@action:button", "Rename")
+                             onTriggered: {
+                                 renameLayout.visible = true;
+@@ -130,6 +132,7 @@ KCM.ScrollViewKCM {
+                     QQC2.Button {
+                         id: discardEditButton
+                         icon.name: "dialog-cancel-symbolic"
++                        // ksr: kcm_kwin_virtualdesktops/Cancel-rename
+                         text: i18nc("@info:tooltip", "Cancel rename")
+                         onClicked: {
+                             renameLayout.visible = false;
+@@ -201,14 +204,19 @@ KCM.ScrollViewKCM {
+     }
+ 
+     extraFooterTopPadding: true // re-add separator line
++    // Desktop list above (what people open this page for), switching options below in two noun sections.
+     footer: ColumnLayout {
+         Kirigami.FormLayout {
+ 
++            Kirigami.Separator {
++                Kirigami.FormData.isSection: true
++                Kirigami.FormData.label: i18nc("@title:group", "Switching")
++            }
++
+             QQC2.CheckBox {
+                 id: navWraps
+ 
+-                Kirigami.FormData.label: i18n("Options:")
+-
++                // ksr: kcm_kwin_virtualdesktops/rollOverDesktops
+                 text: i18n("Navigation wraps around")
+                 enabled: !kcm.virtualDesktopsSettings.isImmutable("rollOverDesktops")
+                 checked: kcm.virtualDesktopsSettings.rollOverDesktops
+@@ -234,27 +242,30 @@ KCM.ScrollViewKCM {
+                 }
+             }
+ 
+-            RowLayout {
+-                Layout.fillWidth: true
+-
+-                QQC2.CheckBox {
+-                    id: animationEnabled
+-                    Layout.fillWidth: true
++            QQC2.CheckBox {
++                id: animationEnabled
+ 
+-                    text: i18n("Show animation when switching:")
++                // ksr: kcm_kwin_virtualdesktops/animationsModel-animationEnabled
++                text: i18n("Show animation when switching")
+ 
+-                    checked: kcm.animationsModel.animationEnabled
++                checked: kcm.animationsModel.animationEnabled
+ 
+-                    onToggled: kcm.animationsModel.animationEnabled = checked
++                onToggled: kcm.animationsModel.animationEnabled = checked
+ 
+-                    KCM.SettingHighlighter {
+-                        highlight: kcm.animationsModel.animationEnabled !== kcm.animationsModel.defaultAnimationEnabled
+-                    }
++                KCM.SettingHighlighter {
++                    highlight: kcm.animationsModel.animationEnabled !== kcm.animationsModel.defaultAnimationEnabled
+                 }
++            }
++
++            // Animation choice indented under its parent checkbox; the model fills in after the first frame.
++            RowLayout {
++                Layout.leftMargin: Kirigami.Units.gridUnit
++                spacing: Kirigami.Units.smallSpacing
+ 
+                 QQC2.ComboBox {
+                     enabled: animationEnabled.checked
+ 
++                    Accessible.name: i18nc("@label:listbox accessible name", "Switching animation")
+                     model: kcm.animationsModel
+                     textRole: "NameRole"
+                     currentIndex: kcm.animationsModel.animationIndex
+@@ -269,6 +280,7 @@ KCM.ScrollViewKCM {
+                     enabled: animationEnabled.checked && kcm.animationsModel.currentConfigurable
+ 
+                     icon.name: "configure"
++                    text: i18nc("@action:button", "Configure…") // ksr: kcm_kwin_virtualdesktops/animationsModel-currentConfigurable
+ 
+                     onClicked: kcm.configureAnimation(this)
+                 }
+@@ -277,76 +289,76 @@ KCM.ScrollViewKCM {
+                     enabled: animationEnabled.checked
+ 
+                     icon.name: "dialog-information"
++                    display: QQC2.AbstractButton.IconOnly
++                    text: i18nc("@action:button", "About") // ksr: kcm_kwin_virtualdesktops/showAboutAnimation
++                    Accessible.name: text
++                    QQC2.ToolTip.text: text
++                    QQC2.ToolTip.visible: hovered || visualFocus
++                    QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
+ 
+                     onClicked: kcm.showAboutAnimation(this)
+                 }
+-
+-                Item {
+-                    Layout.fillWidth: true
+-                }
+             }
+ 
+-            RowLayout {
+-                Layout.fillWidth: true
++            Kirigami.Separator {
++                Kirigami.FormData.isSection: true
++                Kirigami.FormData.label: i18nc("@title:group", "On-screen display")
++            }
+ 
+-                QQC2.CheckBox {
+-                    id: osdEnabled
++            QQC2.CheckBox {
++                id: osdEnabled
+ 
+-                    text: i18n("Show on-screen display when switching:")
++                // ksr: kcm_kwin_virtualdesktops/desktopChangeOsdEnabled
++                text: i18n("Show on-screen display when switching")
+ 
+-                    checked: kcm.virtualDesktopsSettings.desktopChangeOsdEnabled
++                checked: kcm.virtualDesktopsSettings.desktopChangeOsdEnabled
+ 
+-                    onToggled: kcm.virtualDesktopsSettings.desktopChangeOsdEnabled = checked
++                onToggled: kcm.virtualDesktopsSettings.desktopChangeOsdEnabled = checked
+ 
+-                    KCM.SettingStateBinding {
+-                        configObject: kcm.virtualDesktopsSettings
+-                        settingName: "desktopChangeOsdEnabled"
+-                    }
++                KCM.SettingStateBinding {
++                    configObject: kcm.virtualDesktopsSettings
++                    settingName: "desktopChangeOsdEnabled"
+                 }
++            }
+ 
+-                QQC2.SpinBox {
+-                    id: osdDuration
++            QQC2.CheckBox {
++                id: osdTextOnly
+ 
+-                    from: 0
+-                    to: 10000
+-                    stepSize: 100
++                Layout.leftMargin: Kirigami.Units.gridUnit
++                text: i18n("Show desktop layout indicators")
++                checked: !kcm.virtualDesktopsSettings.textOnly
++                onToggled: kcm.virtualDesktopsSettings.textOnly = !checked
+ 
+-                    textFromValue: (value, locale) => i18n("%1 ms", value)
+-                    valueFromText: (text, locale) => Number.fromLocaleString(locale, text.split(" ")[0])
++                KCM.SettingStateBinding {
++                    configObject: kcm.virtualDesktopsSettings
++                    settingName: "textOnly"
++                    extraEnabledConditions: osdEnabled.checked
++                }
++            }
+ 
+-                    value: kcm.virtualDesktopsSettings.popupHideDelay
++            QQC2.SpinBox {
++                id: osdDuration
+ 
+-                    onValueModified: kcm.virtualDesktopsSettings.popupHideDelay = value
++                // ksr: kcm_kwin_virtualdesktops/popupHideDelay
++                Kirigami.FormData.label: i18nc("@label:spinbox", "Hide after:")
+ 
+-                    KCM.SettingStateBinding {
+-                        configObject: kcm.virtualDesktopsSettings
+-                        settingName: "popupHideDelay"
+-                        extraEnabledConditions: osdEnabled.checked
+-                    }
+-                }
+-            }
++                from: 0
++                to: 10000
++                stepSize: 100
+ 
+-            RowLayout {
+-                Layout.fillWidth: true
++                textFromValue: (value, locale) => i18n("%1 ms", value)
++                valueFromText: (text, locale) => Number.fromLocaleString(locale, text.split(" ")[0])
+ 
+-                Item {
+-                    Layout.preferredWidth: Kirigami.Units.gridUnit
+-                }
++                value: kcm.virtualDesktopsSettings.popupHideDelay
+ 
+-                QQC2.CheckBox {
+-                    id: osdTextOnly
+-                    text: i18n("Show desktop layout indicators")
+-                    checked: !kcm.virtualDesktopsSettings.textOnly
+-                    onToggled: kcm.virtualDesktopsSettings.textOnly = !checked
++                onValueModified: kcm.virtualDesktopsSettings.popupHideDelay = value
+ 
+-                    KCM.SettingStateBinding {
+-                        configObject: kcm.virtualDesktopsSettings
+-                        settingName: "textOnly"
+-                        extraEnabledConditions: osdEnabled.checked
+-                    }
++                KCM.SettingStateBinding {
++                    configObject: kcm.virtualDesktopsSettings
++                    settingName: "popupHideDelay"
++                    extraEnabledConditions: osdEnabled.checked
+                 }
+             }
+         }
+     }
+ }
+-
+diff --git a/src/kcms/desktop/virtualdesktops.cpp b/src/kcms/desktop/virtualdesktops.cpp
+index 410cb1a..74b90a0 100644
+--- a/src/kcms/desktop/virtualdesktops.cpp
++++ b/src/kcms/desktop/virtualdesktops.cpp
+@@ -62,12 +62,22 @@ VirtualDesktopsSettings *VirtualDesktops::virtualDesktopsSettings() const
+     return m_data->settings();
+ }
+ 
++// ksr: kcm_kwin_virtualdesktops/cfg-Desktops-Number
++// ksr: kcm_kwin_virtualdesktops/cfg-Desktops-Rows
++// ksr: kcm_kwin_virtualdesktops/cfg-Desktops-Name
++// The desktop count, rows and names are edited through DesktopsModel
++// (D-Bus org.kde.KWin.VirtualDesktopManager) and written by KWin on save(); unchanged.
+ void VirtualDesktops::load()
+ {
+     KQuickManagedConfigModule::load();
+ 
+     m_data->desktopsModel()->load();
+-    m_data->animationsModel()->load();
++    // VirtualDesktopsData already started loading the animations model in its constructor (the scan of built-in,
++    // script and plugin effects is the slow part): don't scan a second time on the first load().
++    if (m_animationsModelLoaded) {
++        m_data->animationsModel()->load();
++    }
++    m_animationsModelLoaded = true;
+ }
+ 
+ void VirtualDesktops::save()
+diff --git a/src/kcms/desktop/virtualdesktops.h b/src/kcms/desktop/virtualdesktops.h
+index 51fe21d..88847ef 100644
+--- a/src/kcms/desktop/virtualdesktops.h
++++ b/src/kcms/desktop/virtualdesktops.h
+@@ -53,6 +53,7 @@ public Q_SLOTS:
+ 
+ private:
+     VirtualDesktopsData *m_data;
++    bool m_animationsModelLoaded = false;
+ };
+ 
+ }

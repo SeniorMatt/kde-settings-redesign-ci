@@ -1,0 +1,154 @@
+From 61712ef81a125a22e54fe6e6783de37c906f7793 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 14:09:23 +0500
+Subject: [PATCH 1/4] kcm_proxy: clearer wording and section titles; same
+ one-page form
+
+Page type: Form (docs/page-design.md section 1). It is already one Kirigami.Form with the five proxy-type radios first
+and the details of the chosen type below, so the structure stays; settings, kcfg, wpad-detector and env lookups are
+unchanged. The details of the other types stay hidden (they only apply to the selected type; page-design section 3
+allows hiding what cannot apply), not disabled.
+
+Renamed (inventory/relabel/kcm_proxy.tsv):
+- "Use manually-specified proxy configuration" -> "Use manual proxy configuration" (kcm_proxy/ProxyType).
+- "Url:" -> "Address:" in the four manual blocks (HTTP, SSL, FTP, SOCKS); block titles are bold and sentence case
+  ("HTTP proxy").
+- ksr: markers on every text-only control (Choose file, Auto-Detect, Show env values, all protocols, restart notice).
+
+Speed (cause from code, not measured):
+- kcm.autoDetectResolve (environment lookup) only runs when system mode is selected (Component.onCompleted guard in
+  SystemProxyConfiguration): unchanged and cheap. The ~30 hidden FormEntry items of the system and manual blocks
+  (main.qml) are still instantiated up front; putting them behind a Loader inside Kirigami.Form could not be checked
+  without a build, so it is left for the manager's measurement.
+- Numbers: before ~1.6 s under load (ranking only). After: pending, manager will measure.
+- Left alone: kcm_proxy.json keywords include "Firewall" (misleading; belongs to kcm_firewall), a translated search
+  keyword list that needs a decision.
+
+HIG: HIG-005, HIG-006, HIG-019.
+
+Not built yet (freeze).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/proxy/ui/main.qml | 30 ++++++++++++++++++++++++------
+ 1 file changed, 24 insertions(+), 6 deletions(-)
+
+diff --git a/kcms/proxy/ui/main.qml b/kcms/proxy/ui/main.qml
+index f988f36..ecaf06b 100644
+--- a/kcms/proxy/ui/main.qml
++++ b/kcms/proxy/ui/main.qml
+@@ -30,6 +30,7 @@ KCMUtils.SimpleKCM {
+     header: Kirigami.InlineMessage {
+         id: message
+         position: Kirigami.InlineMessage.Header
++        // ksr: kcm_proxy/RestartWarning
+         text: i18nc("@info", "Restart running applications to make these changes take effect for them.")
+         visible: false
+ 
+@@ -101,6 +102,7 @@ KCMUtils.SimpleKCM {
+                     }
+                     QQC2.Button {
+                         icon.name: "document-open"
++                        // ksr: kcm_proxy/Choose-file
+                         text: root.i18nContext.i18nc("@label:button", "Choose file…")
+                         QQC2.ToolTip.text: text
+                         QQC2.ToolTip.visible: hovered || activeFocus
+@@ -126,6 +128,7 @@ KCMUtils.SimpleKCM {
+                         }
+                     }
+                     QQC2.Button {
++                        // ksr: kcm_proxy/AutoDetect
+                         text: root.i18nContext.i18nc("@action:button", "Auto-Detect")
+                         visible: useSystemRadio.checked
+                         onClicked: root.autoDetect()
+@@ -168,6 +171,7 @@ KCMUtils.SimpleKCM {
+                 visible: useSystemRadio.checked
+                 contentItem: QQC2.CheckBox {
+                     id: showEnvValue
++                    // ksr: kcm_proxy/ShowEnvValue
+                     text: root.i18nContext.i18nc("@label", "Show the value of the environment variables")
+                 }
+             }
+@@ -175,7 +179,8 @@ KCMUtils.SimpleKCM {
+             Kirigami.FormEntry {
+                 contentItem: QQC2.RadioButton {
+                     id: manualRadio
+-                    text: root.i18nContext.i18nc("@label", "Use manually-specified proxy configuration")
++                    // ksr: kcm_proxy/ProxyType
++                    text: root.i18nContext.i18nc("@label", "Use manual proxy configuration")
+                     checked: kcm.proxySettings.proxyType === Private.KCM.ManualProxy
+                     onClicked: if (checked) kcm.proxySettings.proxyType = Private.KCM.ManualProxy
+ 
+@@ -193,7 +198,8 @@ KCMUtils.SimpleKCM {
+             Kirigami.FormEntry {
+                 visible: manualRadio.checked
+                 contentItem: QQC2.Label {
+-                    text: root.i18nContext.i18nc("@title", "HTTP Proxy")
++                    font.bold: true
++                    text: root.i18nContext.i18nc("@title", "HTTP proxy")
+                 }
+             }
+ 
+@@ -216,6 +222,7 @@ KCMUtils.SimpleKCM {
+                 contentItem: QQC2.CheckBox {
+                     id: useGlobalCheckBox
+                     enabled: manualHttp.urlValue.length > 0
++                    // ksr: kcm_proxy/UseForAllProtocols
+                     text: root.i18nContext.i18nc("@label", "Use this proxy server for all protocols")
+                     Component.onCompleted: checked = enabled && (kcm.proxySettings.httpProxy === kcm.proxySettings.httpsProxy
+                         && kcm.proxySettings.httpProxy === kcm.proxySettings.ftpProxy
+@@ -230,7 +237,8 @@ KCMUtils.SimpleKCM {
+             Kirigami.FormEntry {
+                 visible: manualRadio.checked
+                 contentItem: QQC2.Label {
+-                    text: root.i18nContext.i18nc("@title", "SSL Proxy")
++                    font.bold: true
++                    text: root.i18nContext.i18nc("@title", "SSL proxy")
+                 }
+             }
+ 
+@@ -253,7 +261,8 @@ KCMUtils.SimpleKCM {
+             Kirigami.FormEntry {
+                 visible: manualRadio.checked
+                 contentItem: QQC2.Label {
+-                    text: root.i18nContext.i18nc("@title", "FTP Proxy")
++                    font.bold: true
++                    text: root.i18nContext.i18nc("@title", "FTP proxy")
+                 }
+             }
+ 
+@@ -276,7 +285,8 @@ KCMUtils.SimpleKCM {
+             Kirigami.FormEntry {
+                 visible: manualRadio.checked
+                 contentItem: QQC2.Label {
+-                    text: root.i18nContext.i18nc("@title", "SOCKS Proxy")
++                    font.bold: true
++                    text: root.i18nContext.i18nc("@title", "SOCKS proxy")
+                 }
+             }
+ 
+@@ -360,7 +370,11 @@ KCMUtils.SimpleKCM {
+             }
+             text: configuration.value.split(" ")[0]
+             onTextEdited: configuration.updateValue()
+-            Kirigami.FormData.label: root.i18nContext.i18nc("@label", "Url:")
++            // ksr: kcm_proxy/configuration-value-split
++            // ksr: kcm_proxy/ManualSslUrl
++            // ksr: kcm_proxy/ManualFtpUrl
++            // ksr: kcm_proxy/ManualSocksUrl
++            Kirigami.FormData.label: root.i18nContext.i18nc("@label", "Address:")
+ 
+             KCMUtils.SettingStateBinding {
+                 configObject: kcm.proxySettings
+@@ -384,6 +398,10 @@ KCMUtils.SimpleKCM {
+                 when: useGlobalCheckBox.checked && !manualProxyPort.urlField.ignoreGlobal
+                 portSpinBox.value: manualHttp.portValue
+             }
++            // ksr: kcm_proxy/Port
++            // ksr: kcm_proxy/ManualSslPort
++            // ksr: kcm_proxy/ManualFtpPort
++            // ksr: kcm_proxy/ManualSocksPort
+             Kirigami.FormData.label: root.i18nContext.i18nc("@label", "Port:")
+             from: 0
+             to: 65535

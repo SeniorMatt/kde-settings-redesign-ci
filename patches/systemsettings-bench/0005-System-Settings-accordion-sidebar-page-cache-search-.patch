@@ -1,0 +1,1113 @@
+From ccdf36418af79edde3e0dafed74cc6460d0235cd Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 08:21:23 +0500
+Subject: [PATCH 05/34] System Settings: accordion sidebar, page cache, search
+ with breadcrumbs
+
+The sidebar is one column. SidebarModel flattens group headers, categories
+and the pages of the open category into rows. Clicking a category opens
+its first page and shows its pages, one category at a time. Keys: Up/Down,
+Right/Enter expand, Left collapses (mirrored for RTL).
+
+SidebarMode::loadModule keeps the last pages alive (6 by default,
+SYSTEMSETTINGS_PAGE_CACHE overrides, 0 is the old behaviour) after asking
+about unsaved changes as before. Search results show their category as a
+subtitle. Info Center keeps its two-column sidebar.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ app/CMakeLists.txt         |   2 +
+ app/SidebarMode.cpp        |  95 ++++++++++-
+ app/SidebarMode.h          |  17 +-
+ app/SidebarModel.cpp       | 333 +++++++++++++++++++++++++++++++++++++
+ app/SidebarModel.h         | 128 ++++++++++++++
+ app/qml/CategoriesPage.qml | 252 ++++++++++++++++++++++------
+ app/qml/CategoryItem.qml   |   7 +-
+ 7 files changed, 775 insertions(+), 59 deletions(-)
+ create mode 100644 app/SidebarModel.cpp
+ create mode 100644 app/SidebarModel.h
+
+diff --git a/app/CMakeLists.txt b/app/CMakeLists.txt
+index c65d1d5..bdb78da 100644
+--- a/app/CMakeLists.txt
++++ b/app/CMakeLists.txt
+@@ -10,6 +10,8 @@ target_sources(systemsettings PRIVATE
+     SettingsBase.h
+     SidebarMode.cpp
+     SidebarMode.h
++    SidebarModel.cpp
++    SidebarModel.h
+     ExternalAppModule.cpp
+     ExternalAppModule.h
+     kcmmetadatahelpers.h
+diff --git a/app/SidebarMode.cpp b/app/SidebarMode.cpp
+index 111517a..988e450 100644
+--- a/app/SidebarMode.cpp
++++ b/app/SidebarMode.cpp
+@@ -11,6 +11,8 @@
+ #include "MenuModel.h"
+ #include "MenuProxyModel.h"
+ #include "ModuleView.h"
++#include "SettingsLayoutTree.h"
++#include "SidebarModel.h"
+ #include "kcmmetadatahelpers.h"
+ #include "systemsettings-config.h"
+ 
+@@ -35,6 +37,9 @@
+ #include <QQuickWidget>
+ #include <QStandardPaths>
+ 
++// Pages (including the current one) that System Settings keeps alive
++static constexpr int defaultPageCacheSize = 6;
++
+ FocusHackWidget::FocusHackWidget(QWidget *parent)
+     : QWidget(parent)
+ {
+@@ -116,6 +121,7 @@ public:
+ 
+     QQuickWidget *quickWidget = nullptr;
+     SubcategoryModel *subCategoryModel = nullptr;
++    SidebarModel *sidebarModel = nullptr;
+     FocusHackWidget *mainWidget = nullptr;
+     QQuickWidget *placeHolderWidget = nullptr;
+     QHBoxLayout *mainLayout = nullptr;
+@@ -201,6 +207,16 @@ QAbstractItemModel *SidebarMode::subCategoryModel() const
+     return d->subCategoryModel;
+ }
+ 
++SidebarModel *SidebarMode::sidebarModel() const
++{
++    return d->sidebarModel;
++}
++
++bool SidebarMode::accordionSidebar() const
++{
++    return d->applicationMode == SystemSettings;
++}
++
+ void SidebarMode::initEvent()
+ {
+     d->model = new MenuModel(rootItem(), this);
+@@ -221,6 +237,9 @@ void SidebarMode::initEvent()
+     d->searchModel->setSourceModel(d->flatModel);
+ 
+     d->subCategoryModel = new SubcategoryModel(d->categorizedModel, this);
++    if (d->applicationMode == SystemSettings) {
++        d->sidebarModel = new SidebarModel(d->categorizedModel, this);
++    }
+     d->mainWidget = new FocusHackWidget();
+     d->mainWidget->installEventFilter(this);
+     d->mainLayout = new QHBoxLayout(d->mainWidget);
+@@ -233,6 +252,12 @@ void SidebarMode::initEvent()
+     connect(d->moduleView, &ModuleView::moduleSaved, this, &SidebarMode::updateDefaults);
+     d->quickWidget = nullptr;
+     moduleView()->setFaceType(KPageView::Plain);
++    if (d->applicationMode == SystemSettings) {
++        // Keep the last pages alive, so that going back to one is instant. 0 destroys a page when it is left.
++        bool ok = false;
++        const int cacheSize = qEnvironmentVariableIntValue("SYSTEMSETTINGS_PAGE_CACHE", &ok);
++        d->moduleView->setPageCacheSize(ok && cacheSize >= 0 ? cacheSize : defaultPageCacheSize);
++    }
+     if (d->applicationMode == InfoCenter) {
+         d->moduleView->setSaveStatistics(false);
+         d->moduleView->setApplyVisible(false);
+@@ -292,32 +317,54 @@ void SidebarMode::showActionMenu(const QPoint &position)
+     setActionMenuVisible(true);
+ }
+ 
+-void SidebarMode::loadModule(const QModelIndex &activeModule, const QStringList &args)
++bool SidebarMode::loadModule(const QModelIndex &activeModule, const QStringList &args)
+ {
+     if (!activeModule.isValid()) {
+-        return;
++        return false;
+     }
+ 
+     auto mi = activeModule.data(MenuModel::MenuItemRole).value<MenuItem *>();
+ 
+     if (!mi) {
+-        return;
++        return false;
+     }
+ 
+     // If we are trying to load a module already open
+-    if (mi->name() == d->moduleView->activeModuleName()) {
++    const bool alreadyOpen = mi->isLibrary() && d->applicationMode == SystemSettings
++        ? mi->metaData().pluginId() == d->moduleView->activeModuleMetadata().pluginId()
++        : mi->name() == d->moduleView->activeModuleName();
++    if (alreadyOpen) {
+         const QVariantList variantArgs(args.cbegin(), args.cend());
+         d->moduleView->requestActivation(variantArgs);
+-        return;
++        updateActiveRows(activeModule, mi);
++        return true;
+     }
+ 
+     if (!d->moduleView->resolveChanges()) {
+-        return;
++        return false;
+     }
+ 
+-    d->moduleView->closeModules();
++    // Without a page cache the previous page is destroyed first
++    if (d->moduleView->pageCacheSize() == 0) {
++        d->moduleView->closeModules();
++    }
+ 
+     d->moduleView->loadModule(activeModule, args);
++    updateActiveRows(activeModule, mi);
++    return true;
++}
++
++void SidebarMode::updateActiveRows(const QModelIndex &activeModule, MenuItem *mi)
++{
++    if (d->sidebarModel) {
++        d->sidebarModel->setCurrentItem(mi);
++        const int searchRow = activeModule.model() == d->searchModel ? activeModule.row() : -1;
++        if (d->activeSearchRow != searchRow) {
++            d->activeSearchRow = searchRow;
++            Q_EMIT activeSearchRowChanged();
++        }
++        return;
++    }
+ 
+     if (activeModule.model() == d->categorizedModel) {
+         const int newCategoryRow = activeModule.row();
+@@ -438,6 +485,24 @@ void SidebarMode::moduleLoaded()
+ 
+ void SidebarMode::updateDefaults()
+ {
++    if (d->sidebarModel) {
++        // The page that was saved is the current one. For the home page, which can change anything, check everything.
++        MenuItem *item = d->sidebarModel->currentItem();
++        if (!item || item == d->homeItem || !item->isLibrary()) {
++            refreshDefaults();
++            return;
++        }
++        KCModuleData *moduleData = loadModuleData(item->metaData());
++        if (moduleData) {
++            connect(moduleData, &KCModuleData::loaded, this, [this, item, moduleData]() {
++                item->setDefaultIndicator(!moduleData->isDefaults());
++                updateModelMenuItem(item);
++                moduleData->deleteLater();
++            });
++        }
++        return;
++    }
++
+     // When the landing page is loaded, we don't have activeCategoryRow and need to reload everything
+     if (d->activeCategoryRow < 0) {
+         refreshDefaults();
+@@ -645,7 +710,7 @@ void SidebarMode::initWidget()
+     if (!startupModule().isEmpty()) {
+         initPlaceHolderWidget();
+         d->placeHolderWidget->show();
+-        MenuItem *item = rootItem()->descendantForModule(startupModule());
++        MenuItem *item = findItem(startupModule());
+         if (item) {
+             loadModule(d->model->indexForItem(item), startupModuleArgs());
+         }
+@@ -676,10 +741,22 @@ void SidebarMode::initPlaceHolderWidget()
+     d->mainLayout->addWidget(d->placeHolderWidget);
+ }
+ 
++MenuItem *SidebarMode::findItem(const QString &moduleName) const
++{
++    // A page can be installed under a renamed id, so a link with the old one still works
++    const QStringList candidates = SettingsLayoutTree::idCandidates(moduleName);
++    for (const QString &candidate : candidates) {
++        if (MenuItem *item = rootItem()->descendantForModule(candidate)) {
++            return item;
++        }
++    }
++    return nullptr;
++}
++
+ void SidebarMode::reloadStartupModule()
+ {
+     if (!startupModule().isEmpty()) {
+-        MenuItem *item = rootItem()->descendantForModule(startupModule());
++        MenuItem *item = findItem(startupModule());
+         if (item) {
+             loadModule(d->model->indexForItem(item), startupModuleArgs());
+         }
+diff --git a/app/SidebarMode.h b/app/SidebarMode.h
+index 61c58da..34177b6 100644
+--- a/app/SidebarMode.h
++++ b/app/SidebarMode.h
+@@ -21,6 +21,7 @@ class QAbstractItemModel;
+ class QAction;
+ class SidebarMode;
+ class MenuItem;
++class SidebarModel;
+ class KActionCollection;
+ 
+ class FocusHackWidget : public QWidget
+@@ -73,6 +74,8 @@ class SidebarMode : public QObject
+     Q_PROPERTY(QAbstractItemModel *categoryModel READ categoryModel CONSTANT)
+     Q_PROPERTY(QAbstractItemModel *searchModel READ searchModel CONSTANT)
+     Q_PROPERTY(QAbstractItemModel *subCategoryModel READ subCategoryModel CONSTANT)
++    Q_PROPERTY(SidebarModel *sidebarModel READ sidebarModel CONSTANT)
++    Q_PROPERTY(bool accordionSidebar READ accordionSidebar CONSTANT)
+     Q_PROPERTY(int activeCategoryRow READ activeCategoryRow NOTIFY activeCategoryRowChanged)
+     Q_PROPERTY(int activeSearchRow READ activeSearchRow NOTIFY activeSearchRowChanged)
+     Q_PROPERTY(int activeSubCategoryRow READ activeSubCategoryRow NOTIFY activeSubCategoryRowChanged)
+@@ -108,6 +111,12 @@ public:
+     QAbstractItemModel *searchModel() const;
+     QAbstractItemModel *subCategoryModel() const;
+ 
++    /**
++     * The one-column sidebar of System Settings, with categories that expand in place. nullptr in Info Center.
++     */
++    SidebarModel *sidebarModel() const;
++    bool accordionSidebar() const;
++
+     int activeCategoryRow() const;
+     int activeSubCategoryRow() const;
+     int activeSearchRow() const;
+@@ -132,7 +141,11 @@ public:
+     Q_INVOKABLE QString actionIconName(const QAction *action) const;
+     Q_INVOKABLE void showActionMenu(const QPoint &position);
+ 
+-    Q_INVOKABLE void loadModule(const QModelIndex &activeModule, const QStringList &args = QStringList());
++    /**
++     * Shows the page of the index.
++     * @return false if the page was not opened, because the user canceled leaving the current one
++     */
++    Q_INVOKABLE bool loadModule(const QModelIndex &activeModule, const QStringList &args = QStringList());
+ 
+     /**
+      * Helper function to move focus to the next/previous QQuickWidget
+@@ -158,6 +171,8 @@ private Q_SLOTS:
+ 
+ private:
+     void initPlaceHolderWidget();
++    MenuItem *findItem(const QString &moduleName) const;
++    void updateActiveRows(const QModelIndex &activeModule, MenuItem *item);
+     void updateModelMenuItem(MenuItem *item);
+     void updateCategoryModel(const QModelIndex &categoryIdx);
+     void refreshDefaults();
+diff --git a/app/SidebarModel.cpp b/app/SidebarModel.cpp
+new file mode 100644
+index 0000000..957fadb
+--- /dev/null
++++ b/app/SidebarModel.cpp
+@@ -0,0 +1,333 @@
++/*
++ * SPDX-FileCopyrightText: 2026 KDE Settings Redesign contributors
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "SidebarModel.h"
++
++#include "MenuItem.h"
++#include "MenuModel.h"
++#include "SidebarMode.h"
++
++#include <KCModuleData>
++#include <KCategorizedSortFilterProxyModel>
++
++#include <QIcon>
++
++SidebarModel::SidebarModel(QAbstractItemModel *source, SidebarMode *mode)
++    : QAbstractListModel(mode)
++    , m_source(source)
++    , m_mode(mode)
++{
++    connect(source, &QAbstractItemModel::modelReset, this, &SidebarModel::rebuild);
++    connect(source, &QAbstractItemModel::layoutChanged, this, &SidebarModel::rebuild);
++    connect(source, &QAbstractItemModel::rowsInserted, this, &SidebarModel::rebuild);
++    connect(source, &QAbstractItemModel::rowsRemoved, this, &SidebarModel::rebuild);
++    connect(source, &QAbstractItemModel::rowsMoved, this, &SidebarModel::rebuild);
++    connect(source, &QAbstractItemModel::dataChanged, this, &SidebarModel::sourceDataChanged);
++    rebuild();
++}
++
++SidebarModel::~SidebarModel() = default;
++
++int SidebarModel::rowCount(const QModelIndex &parent) const
++{
++    return parent.isValid() ? 0 : m_rows.size();
++}
++
++QHash<int, QByteArray> SidebarModel::roleNames() const
++{
++    return {
++        {Qt::DisplayRole, "display"},
++        {KindRole, "kind"},
++        {DepthRole, "depth"},
++        {ExpandableRole, "expandable"},
++        {ExpandedRole, "expanded"},
++        {CurrentRole, "isCurrent"},
++        {IconNameRole, "iconName"},
++        {DescriptionRole, "description"},
++        {DefaultIndicatorRole, "showDefaultIndicator"},
++        {AuxiliaryActionRole, "auxiliaryAction"},
++    };
++}
++
++bool SidebarModel::isExpanded(const Row &row) const
++{
++    return row.kind == CategoryRow && row.expandable && row.item == m_expanded;
++}
++
++bool SidebarModel::isCurrent(const Row &row) const
++{
++    if (!m_currentItem) {
++        return false;
++    }
++    if (row.kind == PageRow) {
++        return row.item == m_currentItem;
++    }
++    // A category stands for its current page when the pages are not shown
++    return row.kind == CategoryRow && !isExpanded(row) && row.item == m_currentItem->parent();
++}
++
++QVariant SidebarModel::data(const QModelIndex &index, int role) const
++{
++    if (!checkIndex(index, CheckIndexOption::IndexIsValid | CheckIndexOption::ParentIsInvalid)) {
++        return {};
++    }
++    const Row &row = m_rows.at(index.row());
++    switch (role) {
++    case Qt::DisplayRole:
++        return row.kind == GroupRow ? row.title : row.item->name();
++    case KindRole:
++        return row.kind;
++    case DepthRole:
++        return row.depth;
++    case ExpandableRole:
++        return row.expandable;
++    case ExpandedRole:
++        return isExpanded(row);
++    case CurrentRole:
++        return isCurrent(row);
++    case IconNameRole:
++        return row.item ? row.item->iconName() : QString();
++    case DescriptionRole:
++        return row.item ? row.item->comment() : QString();
++    case DefaultIndicatorRole:
++        return row.item && row.item->showDefaultIndicator();
++    case AuxiliaryActionRole:
++        if (row.item && row.item->moduleData()) {
++            return QVariant::fromValue(row.item->moduleData()->auxiliaryAction());
++        }
++        return {};
++    default:
++        return {};
++    }
++}
++
++int SidebarModel::currentRow() const
++{
++    return m_currentRow;
++}
++
++MenuItem *SidebarModel::currentItem() const
++{
++    return m_currentItem;
++}
++
++QList<SidebarModel::Row> SidebarModel::pageRows(const Row &category) const
++{
++    QList<Row> rows;
++    const int count = m_source->rowCount(category.sourceIndex);
++    for (int i = 0; i < count; ++i) {
++        const QModelIndex index = m_source->index(i, 0, category.sourceIndex);
++        Row row;
++        row.kind = PageRow;
++        row.item = index.data(MenuModel::MenuItemRole).value<MenuItem *>();
++        row.sourceIndex = index;
++        row.depth = 1;
++        rows.append(row);
++    }
++    return rows;
++}
++
++void SidebarModel::rebuild()
++{
++    beginResetModel();
++    m_rows.clear();
++    QString lastGroup;
++    const int count = m_source->rowCount();
++    for (int i = 0; i < count; ++i) {
++        const QModelIndex index = m_source->index(i, 0);
++        auto item = index.data(MenuModel::MenuItemRole).value<MenuItem *>();
++        // The home page has no group, so no header
++        const QString group = index.data(KCategorizedSortFilterProxyModel::CategoryDisplayRole).toString();
++        if (!group.isEmpty() && group != lastGroup) {
++            Row header;
++            header.kind = GroupRow;
++            header.title = group;
++            m_rows.append(header);
++        }
++        lastGroup = group;
++
++        Row row;
++        row.item = item;
++        row.sourceIndex = index;
++        if (item->menu()) {
++            row.kind = CategoryRow;
++            row.expandable = m_source->rowCount(index) > 1;
++            m_rows.append(row);
++            if (isExpanded(row)) {
++                m_rows.append(pageRows(row));
++            }
++        } else {
++            m_rows.append(row);
++        }
++    }
++    endResetModel();
++    // The view forgets its current row on a reset, so announce it again
++    m_currentRow = -1;
++    updateCurrent();
++}
++
++void SidebarModel::sourceDataChanged(const QModelIndex &topLeft, const QModelIndex &bottomRight)
++{
++    if (topLeft.parent() != bottomRight.parent()) {
++        return;
++    }
++    for (int sourceRow = topLeft.row(); sourceRow <= bottomRight.row(); ++sourceRow) {
++        const auto item = m_source->index(sourceRow, 0, topLeft.parent()).data(MenuModel::MenuItemRole).value<MenuItem *>();
++        const int row = rowOfItem(item);
++        if (row >= 0) {
++            Q_EMIT dataChanged(index(row), index(row), {DefaultIndicatorRole, AuxiliaryActionRole, Qt::DisplayRole, IconNameRole});
++        }
++    }
++}
++
++int SidebarModel::rowOfItem(const MenuItem *item) const
++{
++    if (!item) {
++        return -1;
++    }
++    for (int i = 0; i < m_rows.size(); ++i) {
++        if (m_rows.at(i).item == item) {
++            return i;
++        }
++    }
++    return -1;
++}
++
++void SidebarModel::updateCurrent()
++{
++    int row = -1;
++    for (int i = 0; i < m_rows.size(); ++i) {
++        if (isCurrent(m_rows.at(i))) {
++            row = i;
++            break;
++        }
++    }
++    if (!m_rows.isEmpty()) {
++        Q_EMIT dataChanged(index(0), index(m_rows.size() - 1), {CurrentRole, ExpandedRole});
++    }
++    if (row != m_currentRow) {
++        m_currentRow = row;
++        Q_EMIT currentRowChanged();
++    }
++}
++
++void SidebarModel::setExpanded(MenuItem *category)
++{
++    if (m_expanded == category) {
++        return;
++    }
++
++    if (const int row = rowOfItem(m_expanded); row >= 0) {
++        int last = row;
++        while (last + 1 < m_rows.size() && m_rows.at(last + 1).kind == PageRow && m_rows.at(last + 1).depth > 0) {
++            ++last;
++        }
++        if (last > row) {
++            beginRemoveRows({}, row + 1, last);
++            m_rows.remove(row + 1, last - row);
++            endRemoveRows();
++        }
++    }
++
++    m_expanded = category;
++
++    if (const int row = rowOfItem(category); row >= 0 && m_rows.at(row).expandable) {
++        const QList<Row> pages = pageRows(m_rows.at(row));
++        beginInsertRows({}, row + 1, row + pages.size());
++        for (int i = 0; i < pages.size(); ++i) {
++            m_rows.insert(row + 1 + i, pages.at(i));
++        }
++        endInsertRows();
++    }
++    updateCurrent();
++}
++
++void SidebarModel::setCurrentItem(MenuItem *item)
++{
++    m_currentItem = item;
++    // Pages of other layouts (e.g. Home) are not in a category: close the open one
++    MenuItem *category = item && item->parent() && item->parent()->isLayoutCategory() ? item->parent() : nullptr;
++    if (category == m_expanded) {
++        updateCurrent();
++    } else {
++        setExpanded(category);
++    }
++}
++
++void SidebarModel::openFirstPage(const Row &category)
++{
++    const QModelIndex first = m_source->index(0, 0, category.sourceIndex);
++    if (first.isValid()) {
++        m_mode->loadModule(first);
++    }
++}
++
++void SidebarModel::activate(int row)
++{
++    if (row < 0 || row >= m_rows.size()) {
++        return;
++    }
++    const Row entry = m_rows.at(row);
++    switch (entry.kind) {
++    case GroupRow:
++        break;
++    case PageRow:
++        m_mode->loadModule(entry.sourceIndex);
++        break;
++    case CategoryRow:
++        if (!entry.expandable) {
++            openFirstPage(entry);
++        } else if (isExpanded(entry)) {
++            setExpanded(nullptr);
++        } else {
++            expand(row);
++        }
++        break;
++    }
++}
++
++void SidebarModel::expand(int row)
++{
++    if (row < 0 || row >= m_rows.size()) {
++        return;
++    }
++    const Row entry = m_rows.at(row);
++    if (entry.kind != CategoryRow || isExpanded(entry)) {
++        return;
++    }
++    if (!entry.expandable || !m_currentItem || m_currentItem->parent() != entry.item) {
++        // Opening the page expands the category. If the user cancels, because of unsaved changes, nothing changes.
++        openFirstPage(entry);
++    } else {
++        setExpanded(entry.item);
++    }
++}
++
++int SidebarModel::collapse(int row)
++{
++    if (row < 0 || row >= m_rows.size()) {
++        return -1;
++    }
++    const Row entry = m_rows.at(row);
++    MenuItem *category = entry.kind == PageRow && entry.depth > 0 ? entry.item->parent() : entry.item;
++    if (entry.kind == GroupRow || category != m_expanded) {
++        return -1;
++    }
++    setExpanded(nullptr);
++    return rowOfItem(category);
++}
++
++int SidebarModel::nextSelectable(int row, int step) const
++{
++    for (int i = row + step; i >= 0 && i < m_rows.size(); i += step) {
++        if (m_rows.at(i).kind != GroupRow) {
++            return i;
++        }
++    }
++    return -1;
++}
++
++#include "moc_SidebarModel.cpp"
+diff --git a/app/SidebarModel.h b/app/SidebarModel.h
+new file mode 100644
+index 0000000..949ccc7
+--- /dev/null
++++ b/app/SidebarModel.h
+@@ -0,0 +1,128 @@
++/*
++ * SPDX-FileCopyrightText: 2026 KDE Settings Redesign contributors
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#pragma once
++
++#include <QAbstractListModel>
++#include <QPersistentModelIndex>
++#include <qqmlregistration.h>
++
++class MenuItem;
++class SidebarMode;
++
++/**
++ * @brief The rows of the System Settings sidebar, as one flat list
++ *
++ * The sidebar is an accordion: section headers (groups), categories, and below the open category its pages.
++ * Only one category is open at a time. This model flattens the visible rows of the category model, so the
++ * view needs no nested delegates and opening a category just inserts a few rows.
++ */
++class SidebarModel : public QAbstractListModel
++{
++    Q_OBJECT
++    QML_ELEMENT
++    QML_UNCREATABLE("Use the systemsettings.sidebarModel property")
++
++    /**
++     * Row of the entry that is highlighted: the current page, or its category when the page is not shown
++     * (a category with a single page, or a collapsed category). -1 if none.
++     */
++    Q_PROPERTY(int currentRow READ currentRow NOTIFY currentRowChanged)
++
++public:
++    enum Kind {
++        GroupRow, ///< A section header, not clickable
++        CategoryRow, ///< A category, expandable when it has more than one page
++        PageRow, ///< A page, either under the open category or on its own (Home)
++    };
++    Q_ENUM(Kind)
++
++    enum Roles {
++        KindRole = Qt::UserRole + 1,
++        DepthRole,
++        ExpandableRole,
++        ExpandedRole,
++        CurrentRole,
++        IconNameRole,
++        DescriptionRole,
++        DefaultIndicatorRole,
++        AuxiliaryActionRole,
++    };
++
++    /**
++     * @param source The sorted and filtered model of categories (with their pages as children)
++     */
++    SidebarModel(QAbstractItemModel *source, SidebarMode *mode);
++    ~SidebarModel() override;
++
++    int rowCount(const QModelIndex &parent = QModelIndex()) const override;
++    QVariant data(const QModelIndex &index, int role) const override;
++    QHash<int, QByteArray> roleNames() const override;
++
++    int currentRow() const;
++    MenuItem *currentItem() const;
++
++    /**
++     * The page that is shown now. Opens its category, so it is also right when the page was opened by search,
++     * the command line or a link.
++     */
++    void setCurrentItem(MenuItem *item);
++
++    /**
++     * Opens the page, or the category: opens its first page and shows its pages. A category with a single page
++     * opens that page. An open category is collapsed instead.
++     */
++    Q_INVOKABLE void activate(int row);
++
++    /**
++     * Opens a category and its first page, unless the current page is in it already (then it only shows the
++     * pages). Does nothing for other rows.
++     */
++    Q_INVOKABLE void expand(int row);
++
++    /**
++     * Collapses the category of the row.
++     * @return the row to focus now: the category when called on one of its pages. -1 if nothing changed.
++     */
++    Q_INVOKABLE int collapse(int row);
++
++    /**
++     * @return the next row from @p row in direction @p step (1 or -1) that can be selected, so not a section
++     * header. -1 if there is none.
++     */
++    Q_INVOKABLE int nextSelectable(int row, int step) const;
++
++private:
++    struct Row {
++        Kind kind = PageRow;
++        MenuItem *item = nullptr;
++        QString title; // of a group
++        QPersistentModelIndex sourceIndex;
++        int depth = 0;
++        bool expandable = false;
++    };
++
++    void rebuild();
++    void sourceDataChanged(const QModelIndex &topLeft, const QModelIndex &bottomRight);
++    int rowOfItem(const MenuItem *item) const;
++    QList<Row> pageRows(const Row &category) const;
++    void setExpanded(MenuItem *category);
++    void updateCurrent();
++    bool isExpanded(const Row &row) const;
++    bool isCurrent(const Row &row) const;
++    void openFirstPage(const Row &category);
++
++Q_SIGNALS:
++    void currentRowChanged();
++
++private:
++    QAbstractItemModel *const m_source;
++    SidebarMode *const m_mode;
++    QList<Row> m_rows;
++    MenuItem *m_expanded = nullptr;
++    MenuItem *m_currentItem = nullptr;
++    int m_currentRow = -1;
++};
+diff --git a/app/qml/CategoriesPage.qml b/app/qml/CategoriesPage.qml
+index 9a6dd1d..1318bdf 100644
+--- a/app/qml/CategoriesPage.qml
++++ b/app/qml/CategoriesPage.qml
+@@ -9,12 +9,15 @@ pragma ComponentBehavior: Bound
+ import QtQuick
+ import QtQuick.Controls as QQC2
+ import QtQuick.Layouts
++import Qt.labs.qmlmodels
+ import org.kde.kirigami as Kirigami
+ import org.kde.systemsettings
+ 
+ Kirigami.ScrollablePage {
+     id: mainColumn
+     readonly property bool searchMode: searchField.text.length > 0
++    // System Settings has one column: categories expand in place. Info Center has categories and a column of pages.
++    readonly property bool accordion: systemsettings.accordionSidebar
+ 
+     Kirigami.Theme.colorSet: Kirigami.Theme.View
+     Kirigami.Theme.inherit: false
+@@ -110,15 +113,25 @@ Kirigami.ScrollablePage {
+     Binding {
+         target: categoryView
+         property: "currentIndex"
+-        value: mainColumn.searchMode
+-            ? systemsettings.activeSearchRow
+-            : systemsettings.activeCategoryRow
++        value: {
++            if (mainColumn.searchMode) {
++                return systemsettings.activeSearchRow;
++            }
++            return mainColumn.accordion ? systemsettings.sidebarModel.currentRow : systemsettings.activeCategoryRow;
++        }
+     }
+ 
+     ListView {
+         id: categoryView
+ 
+-        model: mainColumn.searchMode ? systemsettings.searchModel : systemsettings.categoryModel
++        readonly property bool showsAccordion: mainColumn.accordion && !mainColumn.searchMode
++
++        model: {
++            if (mainColumn.searchMode) {
++                return systemsettings.searchModel;
++            }
++            return mainColumn.accordion ? systemsettings.sidebarModel : systemsettings.categoryModel;
++        }
+ 
+         activeFocusOnTab: true
+         keyNavigationWraps: true
+@@ -127,17 +140,92 @@ Kirigami.ScrollablePage {
+         KeyNavigation.up: searchField
+         KeyNavigation.backtab: hamburgerMenuButton
+         Keys.onUpPressed: event => {
++            if (categoryView.showsAccordion) {
++                // Section headers are skipped. Above the first row is the search field.
++                const row = systemsettings.sidebarModel.nextSelectable(categoryView.currentIndex, -1);
++                if (row >= 0) {
++                    categoryView.currentIndex = row;
++                    event.accepted = true;
++                    return;
++                }
++                categoryView.currentIndex = -1;
++                searchField.forceActiveFocus();
++                event.accepted = true;
++                return;
++            }
+             if (categoryView.currentIndex === 0) {
+                 categoryView.currentIndex = -1;
+             }
+             event.accepted = false; // Pass to KeyNavigation.up
+         }
++        Keys.onDownPressed: event => {
++            if (categoryView.showsAccordion) {
++                const row = systemsettings.sidebarModel.nextSelectable(categoryView.currentIndex, 1);
++                if (row >= 0) {
++                    categoryView.currentIndex = row;
++                }
++                event.accepted = true;
++            } else {
++                event.accepted = false;
++            }
++        }
++        // Enter and Right open a category and its first page, Left closes it (the other way round for right-to-left)
++        Keys.onReturnPressed: event => accordionActivate(event)
++        Keys.onEnterPressed: event => accordionActivate(event)
++        Keys.onRightPressed: event => {
++            if (LayoutMirroring.enabled) {
++                accordionCollapse(event);
++            } else {
++                accordionExpand(event);
++            }
++        }
++        Keys.onLeftPressed: event => {
++            if (LayoutMirroring.enabled) {
++                accordionExpand(event);
++            } else {
++                accordionCollapse(event);
++            }
++        }
+         Keys.onTabPressed: {
+             systemsettings.focusNext();
+         }
+ 
++        function accordionActivate(event: var): void {
++            event.accepted = showsAccordion && currentIndex >= 0;
++            if (event.accepted) {
++                systemsettings.sidebarModel.activate(currentIndex);
++            }
++        }
++
++        function accordionExpand(event: var): void {
++            event.accepted = showsAccordion && currentIndex >= 0;
++            if (event.accepted) {
++                systemsettings.sidebarModel.expand(currentIndex);
++            }
++        }
++
++        function accordionCollapse(event: var): void {
++            event.accepted = showsAccordion && currentIndex >= 0;
++            if (event.accepted) {
++                const row = systemsettings.sidebarModel.collapse(currentIndex);
++                if (row >= 0) {
++                    currentIndex = row;
++                }
++            }
++        }
++
++        // The first row that is shown or just got the focus must be visible
++        Connections {
++            target: systemsettings.sidebarModel
++            function onCurrentRowChanged(): void {
++                if (categoryView.showsAccordion && systemsettings.sidebarModel.currentRow >= 0) {
++                    categoryView.positionViewAtIndex(systemsettings.sidebarModel.currentRow, ListView.Contain);
++                }
++            }
++        }
++
+         section {
+-            property: "categoryDisplayRole"
++            property: categoryView.showsAccordion || mainColumn.accordion ? "" : "categoryDisplayRole"
+             delegate: Kirigami.ListSectionHeader {
+ 
+                 required property string section
+@@ -147,62 +235,130 @@ Kirigami.ScrollablePage {
+             }
+         }
+ 
+-        delegate: CategoryItem {
+-            id: delegate
++        delegate: categoryView.showsAccordion ? accordionDelegate : classicDelegate
+ 
+-            required property int index
+-            required property var model
+-            required property bool isCategory
+-            required property int depth
+-            required property bool isKCM
+-            required property string iconName
++        DelegateChooser {
++            id: accordionDelegate
++            role: "kind"
+ 
+-            text: model.display
+-            icon.name: iconName
++            // Section headers are not clickable
++            DelegateChoice {
++                roleValue: SidebarModel.GroupRow
++                delegate: Kirigami.ListSectionHeader {
++                    // "display" is a property of the control, so read it through the model
++                    required property var model
+ 
+-            showArrow: {
+-                if (!isCategory) {
+-                    return false;
++                    width: ListView.view.width
++                    label: model.display
++                    Accessible.role: Accessible.Heading
++                    Accessible.name: model.display
+                 }
+-                const modelIndex = delegate.ListView.view.model.index(index, 0)
+-                return delegate.ListView.view.model.rowCount(modelIndex) > 1
+             }
+-            // Only indent subcategory icons in the search view
+-            leadingPadding: (depth > 1 && searchField.text.length > 0) ? (( depth - 1 ) * Kirigami.Units.iconSizes.smallMedium) + Kirigami.Units.largeSpacing : 0
+ 
+-            hoverEnabled: !isCategory || !mainColumn.searchMode
+-            enabled: !isCategory || !mainColumn.searchMode
++            DelegateChoice {
++                delegate: CategoryItem {
++                    id: row
++
++                    required property int index
++                    required property var model
++                    required property int depth
++                    required property bool expandable
++                    required property bool isCurrent
++                    required property string iconName
++                    required property string description
++
++                    text: model.display
++                    icon.name: iconName
++                    // Pages are indented below their category
++                    leadingPadding: depth * (Kirigami.Units.iconSizes.smallMedium + Kirigami.Units.largeSpacing)
++                    showArrow: expandable
++                    expanded: model.expanded
++
++                    // The current page stays highlighted while the keys move through the list
++                    highlighted: isCurrent || (ListView.isCurrentItem && ListView.view.activeFocus)
++
++                    // Screen readers announce a category as expanded or collapsed
++                    Accessible.role: expandable ? Accessible.TreeItem : Accessible.ListItem
++                    Accessible.description: description
++                    Accessible.expandable: expandable
++                    Accessible.expanded: model.expanded
++                    Accessible.selected: isCurrent
++
++                    onClicked: {
++                        ListView.view.currentIndex = index;
++                        systemsettings.sidebarModel.activate(index);
++                    }
++                    onFocusChanged: {
++                        if (focus) {
++                            ListView.view.positionViewAtIndex(index, ListView.Contain);
++                        }
++                    }
++                }
++            }
++        }
+ 
+-            highlighted: ListView.isCurrentItem
++        Component {
++            id: classicDelegate
+ 
+-            onClicked: {
+-                if (!enabled) { return; }
+-                if (isKCM || mainColumn.searchMode || systemsettings.activeCategoryRow !== index) {
+-                    systemsettings.loadModule(categoryView.model.index(index, 0));
+-                }
+-                if (!mainColumn.searchMode && root.pageStack.depth > 1) {
+-                    root.pageStack.currentIndex = 1;
++            CategoryItem {
++                id: delegate
++
++                required property int index
++                required property var model
++                required property bool isCategory
++                required property int depth
++                required property bool isKCM
++                required property string iconName
++                required property string breadcrumb
++
++                text: model.display
++                icon.name: iconName
++                subtitle: breadcrumb
++
++                showArrow: {
++                    if (!isCategory) {
++                        return false;
++                    }
++                    const modelIndex = delegate.ListView.view.model.index(index, 0)
++                    return delegate.ListView.view.model.rowCount(modelIndex) > 1
+                 }
+-            }
+-            onFocusChanged: {
+-                if (isCategory && mainColumn.searchMode) {
+-                    return;
++                // Only indent subcategory icons in the search view
++                leadingPadding: (!mainColumn.accordion && depth > 1 && searchField.text.length > 0) ? (( depth - 1 ) * Kirigami.Units.iconSizes.smallMedium) + Kirigami.Units.largeSpacing : 0
++
++                hoverEnabled: !isCategory || !mainColumn.searchMode
++                enabled: !isCategory || !mainColumn.searchMode
++
++                highlighted: ListView.isCurrentItem
++
++                onClicked: {
++                    if (!enabled) { return; }
++                    if (isKCM || mainColumn.searchMode || systemsettings.activeCategoryRow !== index) {
++                        systemsettings.loadModule(categoryView.model.index(index, 0));
++                    }
++                    if (!mainColumn.searchMode && root.pageStack.depth > 1) {
++                        root.pageStack.currentIndex = 1;
++                    }
+                 }
+-                if (focus) {
+-                    categoryView.positionViewAtIndex(index, ListView.Contain);
++                onFocusChanged: {
++                    if (isCategory && mainColumn.searchMode) {
++                        return;
++                    }
++                    if (focus) {
++                        categoryView.positionViewAtIndex(index, ListView.Contain);
++                    }
+                 }
+-            }
+-            Keys.onEnterPressed: clicked();
+-            Keys.onReturnPressed: clicked();
++                Keys.onEnterPressed: clicked();
++                Keys.onReturnPressed: clicked();
+ 
+-            Keys.onLeftPressed: {
+-                if (LayoutMirroring.enabled) {
+-                    clicked();
++                Keys.onLeftPressed: {
++                    if (LayoutMirroring.enabled) {
++                        clicked();
++                    }
+                 }
+-            }
+-            Keys.onRightPressed: {
+-                if (!LayoutMirroring.enabled) {
+-                    clicked();
++                Keys.onRightPressed: {
++                    if (!LayoutMirroring.enabled) {
++                        clicked();
++                    }
+                 }
+             }
+         }
+diff --git a/app/qml/CategoryItem.qml b/app/qml/CategoryItem.qml
+index c0b218f..bf11a80 100644
+--- a/app/qml/CategoryItem.qml
++++ b/app/qml/CategoryItem.qml
+@@ -12,6 +12,10 @@ ItemDelegate {
+     id: delegate
+ 
+     property bool showArrow: false
++    // Whether the pages of the category are shown below it. Only shown with showArrow.
++    property bool expanded: false
++    // Secondary text, such as the category of a search result
++    property string subtitle
+     property bool selected: delegate.highlighted || delegate.pressed
+     property bool isSearching: false
+     property real leadingPadding: 0
+@@ -32,6 +36,7 @@ ItemDelegate {
+             Layout.leftMargin: delegate.leadingPadding
+             icon: icon.fromControlsIcon(delegate.icon)
+             title: delegate.text
++            subtitle: delegate.subtitle
+             selected: delegate.selected
+         }
+ 
+@@ -108,7 +113,7 @@ ItemDelegate {
+             Layout.preferredHeight: Kirigami.Units.iconSizes.small
+ 
+             opacity: delegate.showArrow ? 0.7 : 0.0
+-            source: LayoutMirroring.enabled ? "go-next-symbolic-rtl" : "go-next-symbolic"
++            source: delegate.expanded ? "go-down-symbolic" : (LayoutMirroring.enabled ? "go-next-symbolic-rtl" : "go-next-symbolic")
+             selected: delegate.selected
+             visible: !delegate.auxiliaryAction?.visible ?? true
+         }

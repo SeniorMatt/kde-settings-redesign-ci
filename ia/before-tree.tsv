@@ -1,0 +1,106 @@
+kcm	name	category	category_v2	infocenter	weight	formfactors	json
+kcm_about-distro	About this System	system-administration		basic_information	100		kinfocenter/kcms/about-distro/src/kcm_about-distro.json
+kcm_access	Accessibility	input-devices			220		plasma-desktop/kcms/access/kcm_access.json
+kcm_activities	Activities	applications			40		plasma-desktop/kcms/activities/kcm_activities.json
+kcm_animations	Animations	appearance			40	tablet,handset,desktop	kwin/src/kcms/animations/kcm_animations.json
+kcm_app-permissions	Application Permissions	applications-permissions			10	desktop,handset,tablet	flatpak-kcm/kcm_app-permissions.json
+kcm_audio_information	Audio			device_information	100		kinfocenter/kcms/audio_information/kcm_audio_information.json
+kcm_autostart	Autostart	system-administration			50	tablet,handset,desktop	plasma-workspace/kcms/autostart/kcm_autostart.json
+kcm_baloofile	File Search	search			10		plasma-desktop/kcms/baloo/kcm_baloofile.json
+kcm_block_devices	Block Devices			device_information	100		kinfocenter/kcms/block_devices/kcm_block_devices.json
+kcm_bluetooth	Bluetooth	hardware			20	handset,tablet,desktop,mediacenter	bluedevil/src/kcm/kcm_bluetooth.json
+kcm_bolt	Thunderbolt	hardware			40		plasma-thunderbolt/src/kcm/kcm_bolt.json
+kcm_cellular_network	Cellular Network	network			70	handset,tablet	plasma-nm/kcms/kcm_cellularnetwork/kcm_cellular_network.json
+kcm_clock	Date & Time	regionalsettings			30		plasma-desktop/kcms/dateandtime/kcm_clock.json
+kcm_colors	Colors	themes			20	tablet,handset,desktop	plasma-workspace/kcms/colors/kcm_colors.json
+kcm_componentchooser	Default Applications	applications-defaults			10	desktop,handset,tablet	plasma-workspace/kcms/componentchooser/kcm_componentchooser.json
+kcm_cpu	CPU			device_information	100		kinfocenter/kcms/cpu/kcm_cpu.json
+kcm_cursortheme	Pointers	themes			80		plasma-workspace/kcms/cursortheme/kcm_cursortheme.json
+kcm_desktoppaths	Locations	session			60		plasma-desktop/kcms/desktoppaths/kcm_desktoppaths.json
+kcm_desktoptheme	Plasma Style	themes			50	tablet,handset,desktop	plasma-workspace/kcms/desktoptheme/kcm_desktoptheme.json
+kcm_device_automounter	Device Auto-Mount	removable-storage			100		plasma-desktop/solid-device-automounter/kcm/device_automounter_kcm.json
+kcm_disks	SMART Status			device_information	100		plasma-disks/src/kcm/kcm_disks.json
+kcm_edid	EDID			graphical_information	100		kinfocenter/kcms/edid/kcm_edid.json
+kcm_egl	OpenGL (EGL)			graphical_information	100		kinfocenter/kcms/egl/kcm_egl.json
+kcm_energyinfo	Energy			basic_information	2	desktop,tablet,handset	kinfocenter/kcms/energy/kcm_energyinfo.json
+kcm_feedback	User Feedback	security-privacy			50	tablet,handset,desktop	plasma-workspace/kcms/feedback/kcm_feedback.json
+kcm_filetypes	File Associations	applications-defaults			20		kde-cli-tools/keditfiletype/kcm_filetypes.json
+kcm_firewall	Firewall	networksettings			20		plasma-firewall/kcm/kcm_firewall.json
+kcm_firmware_security	Firmware Security			device_information	100		kinfocenter/kcms/firmware_security/kcm_firmware_security.json
+kcm_fonts	Fonts	font			10	tablet,handset,desktop	plasma-workspace/kcms/fonts/kcm_fonts.json
+kcm_gamecontroller	Game Controller	input-devices			70		plasma-desktop/kcms/gamecontroller/kcm_gamecontroller.json
+kcm_glx	OpenGL (GLX)			graphical_information	100		kinfocenter/kcms/glx/kcm_glx.json
+kcm_icons	Icons	themes			70	tablet,handset,desktop	plasma-workspace/kcms/icons/kcm_icons.json
+kcm_interrupts	Interrupts			device_information	100		kinfocenter/kcms/interrupts/kcm_interrupts.json
+kcm_kaccounts	Online Accounts	network			20	desktop,handset,tablet	kaccounts-integration/src/kcm/kcm_kaccounts.json
+kcm_keyboard	Keyboard	keyboard			10		plasma-desktop/kcms/keyboard/kcm_keyboard.json
+kcm_keys	Shortcuts	keyboard			200		plasma-desktop/kcms/keys/kcm_keys.json
+kcm_konlineaccounts	Online Accounts	network			20	desktop,handset,tablet,mediacenter	konlineaccounts/kcm/kcm_konlineaccounts.json
+kcm_krdpserver	Remote Desktop	security-privacy			35	desktop,handset,phone	krdp/src/kcm/kcm_krdpserver.json
+kcm_kscreen	Display Configuration	display			40	tablet,handset,desktop	kscreen/kcm/kcm_kscreen.json
+kcm_kup	Backups	system-administration			100		kup/kcm/kcm_kup.json
+kcm_kwallet	KDE Wallet	security-privacy			30		kwalletmanager/src/kcm/kcm_kwallet.json
+kcm_kwin_effects	Desktop Effects	windowmanagement			30	desktop,tablet	kwin/src/kcms/effects/kcm_kwin_effects.json
+kcm_kwin_scripts	KWin Scripts	windowmanagement			50		kwin/src/kcms/scripts/kcm_kwin_scripts.json
+kcm_kwin_taskswitching	Task Switching	windowmanagement			20		kwin/src/kcms/taskswitching/kcm_kwin_taskswitching.json
+kcm_kwin_virtualdesktops	Virtual Desktops	windowmanagement			60	desktop	kwin/src/kcms/desktop/kcm_kwin_virtualdesktops.json
+kcm_kwindecoration	Window Decorations	themes			60	desktop,tablet	kwin/src/kcms/decoration/kcm_kwindecoration.json
+kcm_kwinoptions	Window Behavior	windowmanagement			10		kwin/src/kcms/options/kcm_kwinoptions.json
+kcm_kwinrules	Window Rules	windowmanagement			40	desktop,tablet	kwin/src/kcms/rules/kcm_kwinrules.json
+kcm_kwinscreenedges	Screen Edges	display			100		kwin/src/kcms/screenedges/kcm_kwinscreenedges.json
+kcm_kwinsupportinfo	Window Manager			graphical_information	100		kinfocenter/kcms/kwinsupportinfo/kcm_kwinsupportinfo.json.in
+kcm_kwintouchscreen	Touchscreen Gestures	hardware-input-touchscreen			20		kwin/src/kcms/screenedges/kcm_kwintouchscreen.json
+kcm_kwinxwayland	Legacy X11 App Support	applications-permissions			20		kwin/src/kcms/xwayland/kcm_kwinxwayland.json
+kcm_landingpage	Quick Settings	rootcategory			40		plasma-desktop/kcms/landingpage/kcm_landingpage.json
+kcm_lookandfeel	Global Theme	themes			10		plasma-workspace/kcms/lookandfeel/kcm_lookandfeel.json
+kcm_memory	Memory			device_information	100		kinfocenter/kcms/memory/kcm_memory.json
+kcm_mobile_hotspot	Hotspot	network			100	handset,tablet	plasma-nm/kcms/kcm_hotspot/kcm_mobile_hotspot.json
+kcm_mobile_info	Information	system-administration			100	handset,tablet	plasma-mobile/kcms/info/kcm_mobile_info.json
+kcm_mobile_power	Energy	system-administration			20	handset,tablet	powerdevil/kcm_mobile/kcm_mobile_power.json
+kcm_mobile_time	Time and Date	regionalsettings			70	handset,tablet	plasma-mobile/kcms/time/kcm_mobile_time.json
+kcm_mobile_wifi	Wi-Fi	network			70	handset,tablet	plasma-nm/kcms/kcm_wifi_mobile/kcm_mobile_wifi.json
+kcm_mobile_wired	Wired Network	network			70	handset,tablet	plasma-nm/kcms/kcm_wired_mobile/kcm_mobile_wired.json
+kcm_mobileshell	Shell	personalization			100	handset,tablet	plasma-mobile/kcms/mobileshell/kcm_mobileshell.json
+kcm_mouse	Mouse	pointing-devices			10		plasma-desktop/kcms/mouse/kcm_mouse.json
+kcm_navigation	Navigation	personalization			100	handset,tablet	plasma-mobile/kcms/navigation/kcm_navigation.json
+kcm_network	Network Interfaces			network_information	100		kinfocenter/kcms/network/kcm_network.json
+kcm_networkmanagement	Wi-Fi & Networking	networksettings			10		plasma-nm/kcms/kcm_connections/kcm_networkmanagement.json
+kcm_networkmanagement_qml	Wi-Fi & Networking	networksettings			10		plasma-nm/kcms/kcm_connections_qml/kcm_networkmanagement_qml.json
+kcm_nightlight	Night Light	display			70	tablet,handset,desktop	plasma-workspace/kcms/nightlight/kcm_nightlight.json
+kcm_nighttime	Day-Night Cycle	regionalsettings			70	tablet,handset,desktop	plasma-workspace/kcms/nighttime/kcm_nighttime.json
+kcm_notifications	Notifications	applications			20	tablet,handset,desktop	plasma-workspace/kcms/notifications/kcm_notifications.json
+kcm_opencl	OpenCL			graphical_information	100		kinfocenter/kcms/opencl/kcm_opencl.json
+kcm_pci	PCI			device_information	100		kinfocenter/kcms/pci/kcm_pci.json.cmake
+kcm_plasmakeyboard	On-Screen Keyboard	keyboard			100	desktop,handset,tablet,mediacenter	plasma-keyboard/kcm/kcm_plasmakeyboard.json
+kcm_plasmalogin	Login Screen	security-privacy			5		plasma-login-manager/src/frontend/kcm/kcm_plasmalogin.json
+kcm_plasmasearch	Plasma Search	search			20		plasma-desktop/kcms/runners/plasmasearch/kcm_plasmasearch.json
+kcm_plymouth	Boot Splash Screen	themes			120		plymouth-kcm/src/kcm_plymouth.json
+kcm_powerdevilprofilesconfig	Power Management	system-administration			20	desktop	powerdevil/kcm/kcm_powerdevilprofilesconfig.json
+kcm_printer_manager	Printers	hardware			100		print-manager/src/kcm/kcm_printer_manager.json
+kcm_proxy	Proxy	networksettings			40		kio-extras/kcms/proxy/kcm_proxy.json
+kcm_pulseaudio	Sound	input-devices			200	handset,tablet,desktop	plasma-pa/src/kcm/kcm_pulseaudio.json
+kcm_recentFiles	Recent Files	security-privacy			40		plasma-desktop/kcms/recentFiles/kcm_recentFiles.json
+kcm_regionandlang	Region & Language	regionalsettings			10	tablet,handset,desktop	plasma-workspace/kcms/region_language/kcm_regionandlang.json
+kcm_samba	Samba Status			network_information	100		kinfocenter/kcms/samba/smbstatus.json
+kcm_screenlocker	Screen Locking	security-privacy			10	tablet,handset,desktop	kscreenlocker/kcm/kcm_screenlocker.json
+kcm_sddm	Login Screen (SDDM)	themes			110		sddm-kcm/src/kcm_sddm.json
+kcm_sensors	Sensors			device_information	100		kinfocenter/kcms/sensors/kcm_sensors.json
+kcm_smserver	Desktop Session	session			60	desktop	plasma-desktop/kcms/ksmserver/kcm_smserver.json
+kcm_soundtheme	System Sounds	themes			90		plasma-workspace/kcms/soundtheme/kcm_soundtheme.json
+kcm_spellchecking	Spell Check	regionalsettings			20		plasma-desktop/kcms/spellchecking/kcm_spellchecking.json
+kcm_splashscreen	Splash Screen	themes			100		plasma-desktop/kcms/ksplash/kcm_splashscreen.json
+kcm_style	Application Style	themes			40		plasma-workspace/kcms/style/kcm_style.json
+kcm_tablet	Drawing Tablet	input-devices			100	tablet,handset,desktop	plasma-desktop/kcms/tablet/kcm_tablet.json
+kcm_touchpad	Touchpad	pointing-devices			20		plasma-desktop/kcms/touchpad/kcm_touchpad.json
+kcm_touchscreen	Touchscreen	hardware-input-touchscreen			10	tablet,handset,desktop	plasma-desktop/kcms/touchscreen/kcm_touchscreen.json
+kcm_updates	Software Update	system-administration			30	tablet,handset,desktop	discover/kcm/kcm_updates.json
+kcm_users	Users	system-administration			40	tablet,handset,desktop	plasma-workspace/kcms/users/src/kcm_users.json
+kcm_vaapi	Video Acceleration (VA-API)			graphical_information	100		kinfocenter/kcms/vaapi/kcm_vaapi.json
+kcm_virtualkeyboard	Virtual Keyboard	keyboard			100	desktop,handset,tablet	kwin/src/kcms/virtualkeyboard/kcm_virtualkeyboard.json
+kcm_vulkan	Vulkan			graphical_information	100		kinfocenter/kcms/vulkan/kcm_vulkan.json
+kcm_wallpaper	Wallpaper	appearance			10	desktop	plasma-workspace/kcms/wallpaper/kcm_wallpaper.json
+kcm_waydroidintegration	Waydroid Integration	system-administration			100	handset,tablet	plasma-mobile/kcms/waydroidintegration/kcm_waydroidintegration.json
+kcm_wayland	Wayland			graphical_information	100		kinfocenter/kcms/wayland/kcm_wayland.json
+kcm_workspace	General Behavior	workspace			10		plasma-desktop/kcms/workspaceoptions/kcm_workspace.json
+kcm_xserver	X-Server			graphical_information	100		kinfocenter/kcms/xserver/kcm_xserver.json
+kcmusb	USB Devices			device_information	100		kinfocenter/kcms/usbview/kcmusb.json

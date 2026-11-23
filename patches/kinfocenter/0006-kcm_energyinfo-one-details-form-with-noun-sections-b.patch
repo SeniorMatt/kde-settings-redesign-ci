@@ -1,0 +1,322 @@
+From acb133c0780be880b0434665baf892a5c001069a Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 01:32:22 +0500
+Subject: [PATCH 6/9] kcm_energyinfo: one details form with noun sections;
+ batteries are scanned after the first frame
+
+Page type: Info/Form (docs/page-design.md 2): device buttons (when more than one battery), history graph with its
+controls, then the facts. The facts (Battery, Energy, Environment) were three FormLayouts tied together with
+twinFormLayouts and a Heading-level-2 hack that hid a title when all rows were empty; now one Kirigami.FormLayout with
+Kirigami.Separator sections (isSection), the same section look as the other pages; a section title is hidden when none of
+its rows has a value (hasValues(), a real binding instead of itemAt()). The rows, labels and formatters are unchanged, so no
+aliases. History graph, Charge Percentage / Energy Consumption, Timespan, Refresh unchanged. Markers: all 9 rows
+(kcm_energyinfo/*); inventory_check --kcm kcm_energyinfo --strict: 0 lost.
+
+Speed (cause found in code): BatteryModel's constructor ran Solid::Device::listFromType(Battery) and a sort that reads
+isPowerSupply() and product() of every battery, and connected Solid::DeviceNotifier::instance() (sets up Solid's
+backends), all during page creation (kcm.cpp:38). Now BatteryModel::populate() runs from the event loop, inserting the rows
+as one insertion (not a reset, so the list keeps currentIndex 0) and setting the new "loaded" property; the "No energy
+information available" placeholder waits for loaded so it does not flash. The history is already asynchronous (UPower via
+QDBusPendingCallWatcher). After numbers: pending, manager will measure.
+
+Not built yet. Uncertain: Component with required properties used as Repeater delegate under "pragma ComponentBehavior:
+Bound" (same required properties as the old inline delegate); QList::removeIf needs Qt 6.1 (fine for 6.8+).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/energy/batterymodel.cpp |  49 ++++++++++++---
+ kcms/energy/batterymodel.h   |   8 +++
+ kcms/energy/ui/main.qml      | 119 ++++++++++++++++++++---------------
+ 3 files changed, 117 insertions(+), 59 deletions(-)
+
+diff --git a/kcms/energy/batterymodel.cpp b/kcms/energy/batterymodel.cpp
+index 8ccf720..196ddf1 100644
+--- a/kcms/energy/batterymodel.cpp
++++ b/kcms/energy/batterymodel.cpp
+@@ -17,17 +17,14 @@ BatteryModel::BatteryModel(QObject *parent)
+ {
+     qmlRegisterUncreatableType<Solid::Battery>("org.kde.kinfocenter.energy.private", 1, 0, "Battery", QStringLiteral("Use Solid::Battery"));
+ 
+-    m_batteries = Solid::Device::listFromType(Solid::DeviceInterface::Battery);
+-    std::sort(m_batteries.begin(), m_batteries.end(), [](const Solid::Device &lhs, const Solid::Device &rhs) {
+-        auto lhsBattery = lhs.as<Solid::Battery>();
+-        auto rhsBattery = rhs.as<Solid::Battery>();
+-        if (lhsBattery->isPowerSupply() != rhsBattery->isPowerSupply()) {
+-            return lhsBattery->isPowerSupply();
+-        }
+-
+-        return lhs.product().compare(rhs.product(), Qt::CaseInsensitive) < 0;
+-    });
++    // The scan (Solid::Device::listFromType and the sort, which reads every battery) runs from the event loop, after
++    // the page has been created (the Solid notifier is connected there too).
++    metaObject()->invokeMethod(this, &BatteryModel::populate, Qt::QueuedConnection);
++}
+ 
++void BatteryModel::populate()
++{
++    // Also here: the first DeviceNotifier::instance() sets up Solid's backends
+     connect(Solid::DeviceNotifier::instance(), &Solid::DeviceNotifier::deviceAdded, this, [this](const QString &udi) {
+         auto it = std::find_if(m_batteries.constBegin(), m_batteries.constEnd(), [&udi](const Solid::Device &dev) {
+             return dev.udi() == udi;
+@@ -61,6 +58,38 @@ BatteryModel::BatteryModel(QObject *parent)
+ 
+         Q_EMIT countChanged();
+     });
++
++    QList<Solid::Device> found = Solid::Device::listFromType(Solid::DeviceInterface::Battery);
++    std::sort(found.begin(), found.end(), [](const Solid::Device &lhs, const Solid::Device &rhs) {
++        auto lhsBattery = lhs.as<Solid::Battery>();
++        auto rhsBattery = rhs.as<Solid::Battery>();
++        if (lhsBattery->isPowerSupply() != rhsBattery->isPowerSupply()) {
++            return lhsBattery->isPowerSupply();
++        }
++
++        return lhs.product().compare(rhs.product(), Qt::CaseInsensitive) < 0;
++    });
++
++    // Rows are inserted (as for a device that is plugged in), not reset, so the list keeps its current index
++    found.removeIf([this](const Solid::Device &device) {
++        return std::any_of(m_batteries.cbegin(), m_batteries.cend(), [&device](const Solid::Device &known) {
++            return known.udi() == device.udi();
++        });
++    });
++    if (!found.isEmpty()) {
++        beginInsertRows(QModelIndex(), 0, found.count() - 1);
++        m_batteries = found + m_batteries;
++        endInsertRows();
++        Q_EMIT countChanged();
++    }
++
++    m_loaded = true;
++    Q_EMIT loadedChanged();
++}
++
++bool BatteryModel::loaded() const
++{
++    return m_loaded;
+ }
+ 
+ QVariant BatteryModel::data(const QModelIndex &index, int role) const
+diff --git a/kcms/energy/batterymodel.h b/kcms/energy/batterymodel.h
+index 9005b80..766c3df 100644
+--- a/kcms/energy/batterymodel.h
++++ b/kcms/energy/batterymodel.h
+@@ -18,6 +18,8 @@ class BatteryModel : public QAbstractListModel
+     Q_OBJECT
+ 
+     Q_PROPERTY(int count READ rowCount NOTIFY countChanged)
++    // false until the first scan for batteries is done (it runs after the page is created)
++    Q_PROPERTY(bool loaded READ loaded NOTIFY loadedChanged)
+ 
+ public:
+     explicit BatteryModel(QObject *parent);
+@@ -34,11 +36,17 @@ public:
+     int rowCount(const QModelIndex &parent = QModelIndex()) const override;
+     QHash<int, QByteArray> roleNames() const override;
+ 
++    bool loaded() const;
++
+ Q_SIGNALS:
+     void countChanged();
++    void loadedChanged();
+ 
+ private:
++    void populate();
++
+     QList<Solid::Device> m_batteries;
++    bool m_loaded = false;
+ };
+ 
+ #endif // KCM_ENERGYINFO_BATTERYMODEL_H
+diff --git a/kcms/energy/ui/main.qml b/kcms/energy/ui/main.qml
+index e8f9ae1..8091044 100644
+--- a/kcms/energy/ui/main.qml
++++ b/kcms/energy/ui/main.qml
+@@ -59,6 +59,18 @@ KCM.SimpleKCM {
+         },
+     ]
+ 
++    // The text of one detail row; "" when the battery has no such value (the row is then hidden)
++    function valueText(source, format) {
++        // Battery properties are lower-cased. Otherwise get the "currentX" property from root
++        const isBatteryProperty = (source[0] == source[0].toLowerCase())
++        const value = isBatteryProperty ? root.currentBattery?.[source] : root[`current${source}`]
++        return value ? format(value) : ""
++    }
++
++    function hasValues(section) {
++        return root.details[section].info.some(row => valueText(row.source, row.format).length > 0)
++    }
++
+     // Formatter functions for the details properties
+ 
+     function format_text(value) {
+@@ -122,7 +134,7 @@ KCM.SimpleKCM {
+ 
+     Kirigami.PlaceholderMessage {
+         anchors.centerIn: parent
+-        visible: kcm.batteries.count <= 0 && history.count <= 0
++        visible: kcm.batteries.loaded && kcm.batteries.count <= 0 && history.count <= 0 // ksr: kcm_energyinfo/NoEnergy
+         width: parent.width - (Kirigami.Units.largeSpacing * 4)
+         text: i18nc("@info:status", "No energy information available on this system")
+         icon.name: "utilities-energy-monitor"
+@@ -161,6 +173,7 @@ KCM.SimpleKCM {
+ 
+                 model: kcm.batteries
+ 
++                // ksr: kcm_energyinfo/DeviceList
+                 delegate: QQC2.Button {
+                     id: deviceItem
+ 
+@@ -327,6 +340,7 @@ KCM.SimpleKCM {
+             footer: GridLayout {
+                 columns: !compact ? 5 : 3
+ 
++                // ksr: kcm_energyinfo/Charge-Percentage
+                 QQC2.Button {
+                     id: chargeButton
+                     checked: true
+@@ -338,6 +352,7 @@ KCM.SimpleKCM {
+                     }
+                 }
+ 
++                // ksr: kcm_energyinfo/Energy-Consumption
+                 QQC2.Button {
+                     id: rateButton
+                     checkable: true
+@@ -352,6 +367,7 @@ KCM.SimpleKCM {
+                     Layout.fillWidth: true
+                 }
+ 
++                // ksr: kcm_energyinfo/Timespan
+                 QQC2.ComboBox {
+                     id: timespanCombo
+                     Layout.minimumWidth: Kirigami.Units.gridUnit * 6
+@@ -374,6 +390,7 @@ KCM.SimpleKCM {
+                     Accessible.description: i18n("Timespan of data to display")
+                 }
+ 
++                // ksr: kcm_energyinfo/Refresh
+                 QQC2.Button {
+                     icon.name: "view-refresh-symbolic"
+                     hoverEnabled: true
+@@ -386,66 +403,70 @@ KCM.SimpleKCM {
+             }
+         }
+ 
+-        Repeater {
+-            id: titleRepeater
+-            property list<Kirigami.FormLayout> layouts
++        // One form for the three groups of facts (was one FormLayout per group, tied together with twinFormLayouts).
++        // A group with no value to show hides its title.
++        Kirigami.FormLayout {
++            id: detailsForm
++            Layout.fillWidth: true
+             visible: !!root.currentBattery
+ 
+-            model: root.details
++            Component {
++                id: detailRow
+ 
+-            delegate: Kirigami.FormLayout {
+-                id: currentLayout
++                Kirigami.SelectableLabel {
++                    id: valueLabel
+ 
+-                required property string title
+-                required property list<var> info
++                    required property string label
++                    required property string source
++                    required property var format  // A formatter function
+ 
+-                Component.onCompleted: {
+-                    // ensure that all visible FormLayout share the same set of twinFormLayouts
+-                    titleRepeater.layouts.push(currentLayout);
+-                    for (let i = 0, length = titleRepeater.layouts.length; i < length; ++i) {
+-                        titleRepeater.layouts[i].twinFormLayouts = titleRepeater.layouts;
++                    visible: text.length > 0
++                    Layout.fillWidth: true
++
++                    Keys.onPressed: event => {
++                        if (event.matches(StandardKey.Copy)) {
++                            valueLabel.copy();
++                            event.accepted = true;
++                        }
+                     }
+-                }
+ 
+-                Kirigami.Heading {
+-                    text: currentLayout.title
++                    Kirigami.FormData.label: i18n("%1:", valueLabel.label)
++                    text: root.valueText(valueLabel.source, valueLabel.format)
+                     textFormat: Text.PlainText
+-                    Kirigami.FormData.isSection: true
+-                    level: 2
+-                    // HACK hide section header if all labels are invisible
+-                    visible:  [...Array(detailsRepeater.count).keys()].some(i => detailsRepeater.itemAt(i)?.visible ?? false)
+                 }
++            }
+ 
+-                Repeater {
+-                    id: detailsRepeater
+-                    model: currentLayout.info || []
+-                    delegate: Kirigami.SelectableLabel {
+-                        id: valueLabel
+-
+-                        required property string label
+-                        required property string source
+-                        required property var format  // A formatter function
+-
+-                        visible: text.length > 0
+-                        Layout.fillWidth: true
++            // ksr: kcm_energyinfo/BatteryInfo
++            Kirigami.Separator {
++                Kirigami.FormData.isSection: true
++                Kirigami.FormData.label: root.details[0].title
++                visible: root.hasValues(0)
++            }
++            Repeater {
++                model: root.details[0].info
++                delegate: detailRow
++            }
+ 
+-                        Keys.onPressed: event => {
+-                            if (event.matches(StandardKey.Copy)) {
+-                                valueLabel.copy();
+-                                event.accepted = true;
+-                            }
+-                        }
++            // ksr: kcm_energyinfo/EnergyInfo
++            Kirigami.Separator {
++                Kirigami.FormData.isSection: true
++                Kirigami.FormData.label: root.details[1].title
++                visible: root.hasValues(1)
++            }
++            Repeater {
++                model: root.details[1].info
++                delegate: detailRow
++            }
+ 
+-                        Kirigami.FormData.label: i18n("%1:", valueLabel.label)
+-                        text: {
+-                            // Battery properties are lower-cased. Otherwise get the "currentX" property from root
+-                            const isBatteryProperty = (valueLabel.source[0] == valueLabel.source[0].toLowerCase())
+-                            const value = isBatteryProperty ? root.currentBattery?.[valueLabel.source] : root[`current${valueLabel.source}`]
+-                            return value ? valueLabel.format(value) : ""
+-                        }
+-                        textFormat: Text.PlainText
+-                    }
+-                }
++            // ksr: kcm_energyinfo/Environment
++            Kirigami.Separator {
++                Kirigami.FormData.isSection: true
++                Kirigami.FormData.label: root.details[2].title
++                visible: root.hasValues(2)
++            }
++            Repeater {
++                model: root.details[2].info
++                delegate: detailRow
+             }
+         }
+     }

@@ -1,0 +1,1041 @@
+From b0e152cf49495cc5981a74126401cbffd90d52d4 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 14:18:11 +0500
+Subject: [PATCH] kcm_kscreen: display panels built on first use, titled
+ sections, priority dialog on demand, busy state
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Page type: Device-like (screens are peers; the arrangement view stays the main control, one panel per display below it),
+docs/page-design.md. KScreen config handling, OutputModel roles, kwinrc/KScreen settings, KAuth/D-Bus calls and the HDR
+calibrator launch are unchanged. NOT BUILT YET (owner stopped heavy work; kscreen is empty under weston anyway);
+checked statically only.
+
+Moved / renamed:
+- The per-display form was one flat group of ~25 rows. Now: an untitled first group (Display: Enabled, Primary or Change
+  Screen Priorities…, Resolution, Refresh rate, Adaptive sync, Scale, Orientation, Replica of), then groups with noun titles,
+  each shown only when the display supports something in it: "Image" (Overscan, RGB range, Sharpness), "Color" (color
+  profile, ICC path/picker, color accuracy, color resolution limit, sRGB intensity), "High dynamic range" (HDR,
+  Calibrate HDR Brightness…, EDR), "Brightness" (DDC/CI, brightness, adapt to environment, adaptive backlight modulation).
+  Refresh rate moved up next to Resolution (it was after Scale and Orientation); Adaptive sync moved beside it; Replica of
+  moved from the bottom to the first group. The global part (Legacy applications (X11), Screen tearing) got the group
+  title "All displays".
+- Wording: "Device:" -> "Display:" (the checkbox is still "Enabled"), "Enable HDR" -> "Use high dynamic range (HDR)",
+  "Enable EDR" -> "Use extended dynamic range (EDR)" (no "Enable" prefix; their labels were dropped as the group title
+  says it), "High/Extended Dynamic Range:" and "Adaptive Backlight Modulation:" -> sentence case.
+- Nothing removed. Old wording added to the page aliases in ia/layout.json. Relabel table: inventory/relabel/kcm_kscreen.tsv
+  (outer repo). Inventory --strict: 40 rows ok, 0 lost (markers on every control); full check LOST 0.
+- HIG ids: HIG-001, HIG-005, HIG-006, HIG-057; page-design sections 2, 3, 7. ia/duplicates.md: Scale owner stays here.
+
+Speed (cause found in code, not measured):
+- Panel.qml's Repeater created an OutputPanel for EVERY display as soon as the config arrived, and each panel
+  instantiates all its entries even when hidden (Kirigami.FormEntry visible:false still builds its control): about 40 controls
+  per display including two ColorProfileSelectors, two IccSelectors (text field + file dialog launcher), five slider/spinbox
+  pairs and the bits-per-color combo. A three-display setup built ~120 controls in one frame, only one of them visible.
+  The model roles resolutions/refreshRates (output_model.cpp resolutionsStrings/resolutions: all modes, de-duplicated,
+  sorted, formatted with a gcd per size) are rebuilt on every read from QML (model: element.resolutions plus
+  element.resolutions[0] in the label), for each panel.
+- Now: each display's panel is a Loader (asynchronous, active once the display has been selected, kept afterwards), so a
+  config with N displays builds one panel; the others when their tab is clicked. OutputPanel takes `required property var
+  element` (the delegate's model object) instead of reading the delegate context.
+- The "Change Priorities" Kirigami.Dialog (and its measuring items) is a Loader built on first use; the enabled-outputs proxy
+  model moved to the page root so the panels do not depend on the dialog.
+- Before the backend answers the page was blank; now a BusyIndicator shows after 150 ms (Timer), and the error banner still
+  covers a missing backend.
+- Not changed: KCMKScreen::doSave() still blocks in SetConfigOperation::exec() (kcm.cpp, deliberate: the module may exit
+  before an async operation completes, see its comment); GetConfigOperation is already asynchronous.
+- After numbers: pending, manager will measure.
+
+Not built yet; uncertain: `required property var model` in a Repeater/Loader delegate for a QSortFilterProxyModel (should
+give the roles object as before); Loader implicit size feeding StackLayout's `children[currentIndex].implicitHeight`
+while the asynchronous panel is incubating (page height may jump once); FormGroup `visible` driven by its entries' ids
+(FormGroup is an Item, the entries' `visible` is the declared one not the effective one); Kirigami.Dialog opened from
+Component.onCompleted inside a Loader and destroyed from onClosed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcm/ui/OutputPanel.qml | 423 ++++++++++++++++++++++++-----------------
+ kcm/ui/Panel.qml       |  31 ++-
+ kcm/ui/main.qml        | 250 +++++++++++++-----------
+ 3 files changed, 415 insertions(+), 289 deletions(-)
+
+diff --git a/kcm/ui/OutputPanel.qml b/kcm/ui/OutputPanel.qml
+index 68c0971..6907156 100644
+--- a/kcm/ui/OutputPanel.qml
++++ b/kcm/ui/OutputPanel.qml
+@@ -17,7 +17,7 @@ Kirigami.Form {
+     id: root
+ 
+     property KSortFilterProxyModel enabledOutputs
+-    property var element: model
++    required property var element
+     readonly property int comboboxWidth: Kirigami.Units.gridUnit * 12
+     readonly property int sliderWidth: Kirigami.Units.gridUnit * 12
+     readonly property int maxSpinboxWidth: Kirigami.Units.gridUnit * 7
+@@ -28,8 +28,11 @@ Kirigami.Form {
+     signal reorder()
+ 
+     Kirigami.FormGroup {
++
+         Kirigami.FormEntry {
+-            title: i18nc("@label for a checkbox that says 'Enabled'", "Device:")
++            id: enabledEntry
++            // ksr: kcm_kscreen/Enabled
++            title: i18nc("@label for a checkbox that says 'Enabled'", "Display:")
+             visible: kcm.multipleScreensAvailable
+             contentItem: QQC2.CheckBox {
+                 text: i18n("Enabled")
+@@ -40,6 +43,9 @@ Kirigami.Form {
+         }
+ 
+         Kirigami.FormEntry {
++            id: priorityEntry
++            // ksr: kcm_kscreen/Change-Screen-Priorities
++            // ksr: kcm_kscreen/Primary
+             visible: root.enabledOutputs.count >= 2
+             contentItem: RowLayout {
+                 QQC2.Button {
+@@ -63,6 +69,8 @@ Kirigami.Form {
+         }
+ 
+         Kirigami.FormEntry {
++            id: resolutionEntry
++            // ksr: kcm_kscreen/Resolution
+             title: i18n("Resolution:")
+             contentItem: RowLayout {
+                 Layout.fillWidth: false
+@@ -93,6 +101,60 @@ Kirigami.Form {
+         }
+ 
+         Kirigami.FormEntry {
++            id: refreshEntry
++            // ksr: kcm_kscreen/Refresh-rate
++            title: i18n("Refresh rate:")
++            contentItem: RowLayout {
++                Layout.fillWidth: false
++                Kirigami.FormData.buddyFor: refreshRateCombobox.visible ? refreshRateCombobox : singleRefreshRateLabel
++
++                QQC2.ComboBox {
++                    id: refreshRateCombobox
++                    Layout.minimumWidth: root.comboboxWidth
++                    visible: count > 1
++                    model: element.refreshRates
++                    onActivated: element.refreshRateIndex = currentIndex;
++                    Component.onCompleted: currentIndex = Qt.binding(() => element.refreshRateIndex);
++                }
++                // When the combobox is has only one item, it's basically non-interactive
++                // and is serving purely in a descriptive role, so make this explicit by
++                // using a label instead
++                QQC2.Label {
++                    id: singleRefreshRateLabel
++                    visible: refreshRateCombobox.count <= 1
++                    text: element.refreshRates[0] || ""
++                }
++            }
++            trailingItems: Kirigami.ContextualHelpButton {
++                visible: refreshRateCombobox.count <= 1
++                toolTipText: resolutionCombobox.count <= 1 ? i18nc("@info", "“%1” is the only refresh rate supported by this display.", singleRefreshRateLabel.text)
++                                                       : i18nc("@info", "“%1” is the only refresh rate supported by this display at the current resolution.", singleRefreshRateLabel.text)
++            }
++        }
++
++        Kirigami.FormEntry {
++            id: vrrEntry
++            // ksr: kcm_kscreen/Never
++            title: i18n("Adaptive sync:")
++            visible: element.capabilities & KScreen.Output.Capability.Vrr
++            contentItem: QQC2.ComboBox {
++                Layout.minimumWidth: root.comboboxWidth
++                model: [
++                    { label: i18n("Never"), value: KScreen.Output.VrrPolicy.Never },
++                    { label: i18n("Automatic"), value: KScreen.Output.VrrPolicy.Automatic },
++                    { label: i18n("Always"), value: KScreen.Output.VrrPolicy.Always },
++                ]
++                textRole: "label"
++                valueRole: "value"
++
++                onActivated: element.vrrPolicy = currentValue;
++                Component.onCompleted: currentIndex = indexOfValue(element.vrrPolicy);
++            }
++        }
++
++        Kirigami.FormEntry {
++            id: scaleEntry
++            // ksr: kcm_kscreen/Scale
+             title: i18n("Scale:")
+             visible: element.replicationSourceIndex == 0
+             contentItem: RowLayout {
+@@ -147,58 +209,56 @@ Kirigami.Form {
+         }
+ 
+         Kirigami.FormEntry {
++            id: orientationEntry
++            // ksr: kcm_kscreen/Automatic
++            // ksr: kcm_kscreen/Manual
+             contentItem: Orientation {}
+         }
+ 
+         Kirigami.FormEntry {
+-            title: i18n("Refresh rate:")
+-            contentItem: RowLayout {
+-                Layout.fillWidth: false
+-                Kirigami.FormData.buddyFor: refreshRateCombobox.visible ? refreshRateCombobox : singleRefreshRateLabel
+-
+-                QQC2.ComboBox {
+-                    id: refreshRateCombobox
+-                    Layout.minimumWidth: root.comboboxWidth
+-                    visible: count > 1
+-                    model: element.refreshRates
+-                    onActivated: element.refreshRateIndex = currentIndex;
+-                    Component.onCompleted: currentIndex = Qt.binding(() => element.refreshRateIndex);
+-                }
+-                // When the combobox is has only one item, it's basically non-interactive
+-                // and is serving purely in a descriptive role, so make this explicit by
+-                // using a label instead
+-                QQC2.Label {
+-                    id: singleRefreshRateLabel
+-                    visible: refreshRateCombobox.count <= 1
+-                    text: element.refreshRates[0] || ""
+-                }
+-            }
+-            trailingItems: Kirigami.ContextualHelpButton {
+-                visible: refreshRateCombobox.count <= 1
+-                toolTipText: resolutionCombobox.count <= 1 ? i18nc("@info", "“%1” is the only refresh rate supported by this display.", singleRefreshRateLabel.text)
+-                                                       : i18nc("@info", "“%1” is the only refresh rate supported by this display at the current resolution.", singleRefreshRateLabel.text)
+-            }
+-        }
+-
+-        Kirigami.FormEntry {
+-            title: i18n("Adaptive sync:")
+-            visible: element.capabilities & KScreen.Output.Capability.Vrr
++            id: replicaEntry
++            // ksr: kcm_kscreen/Replica-of
++            title: i18n("Replica of:")
++            visible: contentItem.count > 0
+             contentItem: QQC2.ComboBox {
+                 Layout.minimumWidth: root.comboboxWidth
+-                model: [
+-                    { label: i18n("Never"), value: KScreen.Output.VrrPolicy.Never },
+-                    { label: i18n("Automatic"), value: KScreen.Output.VrrPolicy.Automatic },
+-                    { label: i18n("Always"), value: KScreen.Output.VrrPolicy.Always },
+-                ]
+-                textRole: "label"
+-                valueRole: "value"
++                Layout.maximumWidth: Kirigami.Units.gridUnit * 14
++                model: element.replicationSourceModelWithNumbers
++                textRole: "display"
+ 
+-                onActivated: element.vrrPolicy = currentValue;
+-                Component.onCompleted: currentIndex = indexOfValue(element.vrrPolicy);
++                onModelChanged: enabled = (count > 1);
++                onCountChanged: enabled = (count > 1);
++
++                Component.onCompleted: currentIndex = element.replicationSourceIndex;
++                onActivated: element.replicationSourceIndex = currentIndex;
++
++                delegate: QQC2.ItemDelegate {
++                    width: parent.width
++                    contentItem: RowLayout {
++                        spacing: Kirigami.Units.largeSpacing
++                        OutputNumberBadge {
++                            number: modelData.number
++                        }
++
++                        QQC2.Label {
++                            text: modelData.display
++                            elide: Text.ElideRight
++                            Layout.fillWidth: true
++                        }
++                    }
++                    highlighted: index === parent.currentIndex
++                }
+             }
+         }
++    }
++
++    Kirigami.FormGroup {
++        title: i18nc("@title:group display settings", "Image")
++        visible: overscanEntry.visible || rgbEntry.visible || sharpnessEntry.visible
+ 
+         Kirigami.FormEntry {
++            id: overscanEntry
++            // ksr: kcm_kscreen/Overscan
+             title: i18n("Overscan:")
+             visible: element.capabilities & KScreen.Output.Capability.Overscan
+             contentItem: QQC2.SpinBox {
+@@ -222,6 +282,8 @@ Kirigami.Form {
+         }
+ 
+         Kirigami.FormEntry {
++            id: rgbEntry
++            // ksr: kcm_kscreen/Automatic-2
+             title: i18n("RGB range:")
+             visible: element.capabilities & KScreen.Output.Capability.RgbRange
+             contentItem: QQC2.ComboBox {
+@@ -244,8 +306,49 @@ Kirigami.Form {
+             }
+         }
+ 
+-        // for SDR
+         Kirigami.FormEntry {
++            id: sharpnessEntry
++            // ksr: kcm_kscreen/Sharpness
++            title: i18nc("@label", "Sharpness:")
++            visible: element.capabilities & KScreen.Output.Capability.SharpnessControl
++            contentItem: RowLayout {
++                Layout.fillWidth: true
++                // Set the same limit as the device ComboBox
++                Layout.maximumWidth: Kirigami.Units.gridUnit * 14
++                spacing: Kirigami.Units.smallSpacing
++
++                Kirigami.FormData.buddyFor: sharpnessSlider
++
++                QQC2.Slider {
++                    id: sharpnessSlider
++                    Kirigami.StyleHints.tickMarkStepSize: stepSize
++                    Layout.fillWidth: true
++                    Layout.minimumWidth: root.sliderWidth
++                    from: 0
++                    to: 100
++                    stepSize: 5
++                    live: true
++                    value: element.sharpness * 100.0
++                    onMoved: element.sharpness = value / 100.0
++                }
++                QQC2.SpinBox {
++                    from: 0
++                    to: 100
++                    stepSize: 5
++                    value: element.sharpness * 100.0
++                    onValueModified: element.sharpness = value / 100.0
++                }
++            }
++        }
++    }
++
++    Kirigami.FormGroup {
++        title: i18nc("@title:group display settings", "Color")
++        visible: sdrProfileEntry.visible || sdrIccEntry.visible || hdrProfileEntry.visible || hdrIccEntry.visible || accuracyEntry.visible || bpcEntry.visible || srgbEntry.visible
++
++        Kirigami.FormEntry {
++            id: sdrProfileEntry
++            // ksr: kcm_kscreen/None
+             visible: ((element.capabilities & KScreen.Output.Capability.IccProfile) || (element.capabilities & KScreen.Output.Capability.BuiltInColorProfile)) && !root.hdrActive
+             contentItem: ColorProfileSelector {
+                 colorProfileSource: element.colorProfileSource
+@@ -259,6 +362,9 @@ Kirigami.Form {
+         }
+ 
+         Kirigami.FormEntry {
++            id: sdrIccEntry
++            // ksr: kcm_kscreen/Enter-ICC-profile-path
++            // ksr: kcm_kscreen/Select-ICC-profile
+             visible: (element.capabilities & KScreen.Output.Capability.IccProfile)
+                   && (element.colorProfileSource == KScreen.Output.ColorProfileSource.ICC)
+                   && !root.hdrActive
+@@ -268,8 +374,8 @@ Kirigami.Form {
+             }
+         }
+ 
+-        // for HDR
+         Kirigami.FormEntry {
++            id: hdrProfileEntry
+             visible: ((element.capabilities & KScreen.Output.Capability.HdrIccProfile) || (element.capabilities & KScreen.Output.Capability.BuiltInColorProfile)) && root.hdrActive
+             contentItem: ColorProfileSelector {
+                 colorProfileSource: element.hdrColorProfileSource
+@@ -283,6 +389,7 @@ Kirigami.Form {
+         }
+ 
+         Kirigami.FormEntry {
++            id: hdrIccEntry
+             visible: (element.capabilities & KScreen.Output.Capability.HdrIccProfile)
+                   && (element.hdrColorProfileSource == KScreen.Output.ColorProfileSource.ICC)
+                   && root.hdrActive
+@@ -293,49 +400,8 @@ Kirigami.Form {
+         }
+ 
+         Kirigami.FormEntry {
+-            title: i18nc("@label", "High Dynamic Range:")
+-            visible: root.hdrAvailable
+-            contentItem: QQC2.CheckBox {
+-                id: hdrCheckbox
+-                // Set the same limit as the device ComboBox
+-                Layout.maximumWidth: Kirigami.Units.gridUnit * 14
+-                text: i18nc("@option:check", "Enable &HDR")
+-                checked: element.hdr
+-                onToggled: element.hdr = checked
+-            }
+-
+-            trailingItems: Kirigami.ContextualHelpButton {
+-                toolTipText: i18nc("@info:tooltip", "HDR allows compatible applications to show brighter and more vivid colors.")
+-            }
+-        }
+-
+-        Kirigami.FormEntry {
+-            visible: root.hdrActive && element.hdrColorProfileSource != KScreen.Output.ColorProfileSource.ICC
+-            contentItem: QQC2.Button {
+-                id: hdrCalibrationButton
+-                text: i18nc("@action:button", "Calibrate HDR Brightness…")
+-                onClicked: kcm.startHdrCalibrator(element.name);
+-                enabled: !kcm.needsSave
+-
+-                // Set the same limit as the device ComboBox
+-                Layout.maximumWidth: Kirigami.Units.gridUnit * 14
+-
+-                QQC2.ToolTip.visible: hovered || visualFocus
+-                QQC2.ToolTip.text: text
+-                QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
+-
+-                Accessible.role: Accessible.Button
+-                Accessible.name: text
+-                Accessible.description: i18n("Opens a window to calibrate HDR brightness")
+-                Accessible.onPressAction: onClicked();
+-            }
+-            trailingItems: Kirigami.ContextualHelpButton {
+-                visible: hdrCalibrationButton.visible && !hdrCalibrationButton.enabled
+-                toolTipText: xi18nc("@info:tooltip", "HDR calibration can only be started if all settings are applied.")
+-            }
+-        }
+-
+-        Kirigami.FormEntry {
++            id: accuracyEntry
++            // ksr: kcm_kscreen/Prefer-efficiency
+             title: i18nc("@label:listbox", "Color accuracy:")
+             visible: element.capabilities & KScreen.Output.Capability.IccProfile
+             contentItem: QQC2.ComboBox {
+@@ -370,6 +436,8 @@ Note that changing this setting can have a large impact on performance.")
+         }
+ 
+         Kirigami.FormEntry {
++            id: bpcEntry
++            // ksr: kcm_kscreen/Limit-color-resolution-to
+             title: i18nc("@label:listbox", "Limit color resolution to:")
+             visible: (element.capabilities & KScreen.Output.Capability.MaxBitsPerColor) && element.minSupportedMaxBitsPerColor != element.maxSupportedMaxBitsPerColor
+             contentItem: QQC2.ComboBox {
+@@ -429,6 +497,8 @@ Due to graphics driver limitations, the actually used resolution cannot be known
+         }
+ 
+         Kirigami.FormEntry {
++            id: srgbEntry
++            // ksr: kcm_kscreen/sRGB-color-intensity
+             title: i18nc("@label", "sRGB color intensity:")
+             visible: root.hdrActive || (element.colorProfileSource != KScreen.Output.ColorProfileSource.sRGB)
+             contentItem: RowLayout {
+@@ -478,43 +548,84 @@ Due to graphics driver limitations, the actually used resolution cannot be known
+                 toolTipText: i18nc("@info:tooltip", "Increases the intensity of sRGB content on the screen.")
+             }
+         }
++    }
++
++    Kirigami.FormGroup {
++        title: i18nc("@title:group display settings", "High dynamic range")
++        visible: hdrEntry.visible || hdrCalEntry.visible || edrEntry.visible
+ 
+         Kirigami.FormEntry {
+-            title: i18nc("@label", "Adaptive Backlight Modulation:")
+-            visible: (element.capabilities & KScreen.Output.Capability.AbmLevel)
+-                  && element.colorPowerPreference == KScreen.Output.ColorPowerTradeoff.PreferEfficiency
+-            contentItem: RowLayout {
+-                Layout.fillWidth: true
+-                spacing: Kirigami.Units.smallSpacing
++            id: hdrEntry
++            // ksr: kcm_kscreen/Enable-HDR
++            title: ""
++            visible: root.hdrAvailable
++            contentItem: QQC2.CheckBox {
++                id: hdrCheckbox
++                // Wider than the device ComboBox: the text is longer
++                Layout.maximumWidth: Kirigami.Units.gridUnit * 20
++                text: i18nc("@option:check", "Use high dynamic range (&HDR)")
++                checked: element.hdr
++                onToggled: element.hdr = checked
++            }
+ 
+-                Kirigami.FormData.buddyFor: abmLevelSlider
++            trailingItems: Kirigami.ContextualHelpButton {
++                toolTipText: i18nc("@info:tooltip", "HDR allows compatible applications to show brighter and more vivid colors.")
++            }
++        }
+ 
+-                QQC2.Slider {
+-                    id: abmLevelSlider
+-                    Kirigami.StyleHints.tickMarkStepSize: stepSize
+-                    Layout.fillWidth: true
+-                    Layout.minimumWidth: root.sliderWidth
+-                    from: 0
+-                    to: 4
+-                    stepSize: 1
+-                    live: true
+-                    value: element.abmLevel
+-                    onMoved: element.abmLevel = value
+-                }
+-                QQC2.SpinBox {
+-                    from: 0
+-                    to: 4
+-                    stepSize: 1
+-                    value: element.abmLevel
+-                    onValueModified: element.abmLevel = value
+-                }
++        Kirigami.FormEntry {
++            id: hdrCalEntry
++            visible: root.hdrActive && element.hdrColorProfileSource != KScreen.Output.ColorProfileSource.ICC
++            contentItem: QQC2.Button {
++                id: hdrCalibrationButton
++                text: i18nc("@action:button", "Calibrate HDR Brightness…")
++                onClicked: kcm.startHdrCalibrator(element.name);
++                enabled: !kcm.needsSave
++
++                // Set the same limit as the device ComboBox
++                Layout.maximumWidth: Kirigami.Units.gridUnit * 14
++
++                QQC2.ToolTip.visible: hovered || visualFocus
++                QQC2.ToolTip.text: text
++                QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
++
++                Accessible.role: Accessible.Button
++                Accessible.name: text
++                Accessible.description: i18n("Opens a window to calibrate HDR brightness")
++                Accessible.onPressAction: onClicked();
+             }
+             trailingItems: Kirigami.ContextualHelpButton {
+-                toolTipText: i18nc("@info:tooltip", "Adaptive backlight modulation reduces power use at the cost of color accuracy")
++                visible: hdrCalibrationButton.visible && !hdrCalibrationButton.enabled
++                toolTipText: xi18nc("@info:tooltip", "HDR calibration can only be started if all settings are applied.")
+             }
+         }
+ 
+         Kirigami.FormEntry {
++            id: edrEntry
++            // ksr: kcm_kscreen/Enable-EDR
++            title: ""
++            visible: !root.hdrAvailable && (element.capabilities & KScreen.Output.Capability.ExtendedDynamicRange)
++            contentItem: QQC2.CheckBox {
++                id: edrCheckbox
++                // Wider than the device ComboBox: the text is longer
++                Layout.maximumWidth: Kirigami.Units.gridUnit * 20
++                text: i18nc("@option:check", "Use extended dynamic range (EDR)")
++                checked: element.edrPolicy == KScreen.Output.EdrPolicy.Always
++                onToggled: element.edrPolicy = (checked ? KScreen.Output.EdrPolicy.Always : KScreen.Output.EdrPolicy.Never)
++            }
++
++            trailingItems: Kirigami.ContextualHelpButton {
++                toolTipText: xi18nc("@info:tooltip", "EDR allows viewing HDR content on SDR displays by dynamically adjusting the backlight.<nl/><nl/>Note that this increases battery usage while viewing HDR content.")
++            }
++        }
++    }
++
++    Kirigami.FormGroup {
++        title: i18nc("@title:group display settings", "Brightness")
++        visible: ddcCiAllowedEntry.visible || brightnessEntry.visible || autoBrightnessEntry.visible || abmEntry.visible
++
++        Kirigami.FormEntry {
++            // ksr: kcm_kscreen/Control-hardware-brightness-with-DDC-CI
+             id: ddcCiAllowedEntry
+             title: i18nc("@label", "Brightness:")
+             visible: (element.capabilities & KScreen.Output.Capability.DdcCi) && !(root.hdrAvailable && element.hdr)
+@@ -572,6 +683,8 @@ Due to graphics driver limitations, the actually used resolution cannot be known
+         }
+ 
+         Kirigami.FormEntry {
++            id: autoBrightnessEntry
++            // ksr: kcm_kscreen/Automatically-adapt-to-environment
+             visible: brightnessEntry.visible && (element.capabilities & KScreen.Output.Capability.AutomaticBrightness)
+             contentItem: QQC2.CheckBox {
+                 // Set the same limit as the device ComboBox
+@@ -585,88 +698,40 @@ Due to graphics driver limitations, the actually used resolution cannot be known
+             }
+         }
+ 
+-        /* Sharpness Slider and Spinbox */
+         Kirigami.FormEntry {
+-            title: i18nc("@label", "Sharpness:")
+-            visible: element.capabilities & KScreen.Output.Capability.SharpnessControl
++            id: abmEntry
++            // ksr: kcm_kscreen/Adaptive-Backlight-Modulation
++            title: i18nc("@label", "Adaptive backlight modulation:")
++            visible: (element.capabilities & KScreen.Output.Capability.AbmLevel)
++                  && element.colorPowerPreference == KScreen.Output.ColorPowerTradeoff.PreferEfficiency
+             contentItem: RowLayout {
+                 Layout.fillWidth: true
+-                // Set the same limit as the device ComboBox
+-                Layout.maximumWidth: Kirigami.Units.gridUnit * 14
+                 spacing: Kirigami.Units.smallSpacing
+ 
+-                Kirigami.FormData.buddyFor: sharpnessSlider
++                Kirigami.FormData.buddyFor: abmLevelSlider
+ 
+                 QQC2.Slider {
+-                    id: sharpnessSlider
++                    id: abmLevelSlider
+                     Kirigami.StyleHints.tickMarkStepSize: stepSize
+                     Layout.fillWidth: true
+                     Layout.minimumWidth: root.sliderWidth
+                     from: 0
+-                    to: 100
+-                    stepSize: 5
++                    to: 4
++                    stepSize: 1
+                     live: true
+-                    value: element.sharpness * 100.0
+-                    onMoved: element.sharpness = value / 100.0
++                    value: element.abmLevel
++                    onMoved: element.abmLevel = value
+                 }
+                 QQC2.SpinBox {
+                     from: 0
+-                    to: 100
+-                    stepSize: 5
+-                    value: element.sharpness * 100.0
+-                    onValueModified: element.sharpness = value / 100.0
++                    to: 4
++                    stepSize: 1
++                    value: element.abmLevel
++                    onValueModified: element.abmLevel = value
+                 }
+             }
+-        }
+-
+-        Kirigami.FormEntry {
+-            title: i18nc("@label", "Extended Dynamic Range:")
+-            visible: !root.hdrAvailable && (element.capabilities & KScreen.Output.Capability.ExtendedDynamicRange)
+-            contentItem: QQC2.CheckBox {
+-                id: edrCheckbox
+-                // Set the same limit as the device ComboBox
+-                Layout.maximumWidth: Kirigami.Units.gridUnit * 14
+-                text: i18nc("@option:check", "Enable EDR")
+-                checked: element.edrPolicy == KScreen.Output.EdrPolicy.Always
+-                onToggled: element.edrPolicy = (checked ? KScreen.Output.EdrPolicy.Always : KScreen.Output.EdrPolicy.Never)
+-            }
+-
+             trailingItems: Kirigami.ContextualHelpButton {
+-                toolTipText: xi18nc("@info:tooltip", "EDR allows viewing HDR content on SDR displays by dynamically adjusting the backlight.<nl/><nl/>Note that this increases battery usage while viewing HDR content.")
+-            }
+-        }
+-
+-        Kirigami.FormEntry {
+-            title: i18n("Replica of:")
+-            visible: contentItem.count > 0
+-            contentItem: QQC2.ComboBox {
+-                Layout.minimumWidth: root.comboboxWidth
+-                Layout.maximumWidth: Kirigami.Units.gridUnit * 14
+-                model: element.replicationSourceModelWithNumbers
+-                textRole: "display"
+-
+-                onModelChanged: enabled = (count > 1);
+-                onCountChanged: enabled = (count > 1);
+-
+-                Component.onCompleted: currentIndex = element.replicationSourceIndex;
+-                onActivated: element.replicationSourceIndex = currentIndex;
+-
+-                delegate: QQC2.ItemDelegate {
+-                    width: parent.width
+-                    contentItem: RowLayout {
+-                        spacing: Kirigami.Units.largeSpacing
+-                        OutputNumberBadge {
+-                            number: modelData.number
+-                        }
+-
+-                        QQC2.Label {
+-                            text: modelData.display
+-                            elide: Text.ElideRight
+-                            Layout.fillWidth: true
+-                        }
+-                    }
+-                    highlighted: index === parent.currentIndex
+-                }
++                toolTipText: i18nc("@info:tooltip", "Adaptive backlight modulation reduces power use at the cost of color accuracy")
+             }
+         }
+     }
+diff --git a/kcm/ui/Panel.qml b/kcm/ui/Panel.qml
+index c6b004d..277580f 100644
+--- a/kcm/ui/Panel.qml
++++ b/kcm/ui/Panel.qml
+@@ -33,10 +33,30 @@ ColumnLayout {
+         Repeater {
+             id: panelsRepeater
+             model: kcm.outputModel
+-            OutputPanel {
+-                Kirigami.FormAlignmentGroup.group: alignmentGroup
+-                enabledOutputs: root.enabledOutputs
+-                onReorder: root.reorder()
++
++            // One panel per display, but only built when the display is first selected (and kept after that):
++            // each panel has about 40 controls, and its model roles (resolution and refresh-rate lists) are
++            // recomputed on every read.
++            delegate: Loader {
++                id: panelLoader
++
++                required property var model
++                required property int index
++
++                property bool wasShown: false
++                readonly property bool isCurrent: index === root.selectedOutput
++                onIsCurrentChanged: if (isCurrent) wasShown = true
++                Component.onCompleted: if (isCurrent) wasShown = true
++
++                active: wasShown
++                asynchronous: true
++
++                sourceComponent: OutputPanel {
++                    element: panelLoader.model
++                    Kirigami.FormAlignmentGroup.group: alignmentGroup
++                    enabledOutputs: root.enabledOutputs
++                    onReorder: root.reorder()
++                }
+             }
+ 
+             // "Since 6.5, inserting/removing a new Item at an index less than or equal to the current
+@@ -65,8 +85,10 @@ ColumnLayout {
+ 
+         Kirigami.FormGroup {
+             id: globalSettingsGroup
++            title: i18nc("@title:group settings that apply to all displays", "All displays")
+ 
+             Kirigami.FormEntry {
++                // ksr: kcm_kscreen/xwaylandClientsScale
+                 title: i18n("Legacy applications (X11):")
+                 contentItem: QQC2.RadioButton {
+                     id: x11ScalingApps
+@@ -91,6 +113,7 @@ ColumnLayout {
+             }
+ 
+             Kirigami.FormEntry {
++                // ksr: kcm_kscreen/tearingAllowed
+                 title: i18nc("@label", "Screen tearing:")
+                 contentItem: QQC2.CheckBox {
+                     text: i18nc("@option:check The thing being allowed in fullscreen windows is screen tearing", "Allow in fullscreen windows")
+diff --git a/kcm/ui/main.qml b/kcm/ui/main.qml
+index ce3c37a..fbf85a9 100644
+--- a/kcm/ui/main.qml
++++ b/kcm/ui/main.qml
+@@ -43,6 +43,27 @@ KCM.AbstractKCM {
+ 
+     property int revertCountdown: 15
+ 
++    // Enabled displays, in priority order; used by every display panel and by the priority dialog
++    KSortFilterProxyModel {
++        id: enabledOutputsModel
++        sourceModel: kcm.outputModel
++        filterRoleName: "enabled"
++        filterString: "true"
++    }
++
++    // Shown only when reading the display configuration takes longer than 150 ms
++    Timer {
++        id: busyDelay
++        interval: 150
++        running: !kcm.backendReady && !errBackendMsg.visible
++    }
++    QQC2.BusyIndicator {
++        anchors.centerIn: parent
++        z: 1
++        running: visible
++        visible: !kcm.backendReady && !busyDelay.running && !errBackendMsg.visible
++    }
++
+     implicitWidth: Kirigami.Units.gridUnit * 32
+     implicitHeight: Kirigami.Units.gridUnit * 30
+ 
+@@ -88,6 +109,7 @@ KCM.AbstractKCM {
+                     }
+                 }
+                 icon.name: "dialog-ok"
++                // ksr: kcm_kscreen/Keep
+                 text: i18n("&Keep")
+             }
+             QQC2.Button {
+@@ -101,6 +123,7 @@ KCM.AbstractKCM {
+                 }
+                 action: QQC2.Action {
+                     icon.name: "edit-undo"
++                    // ksr: kcm_kscreen/Revert
+                     text: i18n("&Revert")
+                     shortcut: "Escape"
+                     enabled: confirmMsg.visible
+@@ -117,6 +140,7 @@ KCM.AbstractKCM {
+         }
+     }
+ 
++    // ksr: kcm_kscreen/ConfigErrors
+     Connections {
+         target: kcm
+         function onInvalidConfig(reason) {
+@@ -231,120 +255,52 @@ KCM.AbstractKCM {
+ 
+         spacing: 0
+ 
+-        Kirigami.Dialog {
+-            id: reorderDialog
+-
+-            title: i18nc("@title:window", "Change Priorities")
+-            showCloseButton: true
+-            standardButtons: Kirigami.Dialog.Ok
+-            padding: 0
+-
+-            contentItem: Item {
+-                id: reorderView
+-
+-                implicitWidth: Math.min(root.width * 0.75, Kirigami.Units.gridUnit * 32)
+-                implicitHeight: rowHeight * enabledOutputsModel.count
+-
+-                readonly property real rowHeight: rowMetrics.implicitHeight
+-                readonly property real numberColumnWidth: badgeMetrics.implicitWidth + Kirigami.Units.largeSpacing * 2
+-
+-                KSortFilterProxyModel {
+-                    id: enabledOutputsModel
+-                    sourceModel: kcm.outputModel
+-                    filterRoleName: "enabled"
+-                    filterString: "true"
+-                }
+-
+-                OutputNumberBadge {
+-                    id: badgeMetrics
+-                    visible: false
+-                    number: 1
+-                }
+-                QQC2.ItemDelegate {
+-                    id: rowMetrics
+-                    visible: false
+-                    contentItem: RowLayout {
+-                        spacing: Kirigami.Units.largeSpacing
+-                        Kirigami.TitleSubtitle {
+-                            title: "Metrics"
+-                            subtitle: "Primary"
+-                            reserveSpaceForSubtitle: true
+-                            Layout.fillWidth: true
+-                        }
+-                        QQC2.ToolButton {
+-                            icon.name: "arrow-up"
+-                            text: i18n("Raise priority")
+-                            display: QQC2.AbstractButton.IconOnly
+-
+-                            QQC2.ToolTip.visible: hovered || visualFocus
+-                            QQC2.ToolTip.text: text
+-                            QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
+-                        }
+-                        QQC2.ToolButton {
+-                            icon.name: "arrow-down"
+-                            text: i18n("Lower priority")
+-                            display: QQC2.AbstractButton.IconOnly
+-
+-                            QQC2.ToolTip.visible: hovered || visualFocus
+-                            QQC2.ToolTip.text: text
+-                            QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
+-                        }
+-                    }
+-                }
+-
+-                Repeater {
+-                    model: enabledOutputsModel.count
+-                    delegate: QQC2.ItemDelegate {
+-                        x: 0
+-                        y: index * reorderView.rowHeight
+-                        width: reorderView.numberColumnWidth
+-                        height: reorderView.rowHeight
+-                        hoverEnabled: false
+-
+-                        contentItem: Item {
+-                            OutputNumberBadge {
+-                                anchors.centerIn: parent
+-                                number: index + 1
+-                            }
+-                        }
++        // The "Change Priorities" dialog is built when it is first needed, not with the page.
++        Loader {
++            id: reorderLoader
++            active: false
++            visible: false
++            sourceComponent: Component {
++                Kirigami.Dialog {
++                    id: reorderDialog
++                    Component.onCompleted: open()
++                    onClosed: reorderLoader.active = false
++
++                title: i18nc("@title:window", "Change Priorities")
++                showCloseButton: true
++                standardButtons: Kirigami.Dialog.Ok
++                padding: 0
++
++                contentItem: Item {
++                    id: reorderView
++
++                    implicitWidth: Math.min(root.width * 0.75, Kirigami.Units.gridUnit * 32)
++                    implicitHeight: rowHeight * enabledOutputsModel.count
++
++                    readonly property real rowHeight: rowMetrics.implicitHeight
++                    readonly property real numberColumnWidth: badgeMetrics.implicitWidth + Kirigami.Units.largeSpacing * 2
++
++                    OutputNumberBadge {
++                        id: badgeMetrics
++                        visible: false
++                        number: 1
+                     }
+-                }
+-
+-                Repeater {
+-                    model: enabledOutputsModel
+-
+-                    delegate: QQC2.ItemDelegate {
+-                        id: delegate
+-
+-                        property var output: model
+-
+-                        x: reorderView.numberColumnWidth
+-                        width: reorderView.width - reorderView.numberColumnWidth
+-                        height: reorderView.rowHeight
+-                        hoverEnabled: true
+-
+-                        y: (output.priority - 1) * reorderView.rowHeight
+-                        Behavior on y {
+-                            NumberAnimation {
+-                                duration: Kirigami.Units.longDuration
+-                                easing.type: Easing.InOutQuad
+-                            }
+-                        }
+-
++                    QQC2.ItemDelegate {
++                        id: rowMetrics
++                        visible: false
+                         contentItem: RowLayout {
+                             spacing: Kirigami.Units.largeSpacing
+                             Kirigami.TitleSubtitle {
+-                                title: delegate.output.display
+-                                subtitle: (delegate.output.priority === 1) ? i18n("Primary") : ""
++                                title: "Metrics"
++                                subtitle: "Primary"
+                                 reserveSpaceForSubtitle: true
+                                 Layout.fillWidth: true
+                             }
+                             QQC2.ToolButton {
+                                 icon.name: "arrow-up"
++                                // ksr: kcm_kscreen/Raise-priority
+                                 text: i18n("Raise priority")
+                                 display: QQC2.AbstractButton.IconOnly
+-                                enabled: delegate.output.priority > 1
+-                                onClicked: delegate.output.priority -= 1
+ 
+                                 QQC2.ToolTip.visible: hovered || visualFocus
+                                 QQC2.ToolTip.text: text
+@@ -352,10 +308,9 @@ KCM.AbstractKCM {
+                             }
+                             QQC2.ToolButton {
+                                 icon.name: "arrow-down"
++                                // ksr: kcm_kscreen/Lower-priority
+                                 text: i18n("Lower priority")
+                                 display: QQC2.AbstractButton.IconOnly
+-                                enabled: delegate.output.priority < enabledOutputsModel.count
+-                                onClicked: delegate.output.priority += 1
+ 
+                                 QQC2.ToolTip.visible: hovered || visualFocus
+                                 QQC2.ToolTip.text: text
+@@ -363,8 +318,84 @@ KCM.AbstractKCM {
+                             }
+                         }
+                     }
++
++                    Repeater {
++                        model: enabledOutputsModel.count
++                        delegate: QQC2.ItemDelegate {
++                            x: 0
++                            y: index * reorderView.rowHeight
++                            width: reorderView.numberColumnWidth
++                            height: reorderView.rowHeight
++                            hoverEnabled: false
++
++                            contentItem: Item {
++                                OutputNumberBadge {
++                                    anchors.centerIn: parent
++                                    number: index + 1
++                                }
++                            }
++                        }
++                    }
++
++                    Repeater {
++                        model: enabledOutputsModel
++
++                        delegate: QQC2.ItemDelegate {
++                            id: delegate
++
++                            property var output: model
++
++                            x: reorderView.numberColumnWidth
++                            width: reorderView.width - reorderView.numberColumnWidth
++                            height: reorderView.rowHeight
++                            hoverEnabled: true
++
++                            y: (output.priority - 1) * reorderView.rowHeight
++                            Behavior on y {
++                                NumberAnimation {
++                                    duration: Kirigami.Units.longDuration
++                                    easing.type: Easing.InOutQuad
++                                }
++                            }
++
++                            contentItem: RowLayout {
++                                spacing: Kirigami.Units.largeSpacing
++                                Kirigami.TitleSubtitle {
++                                    title: delegate.output.display
++                                    subtitle: (delegate.output.priority === 1) ? i18n("Primary") : ""
++                                    reserveSpaceForSubtitle: true
++                                    Layout.fillWidth: true
++                                }
++                                QQC2.ToolButton {
++                                    icon.name: "arrow-up"
++                                    // ksr: kcm_kscreen/Raise-priority
++                                    text: i18n("Raise priority")
++                                    display: QQC2.AbstractButton.IconOnly
++                                    enabled: delegate.output.priority > 1
++                                    onClicked: delegate.output.priority -= 1
++
++                                    QQC2.ToolTip.visible: hovered || visualFocus
++                                    QQC2.ToolTip.text: text
++                                    QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
++                                }
++                                QQC2.ToolButton {
++                                    icon.name: "arrow-down"
++                                    // ksr: kcm_kscreen/Lower-priority
++                                    text: i18n("Lower priority")
++                                    display: QQC2.AbstractButton.IconOnly
++                                    enabled: delegate.output.priority < enabledOutputsModel.count
++                                    onClicked: delegate.output.priority += 1
++
++                                    QQC2.ToolTip.visible: hovered || visualFocus
++                                    QQC2.ToolTip.text: text
++                                    QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
++                                }
++                            }
++                        }
++                    }
+                 }
+             }
++            }
+         }
+ 
+         QQC2.ScrollView {
+@@ -425,6 +456,7 @@ KCM.AbstractKCM {
+                                 value: 0.6
+                             }
+ 
++                            // ksr: kcm_kscreen/model-index
+                             checked: root.selectedOutput === model.index
+                             onClicked: root.selectedOutput = model.index
+                         }
+@@ -518,7 +550,13 @@ KCM.AbstractKCM {
+                     enabled: kcm.outputModel && kcm.backendReady
+                     enabledOutputs: enabledOutputsModel
+                     selectedOutput: root.selectedOutput
+-                    onReorder: reorderDialog.open()
++                    onReorder: {
++                        if (reorderLoader.active) {
++                            reorderLoader.item.open();
++                        } else {
++                            reorderLoader.active = true;
++                        }
++                    }
+                 }
+             }
+         }

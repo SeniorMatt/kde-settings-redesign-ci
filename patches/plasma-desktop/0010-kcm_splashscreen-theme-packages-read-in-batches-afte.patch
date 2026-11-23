@@ -1,0 +1,298 @@
+From 88f088a62f020d251740bbf63c517d5c70110584 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 14:26:55 +0500
+Subject: [PATCH 10/31] kcm_splashscreen: theme packages read in batches after
+ the first frame, async previews, busy state
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Page type: Gallery (docs/page-design.md §5). Layout, config keys, Preview/Remove actions, Get New action unchanged
+(already page action + per-card actions). NOT BUILT YET (owner stopped heavy work); checked statically only.
+
+Changed:
+- Empty/loading state: busy indicator only after 150 ms (HIG-ish "never block the first frame", design §3 Busy).
+- Card thumbnails Image.asynchronous (design §5).
+- Relabel table inventory/relabel/kcm_splashscreen.tsv (outer repo); no visible label changed, so no aliases needed.
+  5 inventory rows kept, ksr markers added; inventory_check --kcm kcm_splashscreen --strict: 0 lost.
+
+Speed (cause found in code, kcms/ksplash/kcm.cpp): load() ran in KCM load, listed every dir under
+plasma/look-and-feel in all data paths, built a KPackage for each and tested filePath("splashmainscript"), all before the
+page could show. Now load() only reads settings and adds the cheap "None" card; the package scan runs from
+QTimer::singleShot(0) in ~8 ms batches (loadNextBatch, generation counter against a re-load), same order/filter.
+themeChanged is emitted per batch with new rows so view.currentIndex finds the selected card when it arrives; the
+"theme not in list -> defaults()" fallback now runs when the scan has finished. New property modelLoading.
+After numbers: pending, manager will measure.
+
+Not built yet; uncertain: the QML Timer/BusyIndicator are children of GridViewKCM (same as lookandfeel cf609d2);
+repeated themeChanged emission per batch may re-evaluate SettingStateBinding (cheap).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/ksplash/kcm.cpp     | 91 +++++++++++++++++++++++++++++++---------
+ kcms/ksplash/kcm.h       | 10 ++++-
+ kcms/ksplash/ui/main.qml | 18 ++++++++
+ 3 files changed, 98 insertions(+), 21 deletions(-)
+
+diff --git a/kcms/ksplash/kcm.cpp b/kcms/ksplash/kcm.cpp
+index e9dacab..0aad692 100644
+--- a/kcms/ksplash/kcm.cpp
++++ b/kcms/ksplash/kcm.cpp
+@@ -16,10 +16,12 @@
+ #include <qqml.h>
+ 
+ #include <QDir>
++#include <QElapsedTimer>
+ #include <QProcess>
+ #include <QSortFilterProxyModel>
+ #include <QStandardItemModel>
+ #include <QStandardPaths>
++#include <QTimer>
+ 
+ #include <KPackage/PackageJob>
+ #include <KPackage/PackageLoader>
+@@ -80,9 +82,8 @@ KCMSplashScreen::KCMSplashScreen(QObject *parent, const KPluginMetaData &metaDat
+     });
+ }
+ 
+-QList<KPackage::Package> KCMSplashScreen::availablePackages(const QString &component)
++QStringList KCMSplashScreen::availablePackagePaths()
+ {
+-    QList<KPackage::Package> packages;
+     QStringList paths;
+     const QStringList dataPaths = QStandardPaths::standardLocations(QStandardPaths::GenericDataLocation);
+ 
+@@ -90,17 +91,12 @@ QList<KPackage::Package> KCMSplashScreen::availablePackages(const QString &compo
+         QDir dir(path + QStringLiteral("/plasma/look-and-feel"));
+         paths << dir.entryList(QDir::AllDirs | QDir::NoDotAndDotDot);
+     }
++    return paths;
++}
+ 
+-    for (const QString &path : std::as_const(paths)) {
+-        KPackage::Package pkg = KPackage::PackageLoader::self()->loadPackage(QStringLiteral("Plasma/LookAndFeel"));
+-        pkg.setPath(path);
+-        pkg.setFallbackPackage(KPackage::Package());
+-        if (component.isEmpty() || !pkg.filePath(component.toUtf8()).isEmpty()) {
+-            packages << pkg;
+-        }
+-    }
+-
+-    return packages;
++bool KCMSplashScreen::isModelLoading() const
++{
++    return m_modelLoading;
+ }
+ 
+ SplashScreenSettings *KCMSplashScreen::splashScreenSettings() const
+@@ -152,14 +148,12 @@ void KCMSplashScreen::addKPackageToModel(const KPackage::Package &pkg)
+ 
+ void KCMSplashScreen::load()
+ {
++    // Before: load() listed and opened every Plasma/LookAndFeel package (and filtered by "splashmainscript") before the
++    // page could appear. Now the cheap "None" card is added at once; the packages are read after the first frame, in
++    // ~8 ms batches (loadNextBatch), in the same order and with the same filter.
+     m_data->settings()->load();
+     m_model->clear();
+-
+-    const QList<KPackage::Package> pkgs = availablePackages(QStringLiteral("splashmainscript"));
+-    for (const KPackage::Package &pkg : pkgs) {
+-        addKPackageToModel(pkg);
+-    }
+-    m_sortModel->sort(Qt::DisplayRole);
++    ++m_loadGeneration;
+ 
+     QStandardItem *row = new QStandardItem(i18n("None"));
+     row->setData(s_nonePluginName, PluginNameRole);
+@@ -169,13 +163,69 @@ void KCMSplashScreen::load()
+     row->setData(false, PendingDeletionRole);
+     m_model->insertRow(0, row);
+ 
+-    if (-1 == pluginIndex(m_data->settings()->theme())) {
+-        defaults();
++    m_pendingPaths.clear();
++    m_pendingIndex = 0;
++    if (!m_modelLoading) {
++        m_modelLoading = true;
++        Q_EMIT modelLoadingChanged();
+     }
+ 
++    const int generation = m_loadGeneration;
++    QTimer::singleShot(0, this, [this, generation]() {
++        if (generation != m_loadGeneration) {
++            return;
++        }
++        m_pendingPaths = availablePackagePaths();
++        m_pendingIndex = 0;
++        loadNextBatch(generation);
++    });
++
+     Q_EMIT m_data->settings()->themeChanged();
+ }
+ 
++void KCMSplashScreen::loadNextBatch(int generation)
++{
++    if (generation != m_loadGeneration) {
++        return; // a newer load() has started
++    }
++
++    QElapsedTimer timer;
++    timer.start();
++
++    bool added = false;
++    while (m_pendingIndex < m_pendingPaths.size() && timer.elapsed() < 8) {
++        KPackage::Package pkg = KPackage::PackageLoader::self()->loadPackage(QStringLiteral("Plasma/LookAndFeel"));
++        pkg.setPath(m_pendingPaths.at(m_pendingIndex++));
++        pkg.setFallbackPackage(KPackage::Package());
++        if (!pkg.filePath(QByteArrayLiteral("splashmainscript")).isEmpty()) {
++            addKPackageToModel(pkg);
++            added = true;
++        }
++    }
++
++    if (added) {
++        m_sortModel->sort(Qt::DisplayRole);
++        // Re-evaluates the selected card's index (view.currentIndex) once the selected theme has arrived
++        Q_EMIT m_data->settings()->themeChanged();
++    }
++
++    if (m_pendingIndex < m_pendingPaths.size()) {
++        QTimer::singleShot(0, this, [this, generation]() {
++            loadNextBatch(generation);
++        });
++        return;
++    }
++
++    m_pendingPaths.clear();
++    m_pendingIndex = 0;
++    m_modelLoading = false;
++    Q_EMIT modelLoadingChanged();
++
++    if (-1 == pluginIndex(m_data->settings()->theme())) {
++        defaults();
++    }
++}
++
+ void KCMSplashScreen::save()
+ {
+     using namespace KPackage;
+@@ -196,6 +246,7 @@ void KCMSplashScreen::save()
+             }
+         });
+     }
++    // ksr: kcm_splashscreen/cfg-KSplash-Engine
+     m_data->settings()->setEngine(m_data->settings()->theme() == QStringLiteral("None") ? QStringLiteral("none") : QStringLiteral("KSplashQML"));
+     KQuickManagedConfigModule::save();
+ }
+diff --git a/kcms/ksplash/kcm.h b/kcms/ksplash/kcm.h
+index 7cb19cb..e094cf6 100644
+--- a/kcms/ksplash/kcm.h
++++ b/kcms/ksplash/kcm.h
+@@ -25,6 +25,7 @@ class KCMSplashScreen : public KQuickManagedConfigModule
+     Q_PROPERTY(SplashScreenSettings *splashScreenSettings READ splashScreenSettings CONSTANT)
+     Q_PROPERTY(QAbstractProxyModel *splashSortedModel READ splashSortedModel CONSTANT)
+     Q_PROPERTY(bool testing READ testing NOTIFY testingChanged)
++    Q_PROPERTY(bool modelLoading READ isModelLoading NOTIFY modelLoadingChanged)
+ 
+ public:
+     enum Roles {
+@@ -40,6 +41,7 @@ public:
+     SplashScreenSettings *splashScreenSettings() const;
+     QAbstractProxyModel *splashSortedModel() const;
+     bool testing() const;
++    bool isModelLoading() const;
+ 
+     Q_INVOKABLE int sortModelPluginIndex(const QString &pluginName) const;
+     Q_INVOKABLE void ghnsEntryChanged(const KNSCore::Entry &wrapper);
+@@ -53,11 +55,13 @@ public Q_SLOTS:
+ 
+ Q_SIGNALS:
+     void testingChanged();
++    void modelLoadingChanged();
+     void testingFailed(const QString &processErrorOutput);
+     void error(const QString &message);
+ 
+ private:
+-    QList<KPackage::Package> availablePackages(const QString &component);
++    static QStringList availablePackagePaths();
++    void loadNextBatch(int generation);
+     int pluginIndex(const QString &pluginName) const;
+     void addKPackageToModel(const KPackage::Package &pkg);
+ 
+@@ -67,4 +71,8 @@ private:
+     QProcess *m_testProcess = nullptr;
+     QString m_packageRoot;
+     QSortFilterProxyModel *m_sortModel = nullptr;
++    QStringList m_pendingPaths;
++    int m_pendingIndex = 0;
++    int m_loadGeneration = 0;
++    bool m_modelLoading = false;
+ };
+diff --git a/kcms/ksplash/ui/main.qml b/kcms/ksplash/ui/main.qml
+index 6e1f59c..3502427 100644
+--- a/kcms/ksplash/ui/main.qml
++++ b/kcms/ksplash/ui/main.qml
+@@ -8,6 +8,7 @@
+ import QtQuick
+ import QtQuick.Window
+ import QtQuick.Layouts
++import QtQuick.Controls as QQC2
+ import org.kde.kirigami as Kirigami
+ import org.kde.newstuff as NewStuff
+ import org.kde.kcmutils as KCM
+@@ -21,10 +22,12 @@ KCM.GridViewKCM {
+         extraEnabledConditions: !kcm.testing
+     }
+ 
++    // ksr: kcm_splashscreen/theme
+     view.model: kcm.splashSortedModel
+     //NOTE: pay attention to never break this binding
+     view.currentIndex: kcm.sortModelPluginIndex(kcm.splashScreenSettings.theme)
+ 
++    // ksr: kcm_splashscreen/GetNew
+     actions: NewStuff.Action {
+         id: newStuffButton
+         text: i18nc("@action:button", "&Get New…")
+@@ -60,6 +63,18 @@ KCM.GridViewKCM {
+         }
+     }
+ 
++    // The themes are read after the first frame (kcm.modelLoading). The spinner shows only if it takes over 150 ms.
++    Timer {
++        id: busyDelay
++        interval: 150
++        running: kcm.modelLoading
++    }
++    QQC2.BusyIndicator {
++        anchors.centerIn: parent
++        running: kcm.modelLoading && !busyDelay.running
++        visible: running
++    }
++
+     view.delegate: KCM.GridDelegate {
+         id: delegate
+ 
+@@ -69,6 +84,7 @@ KCM.GridViewKCM {
+         thumbnailAvailable: model.screenshot.toString() !== ""
+         thumbnail: Image {
+             anchors.fill: parent
++            asynchronous: true
+             source: model.screenshot
+             sourceSize: Qt.size(delegate.GridView.view.cellWidth * Screen.devicePixelRatio,
+                                 delegate.GridView.view.cellHeight * Screen.devicePixelRatio)
+@@ -78,12 +94,14 @@ KCM.GridViewKCM {
+             }
+         }
+         actions: [
++            // ksr: kcm_splashscreen/Preview
+             Kirigami.Action {
+                 visible: model.pluginName !== "None"
+                 icon.name: "media-playback-start"
+                 tooltip: i18nc("@info:tooltip", "Preview splash screen")
+                 onTriggered: kcm.test(model.pluginName)
+             },
++            // ksr: kcm_splashscreen/RemoveTheme
+             Kirigami.Action {
+                 visible: model.pluginName !== "None"
+                 icon.name: model.pendingDeletion ? "edit-undo" : "edit-delete"

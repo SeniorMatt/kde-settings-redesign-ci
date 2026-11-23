@@ -1,0 +1,596 @@
+From f857ce0c275975d30613b898a0e931d20f10c6b6 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 11:07:46 +0500
+Subject: [PATCH 02/24] kcm_componentchooser: page first, application lists
+ filled afterwards
+
+Page type: Form (docs/page-design.md). mimeapps.list writes, terminal kcfg keys, KLauncher call and behaviour
+are unchanged.
+
+Moved / renamed:
+- Kirigami.Form/FormGroup -> Kirigami.FormLayout. First section (Web browser, Email client, Calendar, Phone
+  Numbers) has no title; sections Multimedia, Documents, Utilities keep their names and order.
+- New link at the end, section "Other file types": "Configure File Associations..." opens kcm_filetypes
+  (ia/duplicates.md "Default Applications & File Associations": this page owns the common defaults, File
+  Associations stays the per-type editor). The existing "Configure Manually..." in Details stays.
+- Combo boxes are disabled and show "Loading..." until their list is filled; a busy indicator appears after
+  150 ms. Combos get accessible names and buddies.
+- The ChooserFormEntry component is now ChooserRow (ColumnLayout for FormLayout); unused unsupportedMimeText() removed.
+- Relabel table: inventory/relabel/kcm_componentchooser.tsv (outer repo). 19 inventory rows kept, 0 lost (--strict).
+
+Speed cause: KcmComponentChooser::load() called ComponentChooser::load() 13 times synchronously
+(kcm_componentchooser.cpp), each running KApplicationTrader::query over every installed service and
+serviceSupportsMimeType() with a QMimeDatabase lookup per advertised mime type of every service
+(applicationmodel.cpp:46, componentchooser.cpp). On top, the page's warning bindings called
+unsupportedMimeTypes / mimeTypesNotAssociated (KApplicationTrader::preferredService per mime type) for all 13
+choosers as soon as each model was reset. Fix:
+- load() now queues the 13 choosers in page order and fills one per event-loop turn (QTimer::singleShot(0)),
+  so the first frame no longer waits; new properties ComponentChooser::loaded and KcmComponentChooser::loading.
+- The file type warnings return empty until the chooser is loaded.
+- serviceSupportsMimeType() looks the target mime type up once per call instead of once per advertised type.
+Numbers: before 0.5 CPU ~2.2 s to first frame (build/bench/clean/before-slow.tsv); after: pending, manager will measure.
+
+HIG: HIG-001, HIG-005, HIG-006, HIG-013, HIG-017, HIG-019, HIG-020, HIG-023, HIG-047, HIG-058, HIG-062.
+
+Not built yet (freeze).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/componentchooser/componentchooser.cpp    |  38 +++-
+ kcms/componentchooser/componentchooser.h      |   7 +
+ .../componentchooser/kcm_componentchooser.cpp |  66 ++++--
+ kcms/componentchooser/kcm_componentchooser.h  |  12 +
+ .../componentchooser/ui/ComponentComboBox.qml |   2 +
+ kcms/componentchooser/ui/ComponentOverlay.qml |   3 +
+ kcms/componentchooser/ui/main.qml             | 215 +++++++++++-------
+ 7 files changed, 241 insertions(+), 102 deletions(-)
+
+diff --git a/kcms/componentchooser/componentchooser.cpp b/kcms/componentchooser/componentchooser.cpp
+index f16ba17..cee2f96 100644
+--- a/kcms/componentchooser/componentchooser.cpp
++++ b/kcms/componentchooser/componentchooser.cpp
+@@ -61,6 +61,22 @@ void ComponentChooser::load()
+     Q_EMIT isDefaultsChanged();
+ }
+ 
++bool ComponentChooser::loaded() const
++{
++    return m_loaded;
++}
++
++void ComponentChooser::setLoaded(bool loaded)
++{
++    if (m_loaded == loaded) {
++        return;
++    }
++    m_loaded = loaded;
++    Q_EMIT loadedChanged();
++    // the file type warnings are only computed once loaded, see unsupportedMimeTypes()
++    Q_EMIT modelChanged();
++}
++
+ void ComponentChooser::select(int index)
+ {
+     // Other selection
+@@ -133,14 +149,18 @@ void ComponentChooser::onSaved()
+ 
+ QStringList ComponentChooser::unsupportedMimeTypes() const
+ {
++    // ksr: these walk every mime type of the component with KApplicationTrader::preferredService(); the page asks
++    // for them as soon as modelChanged() is emitted, so answer nothing until this chooser has finished loading.
++    if (!m_loaded) {
++        return QStringList{};
++    }
++
+     const auto preferredApp = currentStorageId();
+ 
+     if (preferredApp.isEmpty()) {
+         return QStringList{};
+     }
+ 
+-    const auto db = QMimeDatabase();
+-
+     QStringList unsupportedMimeTypes;
+ 
+     const auto appService = KService::serviceByStorageId(preferredApp);
+@@ -170,7 +190,10 @@ QList<PairQml> ComponentChooser::mimeTypesNotAssociated() const
+ {
+     auto ret = QList<PairQml>();
+ 
+-    const auto db = QMimeDatabase();
++    if (!m_loaded) {
++        return ret;
++    }
++
+     const auto storageId = m_currentApplication;
+ 
+     const auto appService = KService::serviceByStorageId(storageId);
+@@ -265,12 +288,19 @@ bool ComponentChooser::serviceSupportsMimeType(KService::Ptr service, const QStr
+ {
+     static QMimeDatabase db;
+     const QStringList mimeTypes = service->mimeTypes();
++    // look the target type up once, not once per advertised type of every service (13 choosers x every service)
++    QMimeType targetType;
++    bool targetLookedUp = false;
+     for (const QString &supportedMimeType : mimeTypes) {
+         if (supportedMimeType == targetMimeType) {
+             return true;
+         }
+ 
+-        if (db.mimeTypeForName(targetMimeType).inherits(supportedMimeType)) {
++        if (!targetLookedUp) {
++            targetType = db.mimeTypeForName(targetMimeType);
++            targetLookedUp = true;
++        }
++        if (targetType.inherits(supportedMimeType)) {
+             return true;
+         }
+     }
+diff --git a/kcms/componentchooser/componentchooser.h b/kcms/componentchooser/componentchooser.h
+index 0b0b1b6..6f0aebb 100644
+--- a/kcms/componentchooser/componentchooser.h
++++ b/kcms/componentchooser/componentchooser.h
+@@ -40,6 +40,7 @@ class ComponentChooser : public QObject
+     Q_PROPERTY(ApplicationModel *applications MEMBER m_model CONSTANT)
+     Q_PROPERTY(int index MEMBER m_index NOTIFY indexChanged)
+     Q_PROPERTY(bool isDefaults READ isDefaults NOTIFY isDefaultsChanged)
++    Q_PROPERTY(bool loaded READ loaded NOTIFY loadedChanged)
+ 
+     Q_PROPERTY(QStringList unsupportedMimeTypes READ unsupportedMimeTypes NOTIFY modelChanged)
+     Q_PROPERTY(QList<PairQml> mimeTypesNotAssociated READ mimeTypesNotAssociated NOTIFY modelChanged)
+@@ -55,6 +56,10 @@ public:
+     bool isDefaults() const;
+     bool isSaveNeeded() const;
+ 
++    /// false until the first load() has finished (the page loads the choosers one after the other, after its first frame)
++    bool loaded() const;
++    void setLoaded(bool loaded);
++
+     Q_INVOKABLE QString currentStorageId() const;
+     Q_INVOKABLE QString applicationName() const;
+     Q_INVOKABLE QString applicationIcon() const;
+@@ -81,6 +86,7 @@ Q_SIGNALS:
+     void isDefaultsChanged();
+     void isSaveNeededChanged();
+     void modelChanged();
++    void loadedChanged();
+ 
+ public Q_SLOTS:
+     void onSaved();
+@@ -89,6 +95,7 @@ protected:
+     ApplicationModel *m_model;
+ 
+     int m_index = -1;
++    bool m_loaded = false;
+     QString m_mimeType;
+     QString m_applicationCategory;
+     QString m_defaultApplication;
+diff --git a/kcms/componentchooser/kcm_componentchooser.cpp b/kcms/componentchooser/kcm_componentchooser.cpp
+index 6e5fbc6..64cac74 100644
+--- a/kcms/componentchooser/kcm_componentchooser.cpp
++++ b/kcms/componentchooser/kcm_componentchooser.cpp
+@@ -10,6 +10,7 @@
+ #include <QApplication>
+ #include <QDBusConnection>
+ #include <QDBusMessage>
++#include <QTimer>
+ 
+ #include <KBuildSycocaProgressDialog>
+ #include <KLocalizedString>
+@@ -150,19 +151,58 @@ void KcmComponentChooser::defaults()
+ 
+ void KcmComponentChooser::load()
+ {
+-    m_browsers->load();
+-    m_calendar->load();
+-    m_fileManagers->load();
+-    m_terminalEmulators->load();
+-    m_emailClients->load();
+-    m_geoUriHandlers->load();
+-    m_telUriHandlers->load();
+-    m_textEditors->load();
+-    m_imageViewers->load();
+-    m_musicPlayers->load();
+-    m_videoPlayers->load();
+-    m_pdfViewers->load();
+-    m_archiveManagers->load();
++    // Each ComponentChooser::load() queries every installed application (KApplicationTrader::query) and checks its mime types, and
++    // the page used to do this 13 times in a row before showing anything. Now the page shows first and the lists are filled
++    // one per event loop turn, in the order they appear on the page, so the window can repaint in between.
++    const bool running = !m_pendingLoads.isEmpty();
++    m_pendingLoads = {m_browsers,
++                      m_emailClients,
++                      m_calendar,
++                      m_telUriHandlers,
++                      m_imageViewers,
++                      m_musicPlayers,
++                      m_videoPlayers,
++                      m_textEditors,
++                      m_pdfViewers,
++                      m_fileManagers,
++                      m_terminalEmulators,
++                      m_archiveManagers,
++                      m_geoUriHandlers};
++    setLoading(true);
++    if (!running) {
++        QTimer::singleShot(0, this, &KcmComponentChooser::loadNext);
++    }
++}
++
++void KcmComponentChooser::loadNext()
++{
++    if (m_pendingLoads.isEmpty()) {
++        setLoading(false);
++        return;
++    }
++
++    ComponentChooser *chooser = m_pendingLoads.takeFirst();
++    chooser->load();
++    chooser->setLoaded(true);
++
++    if (m_pendingLoads.isEmpty()) {
++        setLoading(false);
++    } else {
++        QTimer::singleShot(0, this, &KcmComponentChooser::loadNext);
++    }
++}
++
++bool KcmComponentChooser::loading() const
++{
++    return m_loading;
++}
++
++void KcmComponentChooser::setLoading(bool loading)
++{
++    if (m_loading != loading) {
++        m_loading = loading;
++        Q_EMIT loadingChanged();
++    }
+ }
+ 
+ void KcmComponentChooser::save()
+diff --git a/kcms/componentchooser/kcm_componentchooser.h b/kcms/componentchooser/kcm_componentchooser.h
+index 2f5e1ce..bde7268 100644
+--- a/kcms/componentchooser/kcm_componentchooser.h
++++ b/kcms/componentchooser/kcm_componentchooser.h
+@@ -30,6 +30,8 @@ class KcmComponentChooser : public KQuickManagedConfigModule
+     Q_PROPERTY(ComponentChooser *videoPlayers READ videoPlayers CONSTANT)
+     Q_PROPERTY(ComponentChooser *pdfViewers READ pdfViewers CONSTANT)
+     Q_PROPERTY(ComponentChooser *archiveManagers READ archiveManagers CONSTANT)
++    /// true while the application lists are still being filled (they are filled after the first frame)
++    Q_PROPERTY(bool loading READ loading NOTIFY loadingChanged)
+ 
+ public:
+     KcmComponentChooser(QObject *parent, const KPluginMetaData &metaData);
+@@ -54,7 +56,17 @@ public:
+     bool isDefaults() const override;
+     bool isSaveNeeded() const override;
+ 
++    bool loading() const;
++
++Q_SIGNALS:
++    void loadingChanged();
++
+ private:
++    void loadNext();
++    void setLoading(bool loading);
++
++    QList<ComponentChooser *> m_pendingLoads;
++    bool m_loading = false;
+     ComponentChooser *m_browsers;
+     ComponentChooser *m_calendar;
+     ComponentChooser *m_fileManagers;
+diff --git a/kcms/componentchooser/ui/ComponentComboBox.qml b/kcms/componentchooser/ui/ComponentComboBox.qml
+index 48a03f3..cf3d232 100644
+--- a/kcms/componentchooser/ui/ComponentComboBox.qml
++++ b/kcms/componentchooser/ui/ComponentComboBox.qml
+@@ -18,6 +18,8 @@ QQC2.ComboBox {
+     model: component.applications
+     textRole: "name"
+     currentIndex: component.index
++    enabled: component.loaded
++    displayText: component.loaded ? currentText : i18nc("@item:inlistbox placeholder while the list is being filled", "Loading…")
+ 
+     Kirigami.StyleHints.iconName: model.data(model.index(currentIndex, 0), model.KItemModels.KRoleNames.role("icon")) ?? ""
+ 
+diff --git a/kcms/componentchooser/ui/ComponentOverlay.qml b/kcms/componentchooser/ui/ComponentOverlay.qml
+index 4db3f36..dd34f7a 100644
+--- a/kcms/componentchooser/ui/ComponentOverlay.qml
++++ b/kcms/componentchooser/ui/ComponentOverlay.qml
+@@ -81,6 +81,7 @@ Kirigami.Dialog {
+         }
+ 
+         Kirigami.Heading {
++            // ksr: kcm_componentchooser/DetailsSupported
+             text: i18n("This application can also open these file types:")
+             textFormat: Text.PlainText
+             visible: root.mimeTypesNotAssociated.length > 0
+@@ -141,6 +142,7 @@ Kirigami.Dialog {
+             Layout.fillWidth: true
+         }
+         QQC2.Button {
++            // ksr: kcm_componentchooser/ForceAll
+             visible: root.unsupportedMimeTypes.length > 0
+             icon.name: root.componentChooser?.applicationIcon() ?? ""
+             text: root.componentChooser
+@@ -154,6 +156,7 @@ Kirigami.Dialog {
+         }
+ 
+         QQC2.Button {
++            // ksr: kcm_componentchooser/Configure-Manually
+             Layout.topMargin: Kirigami.Units.largeSpacing
+             icon.name: "configure-symbolic"
+             text: i18n("Configure Manually…")
+diff --git a/kcms/componentchooser/ui/main.qml b/kcms/componentchooser/ui/main.qml
+index eb18c8a..e03eecd 100644
+--- a/kcms/componentchooser/ui/main.qml
++++ b/kcms/componentchooser/ui/main.qml
+@@ -9,16 +9,13 @@ import QtQuick.Layouts
+ import QtQuick.Controls as QQC2
+ import org.kde.kirigami as Kirigami
+ import org.kde.kcmutils as KCM
++import org.kde.config // KAuthorized
+ 
+ pragma ComponentBehavior: Bound
+ 
+ KCM.SimpleKCM {
+     id: root
+ 
+-    function unsupportedMimeText(kcm_component) {
+-        return i18n("’%1’ seems to not support the following mimetypes associated with this kind of application: %2", kcm_component.applications[kcm_component.index]["name"], kcm_component.unsupportedMimeTypes.join(", "))
+-    }
+-
+     topPadding: 0
+     bottomPadding: Kirigami.Units.gridUnit
+ 
+@@ -33,120 +30,168 @@ KCM.SimpleKCM {
+         mode: Kirigami.SizeGroup.Width
+     }
+ 
+-    component ChooserFormEntry: Kirigami.FormEntry {
+-        id: formEntry
+-        required property var component
+-        contentItem: ColumnLayout {
+-            spacing: parent.spacing ?? Kirigami.Units.smallSpacing
+-            Kirigami.FormData.buddyFor: comboBox
++    // The lists are filled by the KCM after the first frame (KcmComponentChooser::load). A busy indicator only
++    // appears when that takes longer than 150 ms.
++    Timer {
++        id: busyDelay
++        interval: 150
++        running: kcm.loading
++        repeat: false
++    }
++
++    component ChooserRow: ColumnLayout {
++        id: row
++        required property string title
++        required property var chooser
++        Kirigami.FormData.label: title
++        Kirigami.FormData.buddyFor: comboBox
++        spacing: Kirigami.Units.smallSpacing
++
++        RowLayout {
++            spacing: Kirigami.Units.smallSpacing
+             ComponentComboBox {
+                 id: comboBox
+-                component: formEntry.component
++                component: row.chooser
++                Accessible.name: row.title
+                 KCM.SettingHighlighter {
+-                    highlight: !formEntry.component.isDefaults
++                    highlight: !row.chooser.isDefaults
+                 }
+                 Component.onCompleted: sizeGroup.items.push(comboBox);
+             }
+-            Kirigami.InlineMessage {
+-                Layout.fillWidth: true
+-                Layout.maximumWidth: comboBox.width
+-                visible: formEntry.component.unsupportedMimeTypes.length > 0 || formEntry.component.mimeTypesNotAssociated.length > 0
+-                type: Kirigami.MessageType.Warning
+-                text: i18nc("@info:status", "This application may not be able to open all file types.");
+-                actions: Kirigami.Action {
+-                    text: i18nc("@action:button", "View Details")
+-                    onTriggered: {
+-                        overlay.componentChooser = formEntry.component
+-                        overlay.open()
+-                    }
++            QQC2.BusyIndicator {
++                Layout.preferredHeight: comboBox.implicitHeight
++                Layout.preferredWidth: comboBox.implicitHeight
++                running: visible
++                visible: !row.chooser.loaded && !busyDelay.running
++            }
++        }
++        Kirigami.InlineMessage {
++            Layout.fillWidth: true
++            Layout.maximumWidth: comboBox.width
++            visible: row.chooser.loaded && (row.chooser.unsupportedMimeTypes.length > 0 || row.chooser.mimeTypesNotAssociated.length > 0)
++            // ksr: kcm_componentchooser/ViewDetails
++            type: Kirigami.MessageType.Warning
++            text: i18nc("@info:status", "This application may not be able to open all file types.");
++            actions: Kirigami.Action {
++                text: i18nc("@action:button", "View Details")
++                onTriggered: {
++                    overlay.componentChooser = row.chooser
++                    overlay.open()
+                 }
+             }
+         }
+     }
+ 
+-    Kirigami.Form {
++    Kirigami.FormLayout {
+         id: form
+ 
+-        Kirigami.FormGroup {
+-            title: i18nc("Internet related application’s category’s name", "Internet")
++        // First section: no title (docs/page-design.md). Web and mail are what people come here for.
++        ChooserRow {
++            // ksr: kcm_componentchooser/Default-browsers
++            title: i18n("Web browser:")
++            chooser: kcm.browsers
++        }
+ 
+-            ChooserFormEntry {
+-                title: i18n("Web browser:")
+-                component: kcm.browsers
+-            }
++        ChooserRow {
++            // ksr: kcm_componentchooser/Default-email
++            title: i18n("Email client:")
++            chooser: kcm.emailClients
++        }
+ 
+-            ChooserFormEntry {
+-                title: i18n("Email client:")
+-                component: kcm.emailClients
+-            }
++        ChooserRow {
++            // ksr: kcm_componentchooser/Default-calendar
++            title: i18nc("Default calendar application", "Calendar:")
++            chooser: kcm.calendar
++        }
+ 
+-            ChooserFormEntry {
+-                title: i18nc("Default calendar application", "Calendar:")
+-                component: kcm.calendar
+-            }
++        ChooserRow {
++            // ksr: kcm_componentchooser/Default-phone
++            title: i18nc("Default phone app", "Phone Numbers:")
++            chooser: kcm.telUriHandlers
++        }
+ 
+-            ChooserFormEntry {
+-                title: i18nc("Default phone app", "Phone Numbers:")
+-                component: kcm.telUriHandlers
+-            }
++        Kirigami.Separator {
++            Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18nc("Multimedia related application’s category’s name", "Multimedia")
+         }
+ 
+-        Kirigami.FormGroup {
+-            title: i18nc("Multimedia related application’s category’s name", "Multimedia")
++        ChooserRow {
++            // ksr: kcm_componentchooser/Default-image
++            title: i18n("Image viewer:")
++            chooser: kcm.imageViewers
++        }
+ 
+-            ChooserFormEntry {
+-                title: i18n("Image viewer:")
+-                component: kcm.imageViewers
+-            }
++        ChooserRow {
++            // ksr: kcm_componentchooser/Default-music
++            title: i18n("Music player:")
++            chooser: kcm.musicPlayers
++        }
+ 
+-            ChooserFormEntry {
+-                title: i18n("Music player:")
+-                component: kcm.musicPlayers
+-            }
++        ChooserRow {
++            // ksr: kcm_componentchooser/Default-video
++            title: i18n("Video player:")
++            chooser: kcm.videoPlayers
++        }
+ 
+-            ChooserFormEntry {
+-                title: i18n("Video player:")
+-                component: kcm.videoPlayers
+-            }
++        Kirigami.Separator {
++            Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18nc("Documents related application’s category’s name", "Documents")
+         }
+ 
+-        Kirigami.FormGroup {
+-            title: i18nc("Documents related application’s category’s name", "Documents")
++        ChooserRow {
++            // ksr: kcm_componentchooser/Default-texteditor
++            title: i18n("Text editor:")
++            chooser: kcm.textEditors
++        }
+ 
+-            ChooserFormEntry {
+-                title: i18n("Text editor:")
+-                component: kcm.textEditors
+-            }
++        ChooserRow {
++            // ksr: kcm_componentchooser/Default-pdf
++            title: i18n("PDF viewer:")
++            chooser: kcm.pdfViewers
++        }
+ 
++        Kirigami.Separator {
++            Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18nc("Utilities related application’s category’s name", "Utilities")
++        }
+ 
+-            ChooserFormEntry {
+-                title: i18n("PDF viewer:")
+-                component: kcm.pdfViewers
+-            }
++        ChooserRow {
++            // ksr: kcm_componentchooser/Default-filemanager
++            title: i18n("File manager:")
++            chooser: kcm.fileManagers
+         }
+ 
+-        Kirigami.FormGroup {
+-            title: i18nc("Utilities related application’s category’s name", "Utilities")
++        ChooserRow {
++            // ksr: kcm_componentchooser/Default-terminal
++            title: i18n("Terminal emulator:")
++            chooser: kcm.terminalEmulators
++        }
+ 
+-            ChooserFormEntry {
+-                title: i18n("File manager:")
+-                component: kcm.fileManagers
+-            }
++        ChooserRow {
++            // ksr: kcm_componentchooser/Default-archive
++            title: i18n("Archive manager:")
++            chooser: kcm.archiveManagers
++        }
+ 
+-            ChooserFormEntry {
+-                title: i18n("Terminal emulator:")
+-                component: kcm.terminalEmulators
+-            }
++        ChooserRow {
++            // ksr: kcm_componentchooser/Default-map
++            title: i18nc("Map related application’s category’s name", "Map:")
++            chooser: kcm.geoUriHandlers
++        }
+ 
+-            ChooserFormEntry {
+-                title: i18n("Archive manager:")
+-                component: kcm.archiveManagers
+-            }
++        // Link out: the per-file-type editor stays on its own page (ia/duplicates.md "Default Applications & File
++        // Associations": this page owns the common defaults, File Associations the per-type editor).
++        Kirigami.Separator {
++            Kirigami.FormData.isSection: true
++            Kirigami.FormData.label: i18nc("@title:group", "Other file types")
++        }
+ 
+-            ChooserFormEntry {
+-                title: i18nc("Map related application’s category’s name", "Map:")
+-                component: kcm.geoUriHandlers
+-            }
++        QQC2.Button {
++            Kirigami.FormData.label: i18nc("@label:button", "Per file type:")
++            visible: KAuthorized.authorizeControlModule("kcm_filetypes")
++            icon.name: "configure-symbolic"
++            text: i18nc("@action:button", "Configure File Associations…")
++            onClicked: KCM.KCMLauncher.openSystemSettings("kcm_filetypes")
+         }
+     }
+ }

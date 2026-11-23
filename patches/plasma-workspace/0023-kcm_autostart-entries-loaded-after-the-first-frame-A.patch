@@ -1,0 +1,181 @@
+From 3fcbfe4478896669e76a6a94d8b508417518ad7f Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 01:28:35 +0500
+Subject: [PATCH 23/24] =?UTF-8?q?kcm=5Fautostart:=20entries=20loaded=20aft?=
+ =?UTF-8?q?er=20the=20first=20frame,=20"Add=E2=80=A6"=20action,=20switches?=
+ =?UTF-8?q?,=20empty=20state=20with=20action?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Page type: List (docs/page-design.md section 4); it already was one (ScrollViewKCM, ListView of ItemDelegate, sections,
+entry details on a kcm.push sub-page), so the structure stays. systemdBoot key, desktop files, scripts and the unit
+D-Bus handling are unchanged.
+
+Moved / renamed:
+- Toolbar action "Add New" -> "Add…" (menu: Application…, Login Script…, Logout Script…): always labelled, with the
+  ellipsis because it opens something. Row kcm_autostart/AddNew.
+- Per-entry CheckBox -> Switch (on/off in a list row, section 3); same call setEntryEnabled, same accessible text.
+- Empty state: explanation no longer points at a button name, and the placeholder carries the action "Add
+  Application…" (section 3). It is hidden until the model was filled once (modelReset), so it does not flash.
+- Markers added on rows that only had weak anchors. Relabel table: inventory/relabel/kcm_autostart.tsv (outer repo).
+  Inventory --strict: 10 rows ok, 0 lost.
+
+Speed: Autostart::load() ran AutostartModel::load() synchronously: mkpath, directory listing of ~/.config/autostart
+and the script dirs, one KDesktopFile parse per entry, creation of a Unit (async D-Bus GetUnit/GetAll) per entry
+(autostartmodel.cpp load). It now runs from QTimer::singleShot(0), so the page is shown first and the list fills on
+modelReset. The Unit calls were already asynchronous. usingSystemdBoot() (a config read per row binding) left as is.
+After-numbers: pending, manager will measure.
+
+HIG: HIG-001/005, HIG-057. Not built yet. Unconfirmed: QTimer::singleShot with a pointer to the public non-slot
+member AutostartModel::load (Qt 6 functor overload, should compile).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/autostart/autostart.cpp |  5 ++++-
+ kcms/autostart/ui/entry.qml  |  2 ++
+ kcms/autostart/ui/main.qml   | 29 +++++++++++++++++++++++++----
+ 3 files changed, 31 insertions(+), 5 deletions(-)
+
+diff --git a/kcms/autostart/autostart.cpp b/kcms/autostart/autostart.cpp
+index 3822cd4..f2dbd82 100644
+--- a/kcms/autostart/autostart.cpp
++++ b/kcms/autostart/autostart.cpp
+@@ -12,6 +12,8 @@
+ 
+ #include <KPluginFactory>
+ 
++#include <QTimer>
++
+ K_PLUGIN_CLASS_WITH_JSON(Autostart, "kcm_autostart.json")
+ 
+ Autostart::Autostart(QObject *parent, const KPluginMetaData &data)
+@@ -33,7 +35,8 @@ AutostartModel *Autostart::model() const
+ 
+ void Autostart::load()
+ {
+-    m_model->load();
++    // ksr: enumerating the autostart directories and parsing every desktop file must not delay the first frame
++    QTimer::singleShot(0, m_model, &AutostartModel::load);
+ }
+ 
+ void Autostart::defaults()
+diff --git a/kcms/autostart/ui/entry.qml b/kcms/autostart/ui/entry.qml
+index a2cd7fc..923eb28 100644
+--- a/kcms/autostart/ui/entry.qml
++++ b/kcms/autostart/ui/entry.qml
+@@ -24,6 +24,7 @@ KCM.SimpleKCM {
+ 
+     onBackRequested: kcm.pop()
+ 
++    // ksr: kcm_autostart/EntryStartStop
+     actions: QQC2.Action {
+         icon.name: entryPage.unit.activeState === "active" ? "media-playback-stop-symbolic" : "media-playback-start-symbolic"
+         text: entryPage.unit.activeState === "active"
+@@ -63,6 +64,7 @@ KCM.SimpleKCM {
+             }
+         }
+ 
++        // ksr: kcm_autostart/EntryInfo
+         Kirigami.FormLayout {
+             // Equal to the margins removed by disabling header padding
+             Layout.margins: Kirigami.Units.mediumSpacing
+diff --git a/kcms/autostart/ui/main.qml b/kcms/autostart/ui/main.qml
+index 6478745..c9d1dfc 100644
+--- a/kcms/autostart/ui/main.qml
++++ b/kcms/autostart/ui/main.qml
+@@ -20,6 +20,14 @@ KCM.ScrollViewKCM {
+     implicitHeight: Kirigami.Units.gridUnit * 28
+     implicitWidth: Kirigami.Units.gridUnit * 28
+ 
++    property bool modelFilled: false
++    Connections {
++        target: kcm.model
++        function onModelReset() {
++            root.modelFilled = true;
++        }
++    }
++
+     headerPaddingEnabled: false // Let the InlineMessage touch the edges
+     header: Kirigami.InlineMessage {
+         id: errorMessage
+@@ -32,6 +40,7 @@ KCM.ScrollViewKCM {
+ 
+             property var fixItAction: Kirigami.Action {
+                 property string fileName
++                // ksr: kcm_autostart/MakeExecutable
+                 text: i18n("Make Executable")
+                 icon.name: "dialog-ok"
+                 onTriggered: {
+@@ -64,8 +73,9 @@ KCM.ScrollViewKCM {
+ 
+     actions: [
+         Kirigami.Action {
++            // ksr: kcm_autostart/AddNew (was "Add New"; page-design section 4: always a label, with the ellipsis)
+             icon.name: "list-add-symbolic"
+-            text: i18nc("@action:button menu button; add new application etc", "Add New")
++            text: i18nc("@action:button menu button; add new application etc", "Add…")
+             Accessible.name: i18nc("@title:menu accessible menu button", "Add new application or script")
+             displayHint: Kirigami.DisplayHint.KeepVisible
+ 
+@@ -128,7 +138,8 @@ KCM.ScrollViewKCM {
+             contentItem: RowLayout {
+                 spacing: Kirigami.Units.smallSpacing
+ 
+-                CheckBox {
++                // ksr: kcm_autostart/model-setEntryEnabled (checkbox -> switch: on/off in a list row, page-design section 3)
++                Switch {
+                     visible: model.source === AutostartModel.XdgAutoStart || model.source === AutostartModel.XdgScripts
+                     checked: model.enabled
+                     onToggled: kcm.model.setEntryEnabled(model.index, checked)
+@@ -168,6 +179,7 @@ KCM.ScrollViewKCM {
+                 }
+ 
+                 Button {
++                    // ksr: kcm_autostart/model-editApplication
+                     text: i18nc("@action:button", "See properties")
+                     icon.name: "document-properties"
+                     display: Button.IconOnly
+@@ -179,6 +191,7 @@ KCM.ScrollViewKCM {
+                 }
+ 
+                 Button {
++                    // ksr: kcm_autostart/model-removeEntry
+                     text: i18nc("@action:button", "Remove entry")
+                     icon.name: "edit-delete-remove"
+                     display: Button.IconOnly
+@@ -212,9 +225,15 @@ KCM.ScrollViewKCM {
+             anchors.centerIn: parent
+             icon.name: "system-run"
+             width: parent.width - (Kirigami.Units.largeSpacing * 4)
+-            visible: parent.count === 0
++            // The model is filled right after the first frame: don't flash the empty state before that
++            visible: parent.count === 0 && root.modelFilled
+             text: i18n("No user-specified autostart items")
+-            explanation: xi18nc("@info 'some' refers to autostart items", "Click the <interface>Add New</interface> button to add some")
++            explanation: i18nc("@info", "Add an application or a script that should start when you log in.")
++            helpfulAction: Kirigami.Action {
++                icon.name: "list-add-symbolic"
++                text: i18nc("@action:button", "Add Application…")
++                onTriggered: kcm.model.showApplicationDialog(root)
++            }
+         }
+     }
+ 
+@@ -229,6 +248,7 @@ KCM.ScrollViewKCM {
+             sourceComponent: FileDialog {
+                 id: loginFileDialog
+ 
++                // ksr: kcm_autostart/ChooseLoginScript
+                 title: i18n("Choose Login Script")
+                 currentFolder: StandardPaths.standardLocations(StandardPaths.HomeLocation)[0]
+                 onAccepted: {
+@@ -249,6 +269,7 @@ KCM.ScrollViewKCM {
+             sourceComponent: FileDialog {
+                 id: logoutFileDialog
+ 
++                // ksr: kcm_autostart/ChooseLogoutScript
+                 title: i18n("Choose Logout Script")
+                 currentFolder: StandardPaths.standardLocations(StandardPaths.HomeLocation)[0]
+                 onAccepted: {

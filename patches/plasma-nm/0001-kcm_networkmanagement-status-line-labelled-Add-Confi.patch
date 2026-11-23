@@ -1,0 +1,1370 @@
+From 10d7b531e633d5b5c8317f7b6944bfa4817dd451 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 14:35:24 +0500
+Subject: [PATCH 1/2] kcm_networkmanagement: status line, labelled
+ Add/Configure, editor and NetworkManager reads after the first frame
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Page type: List (connections) + editor, QtWidgets KCModule with a QQuickWidget list (docs/page-design.md section 8). Not
+ported to QML: the editor is about 12 widget tabs plus VPN plugins; this commit reworks the list side and the start-up
+only. Connection settings, NetworkManager calls and the editor are unchanged.
+
+Moved / renamed (kcm_connections/qml/main.qml):
+- A status line comes first: "Ethernet: Connected to X" from PlasmaNM.NetworkStatus (activeConnections), or "Not
+  connected". It is created 50 ms after the page opens (Loader), because NetworkStatus reads NetworkManager again.
+- "Add new connection" (icon only, bottom right) -> "Add Connection…" labelled button beside the search field
+  (kcm_networkmanagement/AddNewConnection). "Configure" (icon only) -> "Configure…" labelled
+  (kcm_networkmanagement/ConfigureButton). Forget and Export stay icon buttons with tooltip and now an accessible name
+  (kcm_networkmanagement/ForgetConnection, onRequestExportConnection); both are also in the row menu.
+- Empty editor side shows "Select a connection to see and change its settings." instead of nothing.
+- Markers: the 12 touched or weak rows in qml, plus 92 weak rows in the editor .ui files, wizard, model and VPN
+  plugin files (comments only; XML comments in .ui, // in C++). inventory/kcm-extra-sources.json got an entry for
+  kcm_networkmanagement (libs/editor, libs/models, vpn) because the check only looked at kcms/kcm_connections;
+  strict check: 517 rows, 0 lost (was 103 lost at baseline). inventory/relabel/kcm_networkmanagement.tsv (outer repo).
+
+Speed (read from code, kcm.cpp constructor):
+- Before the first frame it ran NetworkManager::networkInterfaces() (blocking GetDevices plus per-device properties) to
+  compute useApMode, connectionFromArgs()/defaultConnection() (primaryConnection, listConnections), selectConnection()
+  which built the whole ConnectionEditorTabWidget for the preselected connection, settingsNotifier() and requestScan().
+- Now all of that runs in startDeferredWork(), started once the QQuickWidget has rendered its first frame
+  (QQuickWindow::afterRendering, then a 0 ms timer; a 2 s timer is the fallback if no frame is drawn). useApMode starts
+  false and is set when computed (only the hotspot dialog reads it). The editor is therefore built on selection,
+  after the list is visible.
+Not changed (needs the models to be made async, larger): KcmIdentityModel / CreatableConnectionsModel (probes every VPN
+plugin, creatableconnectionsmodel.cpp) are still built with main.qml; the editor tabs still build all widgets at
+selection (connectioneditorbase.cpp). After: pending, manager will measure.
+
+HIG: HIG-001, HIG-005, HIG-006, HIG-017, HIG-019, HIG-020.
+
+Not built yet. Uncertain: QQuickWidget::quickWindow() afterRendering firing for the offscreen window (the 2 s timer
+covers it); anchors between the search field and the add button; PlasmaNM.NetworkStatus is QML_ELEMENT in
+libs/networkstatus.h and used by the applet, but not yet by this KCM's QML module imports (same plugin).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/kcm_connections/kcm.cpp                  | 102 ++++++++++++------
+ kcms/kcm_connections/kcm.h                    |   5 +
+ kcms/kcm_connections/qml/ConnectionItem.qml   |   5 +
+ kcms/kcm_connections/qml/main.qml             |  93 +++++++++++-----
+ libs/editor/connectiondetails.cpp             |   1 +
+ libs/editor/settings/ui/802-1x.ui             |   1 +
+ libs/editor/settings/ui/bond.ui               |   3 +
+ libs/editor/settings/ui/bridge.ui             |   2 +
+ libs/editor/settings/ui/bt.ui                 |   2 +
+ libs/editor/settings/ui/cdma.ui               |   1 +
+ libs/editor/settings/ui/gsm.ui                |   3 +
+ libs/editor/settings/ui/infiniband.ui         |   1 +
+ libs/editor/settings/ui/ipv4.ui               |   3 +
+ libs/editor/settings/ui/ipv6.ui               |   3 +
+ libs/editor/settings/ui/ppp.ui                |   5 +
+ libs/editor/settings/ui/team.ui               |   3 +
+ libs/editor/settings/ui/vlan.ui               |   3 +
+ .../settings/ui/wificonnectionwidget.ui       |   2 +
+ libs/editor/settings/ui/wifisecurity.ui       |   2 +
+ .../settings/ui/wiredconnectionwidget.ui      |   3 +
+ libs/editor/settings/ui/wireguardtabwidget.ui |   1 +
+ .../editor/widgets/mobileconnectionwizard.cpp |   6 ++
+ libs/models/creatableconnectionsmodel.cpp     |  13 +++
+ vpn/fortisslvpn/fortisslvpn.ui                |   1 +
+ vpn/fortisslvpn/fortisslvpnadvanced.ui        |   3 +
+ vpn/fortisslvpn/fortisslvpnauth.ui            |   1 +
+ vpn/l2tp/l2tp.ui                              |   2 +
+ vpn/l2tp/l2tpipsec.ui                         |   3 +
+ vpn/l2tp/l2tpppp.ui                           |   6 ++
+ vpn/libreswan/libreswan.ui                    |   3 +
+ vpn/openvpn/openvpnadvanced.ui                |   2 +
+ vpn/pptp/pptpadvanced.ui                      |   1 +
+ vpn/sstp/sstpadvanced.ui                      |   1 +
+ vpn/strongswan/strongswanprop.ui              |   4 +
+ vpn/vpnc/vpnc.ui                              |   3 +
+ vpn/vpnc/vpncadvanced.ui                      |   4 +
+ 36 files changed, 240 insertions(+), 57 deletions(-)
+
+diff --git a/kcms/kcm_connections/kcm.cpp b/kcms/kcm_connections/kcm.cpp
+index 3a02834..c563d04 100644
+--- a/kcms/kcm_connections/kcm.cpp
++++ b/kcms/kcm_connections/kcm.cpp
+@@ -41,11 +41,13 @@
+ 
+ // Qt
+ #include <QFileDialog>
++#include <QLabel>
+ #include <QMenu>
+ #include <QQmlContext>
+ #include <QQmlEngine>
+ #include <QQuickItem>
+ #include <QQuickView>
++#include <QQuickWindow>
+ #include <QQuickWidget>
+ #include <QStringBuilder>
+ #include <QTimer>
+@@ -111,37 +113,6 @@ KCMNetworkmanagement::KCMNetworkmanagement(QObject *parent, const KPluginMetaDat
+ 
+     KLocalization::setupLocalizedContext(m_ui->connectionView->engine());
+ 
+-    // Check if we can use AP mode to identify security type
+-    bool useApMode = false;
+-    bool foundInactive = false;
+-
+-    NetworkManager::WirelessDevice::Ptr wifiDev;
+-
+-    for (const NetworkManager::Device::Ptr &device : NetworkManager::networkInterfaces()) {
+-        if (device->type() == NetworkManager::Device::Wifi) {
+-            wifiDev = device.objectCast<NetworkManager::WirelessDevice>();
+-            if (wifiDev) {
+-                if (!wifiDev->isActive()) {
+-                    foundInactive = true;
+-                } else {
+-                    // Prefer previous device if it was inactive
+-                    if (foundInactive) {
+-                        break;
+-                    }
+-                }
+-
+-                if (wifiDev->wirelessCapabilities().testFlag(NetworkManager::WirelessDevice::ApCap)) {
+-                    useApMode = true;
+-                }
+-
+-                // We prefer inactive wireless card with AP capabilities
+-                if (foundInactive && useApMode) {
+-                    break;
+-                }
+-            }
+-        }
+-    }
+-
+     m_ui->connectionView->setMinimumWidth(235);
+     m_ui->connectionView->setMaximumWidth(350);
+     m_ui->connectionView->rootContext()->setContextProperty("alternateBaseColor", mainWidget->palette().color(QPalette::Active, QPalette::AlternateBase));
+@@ -150,7 +121,7 @@ KCMNetworkmanagement::KCMNetworkmanagement(QObject *parent, const KPluginMetaDat
+     m_ui->connectionView->rootContext()->setContextProperty("highlightColor", mainWidget->palette().color(QPalette::Active, QPalette::Highlight));
+     m_ui->connectionView->rootContext()->setContextProperty("textColor", mainWidget->palette().color(QPalette::Active, QPalette::Text));
+     m_ui->connectionView->rootContext()->setContextProperty("connectionModified", false);
+-    m_ui->connectionView->rootContext()->setContextProperty("useApMode", useApMode);
++    m_ui->connectionView->rootContext()->setContextProperty("useApMode", false); // set by updateApMode() after the first frame
+     m_ui->connectionView->rootContext()->setContextProperty("kcm", this);
+     m_ui->connectionView->setClearColor(Qt::transparent);
+     m_ui->connectionView->setResizeMode(QQuickWidget::SizeRootObjectToView);
+@@ -167,6 +138,13 @@ KCMNetworkmanagement::KCMNetworkmanagement(QObject *parent, const KPluginMetaDat
+ 
+     l->addWidget(mainWidget);
+ 
++    // Empty state of the editor side (the editor itself is built when a connection is selected)
++    m_hint = new QLabel(i18nc("@info:placeholder", "Select a connection to see and change its settings."), mainWidget);
++    m_hint->setAlignment(Qt::AlignCenter);
++    m_hint->setWordWrap(true);
++    m_hint->setEnabled(false);
++    m_ui->horizontalLayout->addWidget(m_hint);
++
+     setButtons(Button::Apply);
+ 
+     connect(this, &KCMNetworkmanagement::activationRequested, this, [this](const QVariantList &args) {
+@@ -189,6 +167,28 @@ KCMNetworkmanagement::KCMNetworkmanagement(QObject *parent, const KPluginMetaDat
+         });
+     }
+ 
++    // Everything below asks NetworkManager over D-Bus (blocking calls) and builds the connection editor for the first
++    // selection. It runs once the list has been drawn, not before the first frame.
++    auto startOnce = [this, args] {
++        if (m_deferredStarted) {
++            return;
++        }
++        m_deferredStarted = true;
++        QTimer::singleShot(0, this, [this, args] {
++            startDeferredWork(args);
++        });
++    };
++    if (auto quickWindow = m_ui->connectionView->quickWindow()) {
++        connect(quickWindow, &QQuickWindow::afterRendering, this, startOnce, Qt::SingleShotConnection);
++    }
++    // In case no frame is ever drawn (the page is created hidden)
++    QTimer::singleShot(2000, this, startOnce);
++}
++
++void KCMNetworkmanagement::startDeferredWork(const QVariantList &args)
++{
++    updateApMode();
++
+     // Select the connection from the arguments, falling back to a default one
+     NetworkManager::Connection::Ptr selectedConnection = connectionFromArgs(args);
+     if (!isSelectable(selectedConnection)) {
+@@ -226,6 +226,42 @@ KCMNetworkmanagement::KCMNetworkmanagement(QObject *parent, const KPluginMetaDat
+     m_timer->start();
+ }
+ 
++void KCMNetworkmanagement::updateApMode()
++{
++    // Check if we can use AP mode to identify security type
++    bool useApMode = false;
++    bool foundInactive = false;
++
++    NetworkManager::WirelessDevice::Ptr wifiDev;
++
++    for (const NetworkManager::Device::Ptr &device : NetworkManager::networkInterfaces()) {
++        if (device->type() == NetworkManager::Device::Wifi) {
++            wifiDev = device.objectCast<NetworkManager::WirelessDevice>();
++            if (wifiDev) {
++                if (!wifiDev->isActive()) {
++                    foundInactive = true;
++                } else {
++                    // Prefer previous device if it was inactive
++                    if (foundInactive) {
++                        break;
++                    }
++                }
++
++                if (wifiDev->wirelessCapabilities().testFlag(NetworkManager::WirelessDevice::ApCap)) {
++                    useApMode = true;
++                }
++
++                // We prefer inactive wireless card with AP capabilities
++                if (foundInactive && useApMode) {
++                    break;
++                }
++            }
++        }
++    }
++
++    m_ui->connectionView->rootContext()->setContextProperty("useApMode", useApMode);
++}
++
+ KCMNetworkmanagement::~KCMNetworkmanagement()
+ {
+     delete m_handler;
+@@ -578,6 +614,7 @@ void KCMNetworkmanagement::loadConnectionSettings(const NetworkManager::Connecti
+         });
+         m_ui->horizontalLayout->addWidget(m_tabWidget);
+     }
++    m_hint->hide();
+ 
+     kcmChanged(false);
+ }
+@@ -692,6 +729,7 @@ void KCMNetworkmanagement::resetSelection()
+         delete m_tabWidget;
+         m_tabWidget = nullptr;
+     }
++    m_hint->show();
+     setNeedsSave(false);
+ }
+ 
+diff --git a/kcms/kcm_connections/kcm.h b/kcms/kcm_connections/kcm.h
+index 4690aba..d9930cc 100755
+--- a/kcms/kcm_connections/kcm.h
++++ b/kcms/kcm_connections/kcm.h
+@@ -14,6 +14,7 @@
+ #include <ui_kcm.h>
+ 
+ class KMessageWidget;
++class QLabel;
+ 
+ class KCMNetworkmanagement : public KCModule
+ {
+@@ -45,6 +46,8 @@ private:
+         static ImportResult fail(const QString &message);
+     };
+ 
++    void startDeferredWork(const QVariantList &args);
++    void updateApMode();
+     void addConnection(const NetworkManager::ConnectionSettings::Ptr &connectionSettings);
+     [[nodiscard]] KCMNetworkmanagement::ImportResult importVpn();
+     [[nodiscard]] KCMNetworkmanagement::ImportResult importVpnFile(const QString &fileName);
+@@ -56,6 +59,8 @@ private:
+     void promptImportVpn(const QString &vpnFile);
+     NetworkManager::Connection::Ptr connectionFromArgs(const QVariantList &args) const;
+ 
++    bool m_deferredStarted = false;
++    QLabel *m_hint = nullptr;
+     QString m_currentConnectionPath;
+     QString m_createdConnectionUuid;
+     Handler *const m_handler;
+diff --git a/kcms/kcm_connections/qml/ConnectionItem.qml b/kcms/kcm_connections/qml/ConnectionItem.qml
+index ab71ded..18e9c98 100644
+--- a/kcms/kcm_connections/qml/ConnectionItem.qml
++++ b/kcms/kcm_connections/qml/ConnectionItem.qml
+@@ -11,6 +11,7 @@ import org.kde.kirigami as Kirigami
+ import org.kde.plasma.components as PlasmaComponents3
+ import org.kde.plasma.networkmanagement as PlasmaNM
+ 
++// ksr: kcm_networkmanagement/model-Name
+ QQC2.ItemDelegate {
+     id: delegate
+ 
+@@ -83,6 +84,7 @@ QQC2.ItemDelegate {
+         QQC2.MenuItem {
+             icon.name: delegate.isConnectionDeactivated() ? "network-connect-symbolic" : "network-disconnect-symbolic"
+             text: delegate.isConnectionDeactivated()
++                // ksr: kcm_networkmanagement/ItemConnect
+                 ? i18nc("@action:inmenu connect to network", "Connect")
+                 : i18nc("@action:inmenu disconnect from network", "Disconnect")
+             enabled: model.ItemType === PlasmaNM.NetworkModelItem.AvailableConnection || model.ItemType === PlasmaNM.NetworkModelItem.AvailableAccessPoint
+@@ -93,6 +95,7 @@ QQC2.ItemDelegate {
+         }
+         QQC2.MenuItem {
+             icon.name: "edit-copy"
++            // ksr: kcm_networkmanagement/ItemDuplicate
+             text: i18nc("@action:inmenu duplicate network connection", "Duplicate")
+             visible: !delegate.isUnknownNewConnection
+ 
+@@ -101,6 +104,7 @@ QQC2.ItemDelegate {
+ 
+         QQC2.MenuItem {
+             icon.name: "list-remove-symbolic"
++            // ksr: kcm_networkmanagement/ItemForget
+             text: i18nc("@action:inmenu forget network connection", "Forget");
+             visible: !delegate.isUnknownNewConnection
+ 
+@@ -112,6 +116,7 @@ QQC2.ItemDelegate {
+         QQC2.MenuItem {
+             icon.name: "document-export-symbolic"
+             visible: model.KcmVpnConnectionExportable
++            // ksr: kcm_networkmanagement/ItemExport
+             text: i18nc("@action:inmenu export network connection", "Export");
+ 
+             onTriggered: kcm.onRequestExportConnection(model.ConnectionPath)
+diff --git a/kcms/kcm_connections/qml/main.qml b/kcms/kcm_connections/qml/main.qml
+index 57a283a..97f240f 100755
+--- a/kcms/kcm_connections/qml/main.qml
++++ b/kcms/kcm_connections/qml/main.qml
+@@ -39,25 +39,80 @@ QQC2.Page {
+         sourceModel: connectionModel
+     }
+ 
+-    Kirigami.SearchField {
+-        id: searchField
++    // State first: what the computer is connected to. Created shortly after the first frame, because it
++    // reads the NetworkManager state again.
++    Loader {
++        id: statusLoader
+ 
++        active: false
+         anchors {
+             left: parent.left
+             right: parent.right
+             top: parent.top
++            margins: item ? Kirigami.Units.smallSpacing : 0
++        }
++        height: item ? item.implicitHeight : 0
++
++        sourceComponent: QQC2.Label {
++            wrapMode: Text.Wrap
++            elide: Text.ElideRight
++            maximumLineCount: 3
++            font.weight: Font.DemiBold
++            text: nmStatus.activeConnections !== "" ? nmStatus.activeConnections : i18nc("@info:status", "Not connected")
++            textFormat: Text.PlainText
++
++            PlasmaNM.NetworkStatus {
++                id: nmStatus
++            }
++        }
++    }
++
++    Timer {
++        interval: 50
++        running: true
++        onTriggered: statusLoader.active = true
++    }
++
++    Kirigami.SearchField {
++        id: searchField
++
++        anchors {
++            left: parent.left
++            right: addConnectionButton.left
++            top: statusLoader.bottom
+         }
+         Keys.onDownPressed: event => {
+             connectionView.currentIndex = 0
+             event.accepted = false // pass to KeyNavigation
+         }
+         KeyNavigation.down: scrollView
++        KeyNavigation.right: addConnectionButton
+ 
+         onTextChanged: {
+             editorProxyModel.setFilterFixedString(text)
+         }
+     }
+ 
++    // ksr: kcm_networkmanagement/AddNewConnection
++    QQC2.ToolButton {
++        id: addConnectionButton
++
++        anchors {
++            right: parent.right
++            verticalCenter: searchField.verticalCenter
++        }
++
++        text: i18nc("@action:button Opens the list of connection types to add", "Add Connection…")
++        display: QQC2.AbstractButton.TextBesideIcon
++        icon.name: "list-add"
++
++        KeyNavigation.down: scrollView
++
++        onClicked: {
++            addNewConnectionDialog.show()
++        }
++    }
++
+     QQC2.ScrollView {
+         id: scrollView
+ 
+@@ -139,23 +194,7 @@ QQC2.Page {
+         }
+         spacing: Kirigami.Units.smallSpacing
+ 
+-        QQC2.ToolButton {
+-            id: addConnectionButton
+-
+-            text: QQC2.ToolTip.text
+-            display: QQC2.AbstractButton.IconOnly
+-            icon.name: "list-add"
+-
+-            KeyNavigation.right: removeConnectionButton
+-
+-            QQC2.ToolTip.text: i18nc("@action:button", "Add new connection")
+-            QQC2.ToolTip.visible: hovered
+-
+-            onClicked: {
+-                addNewConnectionDialog.show()
+-            }
+-        }
+-
++        // ksr: kcm_networkmanagement/ForgetConnection
+         QQC2.ToolButton {
+             id: removeConnectionButton
+ 
+@@ -166,6 +205,7 @@ QQC2.Page {
+ 
+             KeyNavigation.right: exportConnectionButton
+ 
++            Accessible.name: QQC2.ToolTip.text
+             QQC2.ToolTip.text: i18nc("@action:button", "Forget selected connection")
+             QQC2.ToolTip.visible: hovered
+ 
+@@ -176,6 +216,7 @@ QQC2.Page {
+             }
+         }
+ 
++        // ksr: kcm_networkmanagement/onRequestExportConnection
+         QQC2.ToolButton {
+             id: exportConnectionButton
+ 
+@@ -184,6 +225,7 @@ QQC2.Page {
+             enabled: connectionView.currentConnectionExportable
+             icon.name: "document-export"
+ 
++            Accessible.name: QQC2.ToolTip.text
+             QQC2.ToolTip.text: i18nc("@action:button", "Export selected connection")
+             QQC2.ToolTip.visible: hovered
+ 
+@@ -201,16 +243,14 @@ QQC2.Page {
+         }
+         spacing: Kirigami.Units.smallSpacing
+ 
++        // ksr: kcm_networkmanagement/ConfigureButton
+         QQC2.ToolButton {
+             id: configureButton
+-            text: QQC2.ToolTip.text
+-            display: QQC2.AbstractButton.IconOnly
++            text: i18nc("@action:button Opens connection settings", "Configure…")
++            display: QQC2.AbstractButton.TextBesideIcon
+             icon.name: "configure"
+ 
+-            KeyNavigation.right: addConnectionButton
+-
+-            QQC2.ToolTip.text: i18nc("@action:button", "Configure")
+-            QQC2.ToolTip.visible: hovered
++            KeyNavigation.right: removeConnectionButton
+ 
+             onClicked: {
+                 root.showConfigurationDialog();
+@@ -236,12 +276,14 @@ QQC2.Page {
+         property int securityType
+ 
+         footer: QQC2.DialogButtonBox {
++            // ksr: kcm_networkmanagement/Connect
+             QQC2.Button {
+                 text: i18nc("@action:button Connect to network", "Connect")
+                 icon.name: "network-connect"
+                 enabled: passwordField.acceptableInput
+                 QQC2.DialogButtonBox.buttonRole: QQC2.DialogButtonBox.AcceptRole
+             }
++            // ksr: kcm_networkmanagement/Cancel
+             QQC2.Button {
+                 text: i18nc("@action:button Cancel connecting to network", "Cancel")
+                 icon.name: "dialog-cancel"
+@@ -249,6 +291,7 @@ QQC2.Page {
+             }
+         }
+ 
++        // ksr: kcm_networkmanagement/EnterPasswordDialog
+         title: i18nc("@title:window", "Enter Password")
+ 
+         contentItem: ColumnLayout {
+diff --git a/libs/editor/connectiondetails.cpp b/libs/editor/connectiondetails.cpp
+index d030b16..96834d0 100644
+--- a/libs/editor/connectiondetails.cpp
++++ b/libs/editor/connectiondetails.cpp
+@@ -93,6 +93,7 @@ getConnectionDetails(const NetworkManager::Connection::Ptr &connection, const Ne
+             details.append({i18n("MAC Address"), wiredDevice->hardwareAddress()});
+         }
+         if (!details.isEmpty()) {
++            // ksr: kcm_networkmanagement/editor-Status
+             sections.append({i18n("Ethernet"), details});
+         }
+     } else if (type == NetworkManager::ConnectionSettings::Wireless) {
+diff --git a/libs/editor/settings/ui/802-1x.ui b/libs/editor/settings/ui/802-1x.ui
+index 3cde238..a654ab2 100644
+--- a/libs/editor/settings/ui/802-1x.ui
++++ b/libs/editor/settings/ui/802-1x.ui
+@@ -38,6 +38,7 @@
+     </widget>
+    </item>
+    <item row="0" column="1">
++    <!-- ksr: kcm_networkmanagement/802-1x-auth -->
+     <widget class="KComboBox" name="auth">
+      <property name="sizePolicy">
+       <sizepolicy hsizetype="MinimumExpanding" vsizetype="Fixed">
+diff --git a/libs/editor/settings/ui/bond.ui b/libs/editor/settings/ui/bond.ui
+index 11a19ae..277401f 100644
+--- a/libs/editor/settings/ui/bond.ui
++++ b/libs/editor/settings/ui/bond.ui
+@@ -41,6 +41,7 @@
+    <item row="2" column="0" colspan="2">
+     <layout class="QGridLayout" name="gridLayout">
+      <item row="0" column="0" rowspan="4">
++      <!-- ksr: kcm_networkmanagement/bond-bonds -->
+       <widget class="QListWidget" name="bonds">
+        <property name="editTriggers">
+         <set>QAbstractItemView::NoEditTriggers</set>
+@@ -54,6 +55,7 @@
+       </widget>
+      </item>
+      <item row="0" column="1">
++      <!-- ksr: kcm_networkmanagement/bond-btnAdd -->
+       <widget class="QPushButton" name="btnAdd">
+        <property name="text">
+         <string>Add…</string>
+@@ -115,6 +117,7 @@
+     </widget>
+    </item>
+    <item row="3" column="1">
++    <!-- ksr: kcm_networkmanagement/bond-mode -->
+     <widget class="KComboBox" name="mode">
+      <property name="sizePolicy">
+       <sizepolicy hsizetype="MinimumExpanding" vsizetype="Fixed">
+diff --git a/libs/editor/settings/ui/bridge.ui b/libs/editor/settings/ui/bridge.ui
+index c07cc7e..dc948f6 100644
+--- a/libs/editor/settings/ui/bridge.ui
++++ b/libs/editor/settings/ui/bridge.ui
+@@ -51,6 +51,7 @@
+       </widget>
+      </item>
+      <item row="0" column="1">
++      <!-- ksr: kcm_networkmanagement/bridge-btnAdd -->
+       <widget class="QPushButton" name="btnAdd">
+        <property name="text">
+         <string>Add…</string>
+@@ -237,6 +238,7 @@
+        </widget>
+       </item>
+       <item row="3" column="1">
++       <!-- ksr: kcm_networkmanagement/bridge-maxAge -->
+        <widget class="QSpinBox" name="maxAge">
+         <property name="sizePolicy">
+          <sizepolicy hsizetype="MinimumExpanding" vsizetype="Fixed">
+diff --git a/libs/editor/settings/ui/bt.ui b/libs/editor/settings/ui/bt.ui
+index c367afd..c04d952 100644
+--- a/libs/editor/settings/ui/bt.ui
++++ b/libs/editor/settings/ui/bt.ui
+@@ -26,6 +26,7 @@
+     </widget>
+    </item>
+    <item row="0" column="1">
++    <!-- ksr: kcm_networkmanagement/bt-bdaddr -->
+     <widget class="HwAddrComboBox" name="bdaddr">
+      <property name="sizePolicy">
+       <sizepolicy hsizetype="MinimumExpanding" vsizetype="Fixed">
+@@ -46,6 +47,7 @@
+     </widget>
+    </item>
+    <item row="1" column="1">
++    <!-- ksr: kcm_networkmanagement/bt-type -->
+     <widget class="KComboBox" name="type">
+      <property name="sizePolicy">
+       <sizepolicy hsizetype="MinimumExpanding" vsizetype="Fixed">
+diff --git a/libs/editor/settings/ui/cdma.ui b/libs/editor/settings/ui/cdma.ui
+index 379013d..de9b39b 100644
+--- a/libs/editor/settings/ui/cdma.ui
++++ b/libs/editor/settings/ui/cdma.ui
+@@ -25,6 +25,7 @@
+     </widget>
+    </item>
+    <item row="0" column="1">
++    <!-- ksr: kcm_networkmanagement/cdma-number -->
+     <widget class="KLineEdit" name="number">
+      <property name="text">
+       <string notr="true">#777</string>
+diff --git a/libs/editor/settings/ui/gsm.ui b/libs/editor/settings/ui/gsm.ui
+index 992b174..8c4b8cf 100644
+--- a/libs/editor/settings/ui/gsm.ui
++++ b/libs/editor/settings/ui/gsm.ui
+@@ -29,6 +29,7 @@
+        </widget>
+       </item>
+       <item row="0" column="2">
++       <!-- ksr: kcm_networkmanagement/gsm-number -->
+        <widget class="KLineEdit" name="number">
+         <property name="text">
+          <string notr="true">*99#</string>
+@@ -115,6 +116,7 @@
+        </widget>
+       </item>
+       <item row="0" column="1">
++       <!-- ksr: kcm_networkmanagement/gsm-apn -->
+        <widget class="KLineEdit" name="apn">
+         <property name="sizePolicy">
+          <sizepolicy hsizetype="MinimumExpanding" vsizetype="Fixed">
+@@ -140,6 +142,7 @@
+       <item row="3" column="1">
+        <layout class="QHBoxLayout" name="horizontalLayout_3">
+         <item>
++         <!-- ksr: kcm_networkmanagement/gsm-pin -->
+          <widget class="PasswordField" name="pin">
+           <property name="passwordModeEnabled" stdset="0">
+            <bool>true</bool>
+diff --git a/libs/editor/settings/ui/infiniband.ui b/libs/editor/settings/ui/infiniband.ui
+index 53520e3..e905744 100644
+--- a/libs/editor/settings/ui/infiniband.ui
++++ b/libs/editor/settings/ui/infiniband.ui
+@@ -66,6 +66,7 @@
+     </widget>
+    </item>
+    <item row="2" column="1">
++    <!-- ksr: kcm_networkmanagement/infiniband-mtu -->
+     <widget class="QSpinBox" name="mtu">
+      <property name="sizePolicy">
+       <sizepolicy hsizetype="MinimumExpanding" vsizetype="Fixed">
+diff --git a/libs/editor/settings/ui/ipv4.ui b/libs/editor/settings/ui/ipv4.ui
+index 5fc6e0b..2417886 100644
+--- a/libs/editor/settings/ui/ipv4.ui
++++ b/libs/editor/settings/ui/ipv4.ui
+@@ -242,6 +242,7 @@ Default value -1 means that NetworkManager gets to choose and manage the actual
+     </widget>
+    </item>
+    <item row="0" column="1">
++    <!-- ksr: kcm_networkmanagement/ipv4-method -->
+     <widget class="KComboBox" name="method">
+      <property name="sizePolicy">
+       <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+@@ -293,6 +294,7 @@ Default value -1 means that NetworkManager gets to choose and manage the actual
+    <item row="1" column="1">
+     <layout class="QHBoxLayout" name="horizontalLayout_2">
+      <item>
++      <!-- ksr: kcm_networkmanagement/ipv4-dns -->
+       <widget class="KLineEdit" name="dns">
+        <property name="sizePolicy">
+         <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+@@ -340,6 +342,7 @@ but IPv6 configuration succeeds</string>
+    <item row="5" column="0" colspan="2">
+     <layout class="QGridLayout" name="gridLayout">
+      <item row="3" column="1">
++      <!-- ksr: kcm_networkmanagement/ipv4-btnAdd -->
+       <widget class="QPushButton" name="btnAdd">
+        <property name="text">
+         <string>Add</string>
+diff --git a/libs/editor/settings/ui/ipv6.ui b/libs/editor/settings/ui/ipv6.ui
+index b9ef682..10cfbab 100644
+--- a/libs/editor/settings/ui/ipv6.ui
++++ b/libs/editor/settings/ui/ipv6.ui
+@@ -59,6 +59,7 @@ IPv6 configuration fails but IPv4 configuration succeeds</string>
+    <item row="1" column="1">
+     <layout class="QHBoxLayout" name="horizontalLayout_2">
+      <item>
++      <!-- ksr: kcm_networkmanagement/ipv6-dns -->
+       <widget class="KLineEdit" name="dns">
+        <property name="sizePolicy">
+         <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+@@ -102,6 +103,7 @@ IPv6 configuration fails but IPv4 configuration succeeds</string>
+       </widget>
+      </item>
+      <item row="3" column="1">
++      <!-- ksr: kcm_networkmanagement/ipv6-btnAdd -->
+       <widget class="QPushButton" name="btnAdd">
+        <property name="text">
+         <string>Add</string>
+@@ -209,6 +211,7 @@ a temporary IPv6 address in addition to the public one generated from MAC addres
+     </widget>
+    </item>
+    <item row="0" column="1">
++    <!-- ksr: kcm_networkmanagement/ipv6-method -->
+     <widget class="KComboBox" name="method">
+      <property name="sizePolicy">
+       <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+diff --git a/libs/editor/settings/ui/ppp.ui b/libs/editor/settings/ui/ppp.ui
+index 5897902..ab7bd28 100644
+--- a/libs/editor/settings/ui/ppp.ui
++++ b/libs/editor/settings/ui/ppp.ui
+@@ -33,6 +33,7 @@
+        <number>6</number>
+       </property>
+       <item row="0" column="0">
++       <!-- ksr: kcm_networkmanagement/ppp-eap -->
+        <widget class="QCheckBox" name="eap">
+         <property name="text">
+          <string>EAP</string>
+@@ -43,6 +44,7 @@
+        </widget>
+       </item>
+       <item row="1" column="0">
++       <!-- ksr: kcm_networkmanagement/ppp-mschap -->
+        <widget class="QCheckBox" name="mschap">
+         <property name="text">
+          <string>MSCHAP</string>
+@@ -53,6 +55,7 @@
+        </widget>
+       </item>
+       <item row="2" column="0">
++       <!-- ksr: kcm_networkmanagement/ppp-pap -->
+        <widget class="QCheckBox" name="pap">
+         <property name="text">
+          <string>PAP</string>
+@@ -73,6 +76,7 @@
+        </widget>
+       </item>
+       <item row="4" column="0">
++       <!-- ksr: kcm_networkmanagement/ppp-chap -->
+        <widget class="QCheckBox" name="chap">
+         <property name="text">
+          <string>CHAP</string>
+@@ -104,6 +108,7 @@
+        <number>6</number>
+       </property>
+       <item row="0" column="0">
++       <!-- ksr: kcm_networkmanagement/ppp-mppe -->
+        <widget class="QCheckBox" name="mppe">
+         <property name="text">
+          <string>Use point-to-point encryption (MPPE)</string>
+diff --git a/libs/editor/settings/ui/team.ui b/libs/editor/settings/ui/team.ui
+index ee231e9..2749b98 100644
+--- a/libs/editor/settings/ui/team.ui
++++ b/libs/editor/settings/ui/team.ui
+@@ -38,6 +38,7 @@
+    <item row="2" column="0" colspan="2">
+     <layout class="QGridLayout" name="gridLayout">
+      <item row="0" column="0" rowspan="4">
++      <!-- ksr: kcm_networkmanagement/team-teams -->
+       <widget class="QListWidget" name="teams">
+        <property name="editTriggers">
+         <set>QAbstractItemView::NoEditTriggers</set>
+@@ -51,6 +52,7 @@
+       </widget>
+      </item>
+      <item row="0" column="1">
++      <!-- ksr: kcm_networkmanagement/team-btnAdd -->
+       <widget class="QPushButton" name="btnAdd">
+        <property name="text">
+         <string>Add…</string>
+@@ -115,6 +117,7 @@
+     </widget>
+    </item>
+    <item row="4" column="0" colspan="2">
++    <!-- ksr: kcm_networkmanagement/team-config -->
+     <widget class="QPlainTextEdit" name="config"/>
+    </item>
+    <item row="5" column="0" colspan="2">
+diff --git a/libs/editor/settings/ui/vlan.ui b/libs/editor/settings/ui/vlan.ui
+index 460a40a..4843161 100644
+--- a/libs/editor/settings/ui/vlan.ui
++++ b/libs/editor/settings/ui/vlan.ui
+@@ -23,6 +23,7 @@
+     </widget>
+    </item>
+    <item row="0" column="1">
++    <!-- ksr: kcm_networkmanagement/vlan-parent -->
+     <widget class="KComboBox" name="parent">
+      <property name="sizePolicy">
+       <sizepolicy hsizetype="MinimumExpanding" vsizetype="Fixed">
+@@ -46,6 +47,7 @@
+     </widget>
+    </item>
+    <item row="1" column="1">
++    <!-- ksr: kcm_networkmanagement/vlan-id -->
+     <widget class="QSpinBox" name="id">
+      <property name="sizePolicy">
+       <sizepolicy hsizetype="MinimumExpanding" vsizetype="Fixed">
+@@ -79,6 +81,7 @@
+     </widget>
+    </item>
+    <item row="4" column="0" colspan="2">
++    <!-- ksr: kcm_networkmanagement/vlan-gvrp -->
+     <widget class="QCheckBox" name="gvrp">
+      <property name="toolTip">
+       <string>GARP VLAN Registration Protocol</string>
+diff --git a/libs/editor/settings/ui/wificonnectionwidget.ui b/libs/editor/settings/ui/wificonnectionwidget.ui
+index 4734353..a2c4f54 100644
+--- a/libs/editor/settings/ui/wificonnectionwidget.ui
++++ b/libs/editor/settings/ui/wificonnectionwidget.ui
+@@ -171,6 +171,7 @@
+     </widget>
+    </item>
+    <item row="5" column="1">
++    <!-- ksr: kcm_networkmanagement/wificonnectionwidget-band -->
+     <widget class="KComboBox" name="band">
+      <property name="sizePolicy">
+       <sizepolicy hsizetype="MinimumExpanding" vsizetype="Minimum">
+@@ -309,6 +310,7 @@ a Wi-Fi network on the specified channel</string>
+     </widget>
+    </item>
+    <item row="9" column="1">
++    <!-- ksr: kcm_networkmanagement/wificonnectionwidget-mtu -->
+     <widget class="QSpinBox" name="mtu">
+      <property name="sizePolicy">
+       <sizepolicy hsizetype="MinimumExpanding" vsizetype="Fixed">
+diff --git a/libs/editor/settings/ui/wifisecurity.ui b/libs/editor/settings/ui/wifisecurity.ui
+index 048847f..0e250ff 100644
+--- a/libs/editor/settings/ui/wifisecurity.ui
++++ b/libs/editor/settings/ui/wifisecurity.ui
+@@ -116,6 +116,7 @@
+       </widget>
+      </item>
+      <item row="1" column="1">
++      <!-- ksr: kcm_networkmanagement/wifisecurity-wepKey -->
+       <widget class="PasswordField" name="wepKey">
+        <property name="maxLength">
+         <number>26</number>
+@@ -251,6 +252,7 @@
+       </widget>
+      </item>
+      <item row="6" column="1">
++      <!-- ksr: kcm_networkmanagement/wifisecurity-psk -->
+       <widget class="PasswordField" name="psk">
+        <property name="passwordModeEnabled" stdset="0">
+         <bool>true</bool>
+diff --git a/libs/editor/settings/ui/wiredconnectionwidget.ui b/libs/editor/settings/ui/wiredconnectionwidget.ui
+index f889f6c..a7239ff 100644
+--- a/libs/editor/settings/ui/wiredconnectionwidget.ui
++++ b/libs/editor/settings/ui/wiredconnectionwidget.ui
+@@ -94,6 +94,7 @@ cloning or spoofing. Example 11:22:33:44:55</string>
+     </widget>
+    </item>
+    <item row="2" column="1">
++    <!-- ksr: kcm_networkmanagement/wiredconnectionwidget-mtu -->
+     <widget class="QSpinBox" name="mtu">
+      <property name="sizePolicy">
+       <sizepolicy hsizetype="MinimumExpanding" vsizetype="Fixed">
+@@ -137,6 +138,7 @@ into multiple Ethernet frames</string>
+     </widget>
+    </item>
+    <item row="5" column="1">
++    <!-- ksr: kcm_networkmanagement/wiredconnectionwidget-duplex -->
+     <widget class="KComboBox" name="duplex">
+      <property name="enabled">
+       <bool>false</bool>
+@@ -205,6 +207,7 @@ the device compatibility. If unsure, leave here “Ignore” or pick “Automati
+     </widget>
+    </item>
+    <item row="4" column="1">
++    <!-- ksr: kcm_networkmanagement/wiredconnectionwidget-speed -->
+     <widget class="QComboBox" name="speed">
+      <property name="enabled">
+       <bool>false</bool>
+diff --git a/libs/editor/settings/ui/wireguardtabwidget.ui b/libs/editor/settings/ui/wireguardtabwidget.ui
+index 7185f9c..e3b5db7 100644
+--- a/libs/editor/settings/ui/wireguardtabwidget.ui
++++ b/libs/editor/settings/ui/wireguardtabwidget.ui
+@@ -32,6 +32,7 @@
+       <widget class="QWidget" name="horizontalLayoutWidget">
+        <layout class="QHBoxLayout" name="horizontalLayout">
+         <item>
++         <!-- ksr: kcm_networkmanagement/wireguardtabwidget-btnAdd -->
+          <widget class="QPushButton" name="btnAdd">
+           <property name="text">
+            <string>Add new Peer</string>
+diff --git a/libs/editor/widgets/mobileconnectionwizard.cpp b/libs/editor/widgets/mobileconnectionwizard.cpp
+index 840794d..bbbc5e8 100644
+--- a/libs/editor/widgets/mobileconnectionwizard.cpp
++++ b/libs/editor/widgets/mobileconnectionwizard.cpp
+@@ -251,6 +251,7 @@ QWizardPage *MobileConnectionWizard::createIntroPage()
+     layout->addWidget(label);
+ 
+     if (!mInitialMethodType) {
++        // ksr: kcm_networkmanagement/wizard-Device
+         label = new QLabel('\n' + i18nc("Mobile Connection Wizard", "Create a connection for &this mobile broadband device:"));
+         layout->addWidget(label);
+ 
+@@ -400,6 +401,7 @@ QWizardPage *MobileConnectionWizard::createCountryPage()
+     page->setTitle(i18nc("Mobile Connection Wizard", "Choose your Provider's Country"));
+     auto layout = new QVBoxLayout;
+ 
++    // ksr: kcm_networkmanagement/wizard-Country
+     auto label = new QLabel(i18nc("Mobile Connection Wizard", "Country List:"));
+     layout->addWidget(label);
+ 
+@@ -423,6 +425,7 @@ QWizardPage *MobileConnectionWizard::createProvidersPage()
+     page->setTitle(i18nc("Mobile Connection Wizard", "Choose your Provider"));
+     auto layout = new QVBoxLayout;
+ 
++    // ksr: kcm_networkmanagement/wizard-ProviderAuto
+     radioAutoProvider = new QRadioButton(i18nc("Mobile Connection Wizard", "Select your provider from a &list:"));
+     radioAutoProvider->setChecked(true);
+     layout->addWidget(radioAutoProvider);
+@@ -432,6 +435,7 @@ QWizardPage *MobileConnectionWizard::createProvidersPage()
+     connect(mProvidersList, &QListWidget::itemClicked, this, &MobileConnectionWizard::slotCheckProviderList);
+     layout->addWidget(mProvidersList);
+ 
++    // ksr: kcm_networkmanagement/wizard-ProviderManual
+     radioManualProvider = new QRadioButton(i18nc("Mobile Connection Wizard", "I cannot find my provider and I wish to enter it &manually:"));
+     layout->addWidget(radioManualProvider);
+     connect(radioManualProvider, &QRadioButton::toggled, this, &MobileConnectionWizard::slotEnableProviderEdit);
+@@ -477,6 +481,7 @@ QWizardPage *MobileConnectionWizard::createPlansPage()
+     page->setTitle(i18nc("Mobile Connection Wizard", "Choose your Billing Plan"));
+     auto layout = new QBoxLayout(QBoxLayout::TopToBottom);
+ 
++    // ksr: kcm_networkmanagement/wizard-Plan
+     auto label = new QLabel(i18nc("Mobile Connection Wizard", "&Select your plan:"));
+     layout->addWidget(label);
+ 
+@@ -484,6 +489,7 @@ QWizardPage *MobileConnectionWizard::createPlansPage()
+     label->setBuddy(mPlanComboBox);
+     layout->addWidget(mPlanComboBox);
+ 
++    // ksr: kcm_networkmanagement/wizard-Apn
+     label = new QLabel('\n' + i18nc("Mobile Connection Wizard", "Selected plan &APN (Access Point Name):"));
+     layout->addWidget(label);
+ 
+diff --git a/libs/models/creatableconnectionsmodel.cpp b/libs/models/creatableconnectionsmodel.cpp
+index 04b3e87..80d353b 100644
+--- a/libs/models/creatableconnectionsmodel.cpp
++++ b/libs/models/creatableconnectionsmodel.cpp
+@@ -132,6 +132,7 @@ void CreatableConnectionsModel::populateModel()
+     }
+ 
+     CreatableConnectionItem *connectionItem{nullptr};
++    // ksr: kcm_networkmanagement/type-DSL
+     connectionItem = new CreatableConnectionItem(i18n("DSL"),
+                                                  i18n("Hardware based connections"),
+                                                  i18n("Some DSL description"),
+@@ -139,6 +140,7 @@ void CreatableConnectionsModel::populateModel()
+                                                  NetworkManager::ConnectionSettings::Pppoe);
+     m_list << connectionItem;
+ 
++    // ksr: kcm_networkmanagement/type-Infiniband
+     connectionItem = new CreatableConnectionItem(i18n("Infiniband"),
+                                                  i18n("Hardware based connections"),
+                                                  i18n("Some infiniband description"),
+@@ -146,6 +148,7 @@ void CreatableConnectionsModel::populateModel()
+                                                  NetworkManager::ConnectionSettings::Infiniband);
+     m_list << connectionItem;
+ 
++    // ksr: kcm_networkmanagement/type-MobileBroadband
+     connectionItem = new CreatableConnectionItem(i18n("Mobile Broadband"),
+                                                  i18n("Hardware based connections"),
+                                                  i18n("Some mobile broadband description"),
+@@ -153,6 +156,7 @@ void CreatableConnectionsModel::populateModel()
+                                                  NetworkManager::ConnectionSettings::Gsm);
+     m_list << connectionItem;
+ 
++    // ksr: kcm_networkmanagement/type-WiredEthernet
+     connectionItem = new CreatableConnectionItem(i18n("Wired Ethernet"),
+                                                  i18n("Hardware based connections"),
+                                                  i18n("Some wired ethernet description"),
+@@ -160,6 +164,7 @@ void CreatableConnectionsModel::populateModel()
+                                                  NetworkManager::ConnectionSettings::Wired);
+     m_list << connectionItem;
+ 
++    // ksr: kcm_networkmanagement/type-WiredEthernetShared
+     connectionItem = new CreatableConnectionItem(i18n("Wired Ethernet (shared)"),
+                                                  i18n("Hardware based connections"),
+                                                  i18n("Some wired ethernet description"),
+@@ -170,6 +175,7 @@ void CreatableConnectionsModel::populateModel()
+                                                  true); // VpnType and SpecificType are empty
+     m_list << connectionItem;
+ 
++    // ksr: kcm_networkmanagement/type-WiFi
+     connectionItem = new CreatableConnectionItem(i18n("Wi-Fi"),
+                                                  i18n("Hardware based connections"),
+                                                  i18n("Some wi-fi description"),
+@@ -177,6 +183,7 @@ void CreatableConnectionsModel::populateModel()
+                                                  NetworkManager::ConnectionSettings::Wireless);
+     m_list << connectionItem;
+ 
++    // ksr: kcm_networkmanagement/type-WiFiShared
+     connectionItem = new CreatableConnectionItem(i18n("Wi-Fi (shared)"),
+                                                  i18n("Hardware based connections"),
+                                                  i18n("Some wi-fi description"),
+@@ -187,6 +194,7 @@ void CreatableConnectionsModel::populateModel()
+                                                  true); // VpnType and SpecificType are empty
+     m_list << connectionItem;
+ 
++    // ksr: kcm_networkmanagement/type-Bond
+     connectionItem = new CreatableConnectionItem(i18n("Bond"),
+                                                  i18n("Virtual connections"),
+                                                  i18n("Some bond description"),
+@@ -197,6 +205,7 @@ void CreatableConnectionsModel::populateModel()
+                                                  true); // VpnType and SpecificType are empty
+     m_list << connectionItem;
+ 
++    // ksr: kcm_networkmanagement/type-Bridge
+     connectionItem = new CreatableConnectionItem(i18n("Bridge"),
+                                                  i18n("Virtual connections"),
+                                                  i18n("Some bond description"),
+@@ -207,6 +216,7 @@ void CreatableConnectionsModel::populateModel()
+                                                  true); // VpnType and SpecificType are empty
+     m_list << connectionItem;
+ 
++    // ksr: kcm_networkmanagement/type-Team
+     connectionItem = new CreatableConnectionItem(i18n("Team"),
+                                                  i18n("Virtual connections"),
+                                                  i18n("Some team description"),
+@@ -217,6 +227,7 @@ void CreatableConnectionsModel::populateModel()
+                                                  true); // VpnType and SpecificType are empty
+     m_list << connectionItem;
+ 
++    // ksr: kcm_networkmanagement/type-Vlan
+     connectionItem = new CreatableConnectionItem(i18n("Vlan"),
+                                                  i18n("Virtual connections"),
+                                                  i18n("Some vlan description"),
+@@ -239,6 +250,7 @@ void CreatableConnectionsModel::populateModel()
+         const QString vpnDescription = service.description();
+ 
+         connectionItem = new CreatableConnectionItem(service.name(),
++                                                     // ksr: kcm_networkmanagement/type-Vpn
+                                                      i18n("VPN connections"),
+                                                      vpnDescription,
+                                                      QStringLiteral("network-vpn"),
+@@ -251,6 +263,7 @@ void CreatableConnectionsModel::populateModel()
+ 
+     // WireGuard changed from VPN plugin to primary device in version 1.16 of NetworkManager
+     if (NetworkManager::checkVersion(1, 16, 0)) {
++        // ksr: kcm_networkmanagement/type-WireGuard
+         connectionItem = new CreatableConnectionItem(i18n("WireGuard"),
+                                                      i18n("VPN connections"),
+                                                      i18n("WireGuard"),
+diff --git a/vpn/fortisslvpn/fortisslvpn.ui b/vpn/fortisslvpn/fortisslvpn.ui
+index a1a38e2..58ca334 100644
+--- a/vpn/fortisslvpn/fortisslvpn.ui
++++ b/vpn/fortisslvpn/fortisslvpn.ui
+@@ -134,6 +134,7 @@
+        </widget>
+       </item>
+       <item row="2" column="1">
++       <!-- ksr: kcm_networkmanagement/fortisslvpn-fortisslvpn-caCert -->
+        <widget class="KUrlRequester" name="caCert"/>
+       </item>
+       <item row="3" column="0">
+diff --git a/vpn/fortisslvpn/fortisslvpnadvanced.ui b/vpn/fortisslvpn/fortisslvpnadvanced.ui
+index 55d204b..d1271de 100644
+--- a/vpn/fortisslvpn/fortisslvpnadvanced.ui
++++ b/vpn/fortisslvpn/fortisslvpnadvanced.ui
+@@ -38,6 +38,7 @@
+       <item>
+        <layout class="QGridLayout" name="gridLayout_2">
+         <item row="0" column="0">
++         <!-- ksr: kcm_networkmanagement/fortisslvpn-fortisslvpnadvanced-otp -->
+          <widget class="QCheckBox" name="otp">
+           <property name="text">
+            <string>Use a One-Time Password</string>
+@@ -45,6 +46,7 @@
+          </widget>
+         </item>
+         <item row="0" column="1">
++         <!-- ksr: kcm_networkmanagement/fortisslvpn-fortisslvpnadvanced-tfa -->
+          <widget class="QCheckBox" name="tfa">
+           <property name="text">
+            <string>2FA</string>
+@@ -70,6 +72,7 @@
+        </widget>
+       </item>
+       <item>
++       <!-- ksr: kcm_networkmanagement/fortisslvpn-fortisslvpnadvanced-realm -->
+        <widget class="QLineEdit" name="realm"/>
+       </item>
+      </layout>
+diff --git a/vpn/fortisslvpn/fortisslvpnauth.ui b/vpn/fortisslvpn/fortisslvpnauth.ui
+index 4486878..4ca6b40 100644
+--- a/vpn/fortisslvpn/fortisslvpnauth.ui
++++ b/vpn/fortisslvpn/fortisslvpnauth.ui
+@@ -70,6 +70,7 @@
+        </widget>
+       </item>
+       <item row="1" column="1">
++       <!-- ksr: kcm_networkmanagement/fortisslvpn-fortisslvpnauth-otp -->
+        <widget class="PasswordField" name="otp"/>
+       </item>
+      </layout>
+diff --git a/vpn/l2tp/l2tp.ui b/vpn/l2tp/l2tp.ui
+index fbfc378..0731eda 100644
+--- a/vpn/l2tp/l2tp.ui
++++ b/vpn/l2tp/l2tp.ui
+@@ -145,6 +145,7 @@
+         </widget>
+        </item>
+        <item row="2" column="1">
++        <!-- ksr: kcm_networkmanagement/l2tp-l2tp-domain -->
+         <widget class="QLineEdit" name="domain">
+          <property name="toolTip">
+           <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Append the domain name &amp;lt;domain&amp;gt; to the local host name for&lt;/p&gt;&lt;p&gt;authentication purposes.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+@@ -169,6 +170,7 @@
+         </widget>
+        </item>
+        <item row="0" column="1">
++        <!-- ksr: kcm_networkmanagement/l2tp-l2tp-userCA -->
+         <widget class="KUrlRequester" name="userCA">
+          <property name="toolTip">
+           <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Certificate authority (CA) file in .pem, .der, .crt, .cer or .p12 formats.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+diff --git a/vpn/l2tp/l2tpipsec.ui b/vpn/l2tp/l2tpipsec.ui
+index 2026fb8..1840956 100644
+--- a/vpn/l2tp/l2tpipsec.ui
++++ b/vpn/l2tp/l2tpipsec.ui
+@@ -246,6 +246,7 @@
+           </widget>
+          </item>
+          <item row="2" column="1">
++          <!-- ksr: kcm_networkmanagement/l2tp-l2tpipsec-esp -->
+           <widget class="QLineEdit" name="esp">
+            <property name="toolTip">
+             <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Optional. A list of proposals for ESP - Quick Mode. The format is “enc-integ,enc-integ, …”.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+@@ -273,6 +274,7 @@
+           </widget>
+          </item>
+          <item row="1" column="1">
++          <!-- ksr: kcm_networkmanagement/l2tp-l2tpipsec-ike -->
+           <widget class="QLineEdit" name="ike">
+            <property name="toolTip">
+             <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Optional. A list of proposals for IKE - Main Mode. The format is “enc-integ-group,enc-integ-group, …”.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+@@ -324,6 +326,7 @@
+           </widget>
+          </item>
+          <item row="8" column="0" colspan="2">
++          <!-- ksr: kcm_networkmanagement/l2tp-l2tpipsec-cbPFS -->
+           <widget class="QCheckBox" name="cbPFS">
+            <property name="toolTip">
+             <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Disable perfect forward secrecy. Do this only if the server doesn’t support PFS.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+diff --git a/vpn/l2tp/l2tpppp.ui b/vpn/l2tp/l2tpppp.ui
+index f9cbfa6..265d17f 100644
+--- a/vpn/l2tp/l2tpppp.ui
++++ b/vpn/l2tp/l2tpppp.ui
+@@ -102,6 +102,7 @@
+        <number>6</number>
+       </property>
+       <item row="0" column="0">
++       <!-- ksr: kcm_networkmanagement/l2tp-l2tpppp-cbBSD -->
+        <widget class="QCheckBox" name="cbBSD">
+         <property name="toolTip">
+          <string>Allow/disable BSD-Compress compression.</string>
+@@ -219,6 +220,7 @@ and the receive directions.</string>
+        <number>6</number>
+       </property>
+       <item row="0" column="0">
++       <!-- ksr: kcm_networkmanagement/l2tp-l2tpppp-cbMRRU -->
+        <widget class="QCheckBox" name="cbMRRU">
+         <property name="toolTip">
+          <string>Try to negotiate a PPP Multilink on a single connection.</string>
+@@ -229,6 +231,7 @@ and the receive directions.</string>
+        </widget>
+       </item>
+       <item row="0" column="1">
++       <!-- ksr: kcm_networkmanagement/l2tp-l2tpppp-sbMRRU -->
+        <widget class="QSpinBox" name="sbMRRU">
+         <property name="toolTip">
+          <string>Try to negotiate a PPP Multilink on a single connection.</string>
+@@ -252,6 +255,7 @@ and the receive directions.</string>
+        </widget>
+       </item>
+       <item row="1" column="1">
++       <!-- ksr: kcm_networkmanagement/l2tp-l2tpppp-sbMRU -->
+        <widget class="QSpinBox" name="sbMRU">
+         <property name="maximum">
+          <number>1500</number>
+@@ -266,6 +270,7 @@ and the receive directions.</string>
+        </widget>
+       </item>
+       <item row="2" column="1">
++       <!-- ksr: kcm_networkmanagement/l2tp-l2tpppp-sbMTU -->
+        <widget class="QSpinBox" name="sbMTU">
+         <property name="maximum">
+          <number>1500</number>
+@@ -276,6 +281,7 @@ and the receive directions.</string>
+     </widget>
+    </item>
+    <item row="1" column="0" colspan="2">
++    <!-- ksr: kcm_networkmanagement/l2tp-l2tpppp-gbMPPE -->
+     <widget class="QGroupBox" name="gbMPPE">
+      <property name="toolTip">
+       <string>Note: MPPE encryption is only available with MSCHAP authentication methods. To
+diff --git a/vpn/libreswan/libreswan.ui b/vpn/libreswan/libreswan.ui
+index c308968..ee0f541 100644
+--- a/vpn/libreswan/libreswan.ui
++++ b/vpn/libreswan/libreswan.ui
+@@ -101,6 +101,7 @@
+     </widget>
+    </item>
+    <item row="6" column="1">
++    <!-- ksr: kcm_networkmanagement/libreswan-libreswan-phase1 -->
+     <widget class="QLineEdit" name="phase1"/>
+    </item>
+    <item row="7" column="0">
+@@ -111,6 +112,7 @@
+     </widget>
+    </item>
+    <item row="7" column="1">
++    <!-- ksr: kcm_networkmanagement/libreswan-libreswan-phase2 -->
+     <widget class="QLineEdit" name="phase2"/>
+    </item>
+    <item row="8" column="0">
+@@ -121,6 +123,7 @@
+     </widget>
+    </item>
+    <item row="8" column="1">
++    <!-- ksr: kcm_networkmanagement/libreswan-libreswan-domain -->
+     <widget class="QLineEdit" name="domain"/>
+    </item>
+   </layout>
+diff --git a/vpn/openvpn/openvpnadvanced.ui b/vpn/openvpn/openvpnadvanced.ui
+index 0652355..bf2862f 100644
+--- a/vpn/openvpn/openvpnadvanced.ui
++++ b/vpn/openvpn/openvpnadvanced.ui
+@@ -242,6 +242,7 @@
+        <item>
+         <layout class="QHBoxLayout" name="horizontalLayout_7">
+          <item>
++          <!-- ksr: kcm_networkmanagement/openvpn-openvpnadvanced-chkMtu -->
+           <widget class="QCheckBox" name="chkMtu">
+            <property name="toolTip">
+             <string>Take the TUN device MTU to be specified value and derive the link MTU from it.</string>
+@@ -252,6 +253,7 @@
+           </widget>
+          </item>
+          <item>
++          <!-- ksr: kcm_networkmanagement/openvpn-openvpnadvanced-sbMtu -->
+           <widget class="QSpinBox" name="sbMtu">
+            <property name="enabled">
+             <bool>false</bool>
+diff --git a/vpn/pptp/pptpadvanced.ui b/vpn/pptp/pptpadvanced.ui
+index e721d9b..d44f59f 100644
+--- a/vpn/pptp/pptpadvanced.ui
++++ b/vpn/pptp/pptpadvanced.ui
+@@ -170,6 +170,7 @@ methods: MSCHAP or MSCHAPv2.</string>
+        <number>6</number>
+       </property>
+       <item row="0" column="0">
++       <!-- ksr: kcm_networkmanagement/pptp-pptpadvanced-cb_BSD -->
+        <widget class="QCheckBox" name="cb_BSD">
+         <property name="toolTip">
+          <string>Allow/disable BSD-Compress compression.</string>
+diff --git a/vpn/sstp/sstpadvanced.ui b/vpn/sstp/sstpadvanced.ui
+index 85de7ba..e6db64d 100644
+--- a/vpn/sstp/sstpadvanced.ui
++++ b/vpn/sstp/sstpadvanced.ui
+@@ -187,6 +187,7 @@
+            <number>6</number>
+           </property>
+           <item row="0" column="0">
++           <!-- ksr: kcm_networkmanagement/sstp-sstpadvanced-cb_BSD -->
+            <widget class="QCheckBox" name="cb_BSD">
+             <property name="text">
+              <string>Allow BSD compression</string>
+diff --git a/vpn/strongswan/strongswanprop.ui b/vpn/strongswan/strongswanprop.ui
+index b8fe42b..54d962c 100644
+--- a/vpn/strongswan/strongswanprop.ui
++++ b/vpn/strongswan/strongswanprop.ui
+@@ -211,6 +211,7 @@
+           <item row="0" column="1">
+            <layout class="QHBoxLayout" name="horizontalLayout_4">
+             <item>
++             <!-- ksr: kcm_networkmanagement/strongswan-strongswanprop-lePin -->
+              <widget class="PasswordField" name="lePin">
+               <property name="passwordModeEnabled" stdset="0">
+                <bool>true</bool>
+@@ -321,6 +322,7 @@
+        </widget>
+       </item>
+       <item>
++       <!-- ksr: kcm_networkmanagement/strongswan-strongswanprop-ipComp -->
+        <widget class="QCheckBox" name="ipComp">
+         <property name="text">
+          <string>Use IP compression</string>
+@@ -352,6 +354,7 @@
+          </widget>
+         </item>
+         <item row="0" column="1">
++         <!-- ksr: kcm_networkmanagement/strongswan-strongswanprop-ike -->
+          <widget class="QLineEdit" name="ike">
+           <property name="toolTip">
+            <string>A list of proposals for IKE separated by &quot;;&quot;</string>
+@@ -366,6 +369,7 @@
+          </widget>
+         </item>
+         <item row="1" column="1">
++         <!-- ksr: kcm_networkmanagement/strongswan-strongswanprop-esp -->
+          <widget class="QLineEdit" name="esp">
+           <property name="toolTip">
+            <string>A list of proposals for ESP separated by &quot;;&quot;</string>
+diff --git a/vpn/vpnc/vpnc.ui b/vpn/vpnc/vpnc.ui
+index a4a2dda..1e43ad5 100644
+--- a/vpn/vpnc/vpnc.ui
++++ b/vpn/vpnc/vpnc.ui
+@@ -46,6 +46,7 @@
+     </widget>
+    </item>
+    <item row="1" column="1">
++    <!-- ksr: kcm_networkmanagement/vpnc-vpnc-user -->
+     <widget class="QLineEdit" name="user">
+      <property name="toolTip">
+       <string>User name for the connection.</string>
+@@ -99,6 +100,7 @@
+     </widget>
+    </item>
+    <item row="3" column="1">
++    <!-- ksr: kcm_networkmanagement/vpnc-vpnc-group -->
+     <widget class="QLineEdit" name="group">
+      <property name="toolTip">
+       <string>Group name</string>
+@@ -159,6 +161,7 @@
+     </widget>
+    </item>
+    <item row="6" column="1">
++    <!-- ksr: kcm_networkmanagement/vpnc-vpnc-caFile -->
+     <widget class="KUrlRequester" name="caFile">
+      <property name="enabled">
+       <bool>false</bool>
+diff --git a/vpn/vpnc/vpncadvanced.ui b/vpn/vpnc/vpncadvanced.ui
+index fea733c..3c28567 100644
+--- a/vpn/vpnc/vpncadvanced.ui
++++ b/vpn/vpnc/vpncadvanced.ui
+@@ -32,6 +32,7 @@
+        </widget>
+       </item>
+       <item row="0" column="1">
++       <!-- ksr: kcm_networkmanagement/vpnc-vpncadvanced-domain -->
+        <widget class="QLineEdit" name="domain">
+         <property name="toolTip">
+          <string>(NT-)Domain name for authentication.</string>
+@@ -49,6 +50,7 @@
+        </widget>
+       </item>
+       <item row="1" column="1">
++       <!-- ksr: kcm_networkmanagement/vpnc-vpncadvanced-vendor -->
+        <widget class="QComboBox" name="vendor">
+         <property name="sizePolicy">
+          <sizepolicy hsizetype="MinimumExpanding" vsizetype="Fixed">
+@@ -110,6 +112,7 @@
+        </widget>
+       </item>
+       <item row="1" column="1">
++       <!-- ksr: kcm_networkmanagement/vpnc-vpncadvanced-nat -->
+        <widget class="QComboBox" name="nat">
+         <property name="sizePolicy">
+          <sizepolicy hsizetype="MinimumExpanding" vsizetype="Fixed">
+@@ -156,6 +159,7 @@
+        </widget>
+       </item>
+       <item row="3" column="1">
++       <!-- ksr: kcm_networkmanagement/vpnc-vpncadvanced-pfs -->
+        <widget class="QComboBox" name="pfs">
+         <property name="sizePolicy">
+          <sizepolicy hsizetype="MinimumExpanding" vsizetype="Fixed">

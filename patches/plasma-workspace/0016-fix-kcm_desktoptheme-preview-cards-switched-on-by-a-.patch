@@ -1,0 +1,40 @@
+From 7c4a1a22e4417c1e2e6816f6d2bc6e295c3497f6 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 19:04:31 +0500
+Subject: [PATCH 16/24] fix(kcm_desktoptheme): preview cards switched on by a
+ per-card Timer instead of an asynchronous Loader (page hang), not built yet
+
+Opening the page hung systemsettings in the first headless run. Static reading of 1fbed45 found no binding loop in
+kcm.cpp/kcm.h/main.qml; the only new moving part against the working kcm_icons shell pattern is Loader { asynchronous: true }
+around ThemePreview (incubator driven by frames, Kirigami/KSvg items built inside it). Replaced by active:false plus a Timer
+per card (30 ms + min(index,11)*40 ms), the pattern kcm_icons uses. Cause not proven without a run.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/desktoptheme/ui/main.qml | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/kcms/desktoptheme/ui/main.qml b/kcms/desktoptheme/ui/main.qml
+index c5d52b3..cdafcc1 100644
+--- a/kcms/desktoptheme/ui/main.qml
++++ b/kcms/desktoptheme/ui/main.qml
+@@ -170,10 +170,17 @@ KCM.GridViewKCM {
+         thumbnail: Loader {
+             id: previewLoader
+             anchors.fill: parent
+-            asynchronous: true
++            // Not `asynchronous: true`: the QML incubator only advances between rendered frames and was the one new moving part
++            // when this page hung. Same staggering pattern as kcm_icons: each card is switched on by its own short timer.
++            active: false
+             sourceComponent: ThemePreview {
+                 themeName: model.pluginName
+             }
++            Timer {
++                interval: 30 + Math.min(index, 11) * 40
++                running: true
++                onTriggered: previewLoader.active = true
++            }
+         }
+ 
+         actions: [

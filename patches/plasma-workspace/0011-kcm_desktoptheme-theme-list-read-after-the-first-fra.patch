@@ -1,0 +1,216 @@
+From 1fbed45a2abcdd2a0669e2690f4dd88959c375df Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 14:20:40 +0500
+Subject: [PATCH 11/24] kcm_desktoptheme: theme list read after the first
+ frame, previews built one card at a time, empty and busy states
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Page type: Gallery (docs/page-design.md section 5). Config key (plasmarc Theme/name), pending deletion, KNS, install from
+file, plasmathemeexplorer launch and the preview drawing are unchanged. NOT BUILT YET (owner stopped heavy work); checked
+statically only.
+
+Moved / renamed: no visible wording changed. Install from File… and Get New… were already page actions top right; Edit
+Theme… / Remove / Don't delete stay GridDelegate actions; search and the All/Light/Dark/Color-compatible filter stay in the
+header. New: "No Plasma styles found / match" empty state, busy indicator only after 150 ms. The KCM has no other options, so
+no sub-page. Relabel table: inventory/relabel/kcm_desktoptheme.tsv (outer repo). Inventory --strict: 6 rows ok, 0 lost.
+HIG ids: HIG-001, HIG-006; page-design sections 5, 7.
+
+Speed (cause found in code, not measured):
+- KCMDesktopTheme::load() ran ThemesModel::load() synchronously (themesmodel.cpp load()): locateAll plasma/desktoptheme, a
+  directory listing per root, QFile::exists per theme, KPluginMetaData::fromJsonFile or KDesktopFile per theme, and for every
+  theme with its own colors file a KSharedConfig open plus KColorScheme::createApplicationPalette, then a sort. Now queued one
+  event-loop turn later (generation counter, new property KCMDesktopTheme.loaded); the grid has no model until loaded.
+- Every card created a ThemePreview in the first frame: several KSvg.FrameSvgItem/SvgItem plus kcm.applyPlasmaTheme per
+  card (each loads that theme's SVGs). The thumbnail is now a Loader { asynchronous: true } so cards are built incrementally.
+- After numbers: pending, manager will measure.
+
+Not built yet; uncertain: that GridDelegate.thumbnail accepts a Loader (it is an Item, the previous value was one); that the
+asynchronous Loader keeps the placeholder look until a card is ready (empty card for a moment).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/desktoptheme/kcm.cpp     | 21 +++++++++++++++--
+ kcms/desktoptheme/kcm.h       | 11 +++++++++
+ kcms/desktoptheme/ui/main.qml | 44 +++++++++++++++++++++++++++++++----
+ 3 files changed, 69 insertions(+), 7 deletions(-)
+
+diff --git a/kcms/desktoptheme/kcm.cpp b/kcms/desktoptheme/kcm.cpp
+index 7b2ea73..b4df4de 100644
+--- a/kcms/desktoptheme/kcm.cpp
++++ b/kcms/desktoptheme/kcm.cpp
+@@ -30,6 +30,7 @@
+ #include <QStandardItemModel>
+ #include <QStandardPaths>
+ #include <QTemporaryFile>
++#include <QTimer>
+ #include <algorithm>
+ 
+ #include "desktopthemedata.h"
+@@ -184,8 +185,24 @@ void KCMDesktopTheme::applyPlasmaTheme(QQuickItem *item, const QString &themeNam
+ void KCMDesktopTheme::load()
+ {
+     KQuickManagedConfigModule::load();
+-    m_model->load();
+-    m_model->setSelectedTheme(desktopThemeSettings()->name());
++
++    // ksr: ThemesModel::load() lists every plasma/desktoptheme dir, parses each metadata file and builds a KColorScheme palette
++    // per theme with its own colors file. It runs one event-loop turn later so the page is on screen first; a newer load() makes
++    // an older pending one a no-op.
++    if (m_loaded) {
++        m_loaded = false;
++        Q_EMIT loadedChanged();
++    }
++    const int generation = ++m_loadGeneration;
++    QTimer::singleShot(0, this, [this, generation] {
++        if (generation != m_loadGeneration) {
++            return;
++        }
++        m_model->load();
++        m_model->setSelectedTheme(desktopThemeSettings()->name());
++        m_loaded = true;
++        Q_EMIT loadedChanged();
++    });
+ }
+ 
+ void KCMDesktopTheme::save()
+diff --git a/kcms/desktoptheme/kcm.h b/kcms/desktoptheme/kcm.h
+index a4e32ca..4c8c5f7 100644
+--- a/kcms/desktoptheme/kcm.h
++++ b/kcms/desktoptheme/kcm.h
+@@ -42,6 +42,8 @@ class KCMDesktopTheme : public KQuickManagedConfigModule
+     Q_PROPERTY(ThemesModel *desktopThemeModel READ desktopThemeModel CONSTANT)
+     Q_PROPERTY(bool downloadingFile READ downloadingFile NOTIFY downloadingFileChanged)
+     Q_PROPERTY(bool canEditThemes READ canEditThemes CONSTANT)
++    // false until the theme list has been read; that happens one event-loop turn after load(), so the page is shown first
++    Q_PROPERTY(bool loaded READ loaded NOTIFY loadedChanged)
+ 
+ public:
+     KCMDesktopTheme(QObject *parent, const KPluginMetaData &data);
+@@ -61,8 +63,14 @@ public:
+ 
+     Q_INVOKABLE void editTheme(const QString &themeName);
+ 
++    bool loaded() const
++    {
++        return m_loaded;
++    }
++
+ Q_SIGNALS:
+     void downloadingFileChanged();
++    void loadedChanged();
+ 
+     void showSuccessMessage(const QString &message);
+     void showErrorMessage(const QString &message);
+@@ -77,6 +85,9 @@ private:
+ 
+     void processPendingDeletions();
+ 
++    bool m_loaded = false;
++    int m_loadGeneration = 0;
++
+     void installTheme(const QString &path);
+ 
+     DesktopThemeData *const m_data;
+diff --git a/kcms/desktoptheme/ui/main.qml b/kcms/desktoptheme/ui/main.qml
+index c9f43a8..c5d52b3 100644
+--- a/kcms/desktoptheme/ui/main.qml
++++ b/kcms/desktoptheme/ui/main.qml
+@@ -23,8 +23,31 @@ import org.kde.private.kcms.desktoptheme as Private
+ KCM.GridViewKCM {
+     id: root
+ 
+-    view.model: kcm.filteredModel
+-    view.currentIndex: kcm.filteredModel.selectedThemeIndex
++    // The theme list is read one event-loop turn after load() (kcm.loaded), so the page is shown first.
++    view.model: kcm.loaded ? kcm.filteredModel : null
++    view.currentIndex: kcm.loaded ? kcm.filteredModel.selectedThemeIndex : -1
++
++    // Busy only when reading takes longer than 150 ms (docs/page-design.md section 3).
++    Timer {
++        id: busyDelay
++        interval: 150
++        running: !kcm.loaded
++    }
++    QtControls.BusyIndicator {
++        anchors.centerIn: parent
++        z: 1
++        running: visible
++        visible: !kcm.loaded && !busyDelay.running
++    }
++    Kirigami.PlaceholderMessage {
++        anchors.centerIn: parent
++        width: parent.width - Kirigami.Units.gridUnit * 4
++        visible: kcm.loaded && root.view.count === 0
++        icon.name: "preferences-desktop-theme"
++        text: searchField.text.length > 0 || filterCombo.currentIndex !== 0
++            ? i18nc("@info", "No Plasma styles match")
++            : i18nc("@info", "No Plasma styles found")
++    }
+ 
+     Binding {
+         target: kcm.filteredModel
+@@ -94,6 +117,7 @@ KCM.GridViewKCM {
+                 Layout.fillWidth: true
+             }
+ 
++            // ksr: kcm_desktoptheme/All-themes
+             QtControls.ComboBox {
+                 id: filterCombo
+                 textRole: "text"
+@@ -111,11 +135,13 @@ KCM.GridViewKCM {
+ 
+     actions: [
+         Kirigami.Action {
++            // ksr: kcm_desktoptheme/InstallFromFile
+             text: i18n("Install from File…")
+             icon.name: "document-import"
+             onTriggered: fileDialogLoader.active = true
+         },
+         NewStuff.Action {
++            // ksr: kcm_desktoptheme/GetNew
+             text: i18n("Get New…")
+             configFile: "plasma-themes.knsrc"
+             onEntryEvent: function (entry, event) {
+@@ -127,6 +153,7 @@ KCM.GridViewKCM {
+     view.delegate: KCM.GridDelegate {
+         id: delegate
+ 
++        // ksr: kcm_desktoptheme/name
+         text: model.display
+         subtitle: model.colorType == Private.ThemesModel.FollowsColorTheme
+             && view.model.filter != Private.FilterProxyModel.ThemesFollowingColors ? i18n("Follows color scheme") : ""
+@@ -138,14 +165,20 @@ KCM.GridViewKCM {
+         }
+ 
+         thumbnailAvailable: true
+-        thumbnail: ThemePreview {
+-            id: preview
++        // The preview builds several FrameSvgItems and calls applyPlasmaTheme per card; created one card at a time
++        // between frames instead of all in the first one.
++        thumbnail: Loader {
++            id: previewLoader
+             anchors.fill: parent
+-            themeName: model.pluginName
++            asynchronous: true
++            sourceComponent: ThemePreview {
++                themeName: model.pluginName
++            }
+         }
+ 
+         actions: [
+             Kirigami.Action {
++                // ksr: kcm_desktoptheme/EditTheme
+                 icon.name: "document-edit"
+                 tooltip: i18n("Edit Theme…")
+                 enabled: !model.pendingDeletion
+@@ -153,6 +186,7 @@ KCM.GridViewKCM {
+                 onTriggered: kcm.editTheme(model.pluginName)
+             },
+             Kirigami.Action {
++                // ksr: kcm_desktoptheme/RemoveTheme
+                 icon.name: "edit-delete"
+                 tooltip: if (enabled) {
+                     return i18nc("@info:tooltip", "Remove Plasma style");

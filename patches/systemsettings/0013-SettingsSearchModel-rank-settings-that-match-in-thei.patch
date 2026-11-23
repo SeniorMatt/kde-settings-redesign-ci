@@ -1,0 +1,44 @@
+From c118ff18225df8076eaa8b33ccc4531c240e14f6 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 09:05:18 +0500
+Subject: [PATCH 13/22] SettingsSearchModel: rank settings that match in their
+ own text above those that only match by page
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ app/SettingsSearchModel.cpp | 7 ++++++-
+ app/SettingsSearchModel.h   | 2 +-
+ 2 files changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/app/SettingsSearchModel.cpp b/app/SettingsSearchModel.cpp
+index 229bac9..556e0d0 100644
+--- a/app/SettingsSearchModel.cpp
++++ b/app/SettingsSearchModel.cpp
+@@ -336,7 +336,12 @@ void SettingsSearchModel::setQuery(const QString &query)
+             if (!containsAll(haystack, queryWords)) {
+                 continue;
+             }
+-            const int rank = setting.foldedText.startsWith(foldedQuery) ? 2 : 5;
++            int rank = 5;
++            if (setting.foldedText.startsWith(foldedQuery)) {
++                rank = 2;
++            } else if (containsAll(setting.foldedText + u' ' + setting.foldedSection, queryWords)) {
++                rank = 3;
++            }
+             settings.append({rank, i, {i, SettingResult}, setting.foldedText});
+         }
+         std::stable_sort(settings.begin(), settings.end(), [](const Ranked &a, const Ranked &b) {
+diff --git a/app/SettingsSearchModel.h b/app/SettingsSearchModel.h
+index 696b988..318bed1 100644
+--- a/app/SettingsSearchModel.h
++++ b/app/SettingsSearchModel.h
+@@ -27,7 +27,7 @@ struct Entry;
+  *
+  * Matching ignores case and accents; every word of the query must match somewhere in a result.
+  * Results are ranked: exact page name, pages whose name words start with the query words, settings whose text starts
+- * with the query, other pages, other settings.
++ * with the query, settings with all words in their text or section, other pages, other settings.
+  */
+ class SettingsSearchModel : public QAbstractListModel
+ {

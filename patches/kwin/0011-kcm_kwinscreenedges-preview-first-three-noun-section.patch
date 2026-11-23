@@ -1,0 +1,466 @@
+From 04231bd21894db71bcc36e1737fd1215f5241942 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 01:33:35 +0500
+Subject: [PATCH 11/12] kcm_kwinscreenedges: preview first, three noun
+ sections, scans after the first frame
+
+Page type: Form with a preview (QtWidgets kept, docs/page-design.md 8: QFormLayout, bold section titles, no group frames).
+kcfg keys (kwinrc Windows/ElectricBorder*, ScreenEdges/*, EdgeBarrier/*, effect and script BorderActivate lists), the edge
+actions, D-Bus reconfigure calls and plugin id are unchanged. Made consistent with kcm_kwintouchscreen (same source dir): same
+order (info line, preview, hint under the preview), same widget names and spacing.
+
+Moved / renamed (main.ui):
+- Order by use: info line, preview, then "Window Dragging" (Maximize, Tile, quarter tiling ratio indented under Tile),
+  "Edge Behavior" (switch desktop, activation delay, reactivation delay, remain active when fullscreen), "Multiple Screens"
+  (corner barrier, edge barrier). Was: one run of rows under the preview with labels "Maximize:", "Tile:", "Behavior:".
+- Rows with a label column holding a one-word noun and a checkbox with the sentence are now plain checkboxes:
+  "Maximize windows dragged to the top edge", "Tile windows dragged to the left or right edge"; "Corner barrier" got its own
+  checkbox text (was an empty checkbox beside a "Corner barrier:" label).
+- New hint under the preview: "Click an edge or corner of the preview to choose its action." (the preview is the main
+  control and nothing said it is clickable). Info line: "Push the mouse pointer against a screen edge or corner to run an action."
+- Old wording added to the aliases in ia/layout.json; relabel table inventory/relabel/kcm_kwinscreenedges.tsv. Markers on
+  the changed checkboxes and on the weak rows (edge-action, per-edge keys). Inventory --strict: 33 ok, 0 lost.
+HIG ids: HIG-001/005/006, HIG-013 (grouped, indented dependent option), HIG-019, HIG-057. Page-design 2, 3, 8.
+
+Speed cause (code): the KWinScreenEdgesConfig constructor ran monitorInit() (main.cpp), which iterates kwin/builtin-effects
+reading every effect JSON, lists scripted effect and script packages with KPackage and creates one KConfigSkeleton per
+effect/script, all before the first frame. Now it runs in a QTimer::singleShot(0) after the constructor and then loads the
+edge actions; save() is ignored until then (it would write "None" for every edge from empty menus).
+After-numbers: pending, manager will measure. Not built yet. Unconfirmed without a build: QFormLayout colspan rows and
+the Qt::AlignHCenter hint label in uic output; the ui connections to label_1 and the ratio label (kept by name).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ src/kcms/screenedges/main.cpp |  24 +++-
+ src/kcms/screenedges/main.h   |   2 +
+ src/kcms/screenedges/main.ui  | 210 ++++++++++++++++++++--------------
+ 3 files changed, 149 insertions(+), 87 deletions(-)
+
+diff --git a/src/kcms/screenedges/main.cpp b/src/kcms/screenedges/main.cpp
+index 034a11b..905ae5d 100644
+--- a/src/kcms/screenedges/main.cpp
++++ b/src/kcms/screenedges/main.cpp
+@@ -18,6 +18,7 @@
+ #include <KPackage/PackageLoader>
+ #include <KPluginFactory>
+ #include <QDBusConnection>
++#include <QTimer>
+ #include <QVBoxLayout>
+ 
+ #include "kwinscreenedgeconfigform.h"
+@@ -42,7 +43,13 @@ KWinScreenEdgesConfig::KWinScreenEdgesConfig(QObject *parent, const KPluginMetaD
+ 
+     addConfig(m_data->settings(), m_form);
+ 
+-    monitorInit();
++    // The effect, script and package scans in monitorInit() used to run here, before the first frame (cost grows with
++    // the installed effects and scripts). Run them one event-loop turn later and load the edge actions after that.
++    QTimer::singleShot(0, this, [this] {
++        monitorInit();
++        m_initialized = true;
++        load();
++    });
+ 
+     connect(this, &KWinScreenEdgesConfig::defaultsIndicatorsVisibleChanged, m_form, [this]() {
+         m_form->setDefaultsIndicatorsVisible(defaultsIndicatorsVisible());
+@@ -66,8 +73,10 @@ void KWinScreenEdgesConfig::load()
+         setting->load();
+     }
+ 
+-    monitorLoadSettings();
+-    monitorLoadDefaultSettings();
++    if (m_initialized) {
++        monitorLoadSettings();
++        monitorLoadDefaultSettings();
++    }
+     m_form->setRemainActiveOnFullscreen(m_data->settings()->remainActiveOnFullscreen());
+     m_form->setElectricBorderCornerRatio(m_data->settings()->electricBorderCornerRatio());
+     m_form->setDefaultElectricBorderCornerRatio(m_data->settings()->defaultElectricBorderCornerRatioValue());
+@@ -76,6 +85,9 @@ void KWinScreenEdgesConfig::load()
+ 
+ void KWinScreenEdgesConfig::save()
+ {
++    if (!m_initialized) {
++        return; // the edge menus are not filled yet, saving now would write "None" for every edge
++    }
+     monitorSaveSettings();
+     m_data->settings()->setRemainActiveOnFullscreen(m_form->remainActiveOnFullscreen());
+     m_data->settings()->setElectricBorderCornerRatio(m_form->electricBorderCornerRatio());
+@@ -157,6 +169,7 @@ void KWinScreenEdgesConfig::monitorInit()
+ 
+     // TODO: Find a better way to get the display name of the present windows,
+     // Maybe install metadata.json files?
++    // ksr: kcm_kwinscreenedges/edge-action-presentwindows
+     const QString presentWindowsName = i18n("Present Windows");
+     m_form->monitorAddItem(i18n("%1 - All Desktops", presentWindowsName));
+     m_form->monitorAddItem(i18n("%1 - Current Desktop", presentWindowsName));
+@@ -283,6 +296,11 @@ void KWinScreenEdgesConfig::monitorLoadDefaultSettings()
+ void KWinScreenEdgesConfig::monitorSaveSettings()
+ {
+     // Save ElectricBorderActions
++    // ksr: kcm_kwinscreenedges/cfg-ElectricBorders-Top
++    // ksr: kcm_kwinscreenedges/cfg-ElectricBorders-Right
++    // ksr: kcm_kwinscreenedges/cfg-ElectricBorders-Bottom
++    // ksr: kcm_kwinscreenedges/cfg-ElectricBorders-Left
++    // ksr: kcm_kwinscreenedges/edge-action
+     m_data->settings()->setTop(KWinScreenEdgesConfig::electricBorderActionToString(m_form->selectedEdgeItem(ElectricTop)));
+     m_data->settings()->setTopRight(KWinScreenEdgesConfig::electricBorderActionToString(m_form->selectedEdgeItem(ElectricTopRight)));
+     m_data->settings()->setRight(KWinScreenEdgesConfig::electricBorderActionToString(m_form->selectedEdgeItem(ElectricRight)));
+diff --git a/src/kcms/screenedges/main.h b/src/kcms/screenedges/main.h
+index 6cb7578..c772fd0 100644
+--- a/src/kcms/screenedges/main.h
++++ b/src/kcms/screenedges/main.h
+@@ -56,6 +56,8 @@ private:
+         EffectCount,
+     };
+ 
++    bool m_initialized = false;
++
+     void monitorInit();
+     void monitorLoadSettings();
+     void monitorLoadDefaultSettings();
+diff --git a/src/kcms/screenedges/main.ui b/src/kcms/screenedges/main.ui
+index 02494e6..de65ec8 100644
+--- a/src/kcms/screenedges/main.ui
++++ b/src/kcms/screenedges/main.ui
+@@ -7,7 +7,7 @@
+     <x>0</x>
+     <y>0</y>
+     <width>500</width>
+-    <height>525</height>
++    <height>480</height>
+    </rect>
+   </property>
+   <property name="minimumSize">
+@@ -20,29 +20,13 @@
+    <item>
+     <widget class="QLabel" name="infoLabel">
+      <property name="text">
+-      <string>You can trigger an action by pushing the mouse pointer against the corresponding screen edge or corner.</string>
++      <string>Push the mouse pointer against a screen edge or corner to run an action.</string>
+      </property>
+      <property name="wordWrap">
+       <bool>true</bool>
+      </property>
+     </widget>
+    </item>
+-   <item>
+-    <spacer name="verticalSpacer_2">
+-     <property name="orientation">
+-      <enum>Qt::Vertical</enum>
+-     </property>
+-     <property name="sizeType">
+-      <enum>QSizePolicy::Minimum</enum>
+-     </property>
+-     <property name="sizeHint" stdset="0">
+-      <size>
+-       <width>20</width>
+-       <height>20</height>
+-      </size>
+-     </property>
+-    </spacer>
+-   </item>
+    <item>
+     <widget class="KWin::Monitor" name="monitor" native="true">
+      <property name="minimumSize">
+@@ -56,71 +40,80 @@
+      </property>
+     </widget>
+    </item>
++   <item>
++    <widget class="QLabel" name="monitorHintLabel">
++     <property name="text">
++      <string>Click an edge or corner of the preview to choose its action.</string>
++     </property>
++     <property name="alignment">
++      <set>Qt::AlignHCenter|Qt::AlignTop</set>
++     </property>
++     <property name="wordWrap">
++      <bool>true</bool>
++     </property>
++    </widget>
++   </item>
+    <item>
+     <layout class="QFormLayout" name="formLayout">
+      <property name="formAlignment">
+       <set>Qt::AlignHCenter|Qt::AlignTop</set>
+      </property>
+-     <item row="0" column="0">
+-      <widget class="QLabel" name="quickMaximizeLabel">
+-       <property name="text">
+-        <string>&amp;Maximize:</string>
+-       </property>
+-       <property name="buddy">
+-        <cstring>kcfg_ElectricBorderMaximize</cstring>
++     <item row="0" column="0" colspan="2">
++      <widget class="QLabel" name="windowDraggingTitle">
++       <property name="font">
++        <font>
++         <bold>true</bold>
++        </font>
+        </property>
+-      </widget>
+-     </item>
+-     <item row="0" column="1">
+-      <widget class="QCheckBox" name="kcfg_ElectricBorderMaximize">
+        <property name="text">
+-        <string>Windows dragged to top edge</string>
++        <string>Window Dragging</string>
+        </property>
+       </widget>
+      </item>
+-     <item row="1" column="0">
+-      <widget class="QLabel" name="quickTileLabel">
++     <item row="1" column="0" colspan="2">
++      <!-- ksr: kcm_kwinscreenedges/ElectricBorderMaximize -->
++      <widget class="QCheckBox" name="kcfg_ElectricBorderMaximize">
+        <property name="text">
+-        <string>&amp;Tile:</string>
+-       </property>
+-       <property name="buddy">
+-        <cstring>kcfg_ElectricBorderTiling</cstring>
++        <string>Maximize windows dragged to the top edge</string>
+        </property>
+       </widget>
+      </item>
+-     <item row="1" column="1">
++     <item row="2" column="0" colspan="2">
++      <!-- ksr: kcm_kwinscreenedges/ElectricBorderTiling -->
+       <widget class="QCheckBox" name="kcfg_ElectricBorderTiling">
+        <property name="text">
+-        <string>Windows dragged to left or right edge</string>
+-       </property>
+-      </widget>
+-     </item>
+-     <item row="2" column="0">
+-      <widget class="QLabel" name="label">
+-       <property name="text">
+-        <string>Behavior:</string>
+-       </property>
+-      </widget>
+-     </item>
+-     <item row="2" column="1">
+-      <widget class="QCheckBox" name="remainActiveOnFullscreen">
+-       <property name="text">
+-        <string>Remain active when windows are fullscreen</string>
++        <string>Tile windows dragged to the left or right edge</string>
+        </property>
+       </widget>
+      </item>
+-     <item row="3" column="0">
+-      <widget class="QLabel" name="electricBorderCornerRatioLabel">
+-       <property name="text">
+-        <string>Trigger &amp;quarter tiling in:</string>
+-       </property>
+-       <property name="buddy">
+-        <cstring>electricBorderCornerRatioSpin</cstring>
+-       </property>
+-      </widget>
+-     </item>
+-     <item row="3" column="1">
++     <item row="3" column="0" colspan="2">
+       <layout class="QHBoxLayout" name="horizontalLayout">
++       <item>
++        <spacer name="tilingIndent">
++         <property name="orientation">
++          <enum>Qt::Horizontal</enum>
++         </property>
++         <property name="sizeType">
++          <enum>QSizePolicy::Fixed</enum>
++         </property>
++         <property name="sizeHint" stdset="0">
++          <size>
++           <width>24</width>
++           <height>20</height>
++          </size>
++         </property>
++        </spacer>
++       </item>
++       <item>
++        <widget class="QLabel" name="electricBorderCornerRatioLabel">
++         <property name="text">
++          <string>Trigger &amp;quarter tiling in:</string>
++         </property>
++         <property name="buddy">
++          <cstring>electricBorderCornerRatioSpin</cstring>
++         </property>
++        </widget>
++       </item>
+        <item>
+         <widget class="QSpinBox" name="electricBorderCornerRatioSpin">
+          <property name="enabled">
+@@ -150,6 +143,19 @@
+          </property>
+         </widget>
+        </item>
++       <item>
++        <spacer name="tilingStretch">
++         <property name="orientation">
++          <enum>Qt::Horizontal</enum>
++         </property>
++         <property name="sizeHint" stdset="0">
++          <size>
++           <width>0</width>
++           <height>0</height>
++          </size>
++         </property>
++        </spacer>
++       </item>
+       </layout>
+      </item>
+      <item row="4" column="1">
+@@ -163,12 +169,24 @@
+        <property name="sizeHint" stdset="0">
+         <size>
+          <width>20</width>
+-         <height>4</height>
++         <height>8</height>
+         </size>
+        </property>
+       </spacer>
+      </item>
+-     <item row="5" column="0">
++     <item row="5" column="0" colspan="2">
++      <widget class="QLabel" name="edgeBehaviorTitle">
++       <property name="font">
++        <font>
++         <bold>true</bold>
++        </font>
++       </property>
++       <property name="text">
++        <string>Edge Behavior</string>
++       </property>
++      </widget>
++     </item>
++     <item row="6" column="0">
+       <widget class="QLabel" name="desktopSwitchLabel">
+        <property name="toolTip">
+         <string>Change desktop when the mouse pointer is pushed against the edge of the screen</string>
+@@ -181,7 +199,7 @@
+        </property>
+       </widget>
+      </item>
+-     <item row="5" column="1">
++     <item row="6" column="1">
+       <widget class="QComboBox" name="kcfg_ElectricBorders">
+        <item>
+         <property name="text">
+@@ -200,7 +218,7 @@
+        </item>
+       </widget>
+      </item>
+-     <item row="6" column="0">
++     <item row="7" column="0">
+       <widget class="QLabel" name="activationDelayLabel">
+        <property name="toolTip">
+         <string>Amount of time required for the mouse pointer to be pushed against the edge of the screen before the action is triggered</string>
+@@ -213,7 +231,7 @@
+        </property>
+       </widget>
+      </item>
+-     <item row="6" column="1">
++     <item row="7" column="1">
+       <widget class="QSpinBox" name="kcfg_ElectricBorderDelay">
+        <property name="suffix">
+         <string> ms</string>
+@@ -229,11 +247,8 @@
+        </property>
+       </widget>
+      </item>
+-     <item row="7" column="0">
++     <item row="8" column="0">
+       <widget class="QLabel" name="triggerCooldownLabel">
+-       <property name="enabled">
+-        <bool>true</bool>
+-       </property>
+        <property name="toolTip">
+         <string>Amount of time required after triggering an action until the next trigger can occur</string>
+        </property>
+@@ -245,11 +260,8 @@
+        </property>
+       </widget>
+      </item>
+-     <item row="7" column="1">
++     <item row="8" column="1">
+       <widget class="QSpinBox" name="kcfg_ElectricBorderCooldown">
+-       <property name="enabled">
+-        <bool>true</bool>
+-       </property>
+        <property name="suffix">
+         <string> ms</string>
+        </property>
+@@ -264,17 +276,44 @@
+        </property>
+       </widget>
+      </item>
+-     <item row="8" column="0">
+-      <widget class="QLabel" name="CornerBarrierLabel">
++     <item row="9" column="0" colspan="2">
++      <!-- ksr: kcm_kwinscreenedges/remainActiveOnFullscreen -->
++      <widget class="QCheckBox" name="remainActiveOnFullscreen">
+        <property name="text">
+-        <string>&amp;Corner barrier:</string>
++        <string>Remain active when windows are fullscreen</string>
+        </property>
+-       <property name="buddy">
+-        <cstring>kcfg_CornerBarrier</cstring>
++      </widget>
++     </item>
++     <item row="10" column="1">
++      <spacer name="verticalSpacer_4">
++       <property name="orientation">
++        <enum>Qt::Vertical</enum>
++       </property>
++       <property name="sizeType">
++        <enum>QSizePolicy::Fixed</enum>
++       </property>
++       <property name="sizeHint" stdset="0">
++        <size>
++         <width>20</width>
++         <height>8</height>
++        </size>
++       </property>
++      </spacer>
++     </item>
++     <item row="11" column="0" colspan="2">
++      <widget class="QLabel" name="multipleScreensTitle">
++       <property name="font">
++        <font>
++         <bold>true</bold>
++        </font>
++       </property>
++       <property name="text">
++        <string>Multiple Screens</string>
+        </property>
+       </widget>
+      </item>
+-     <item row="8" column="1">
++     <item row="12" column="0" colspan="2">
++      <!-- ksr: kcm_kwinscreenedges/CornerBarrier -->
+       <widget class="QCheckBox" name="kcfg_CornerBarrier">
+        <property name="whatsThis">
+         <string>Here you can enable or disable the virtual corner barrier between screens. The barrier prevents the pointer from moving to another screen when it is already touching a screen corner. This makes it easier to trigger user interface elements like maximized windows' close buttons when using multiple screens.</string>
+@@ -282,9 +321,12 @@
+        <property name="toolTip">
+         <string comment="@info:tooltip">Prevents the pointer from crossing at screen corners.</string>
+        </property>
++       <property name="text">
++        <string>Corner barrier</string>
++       </property>
+       </widget>
+      </item>
+-     <item row="9" column="0">
++     <item row="13" column="0">
+       <widget class="QLabel" name="EdgeBarrierLabel">
+        <property name="text">
+         <string>&amp;Edge barrier:</string>
+@@ -294,7 +336,7 @@
+        </property>
+       </widget>
+      </item>
+-     <item row="9" column="1">
++     <item row="13" column="1">
+       <widget class="QSpinBox" name="kcfg_EdgeBarrier">
+        <property name="whatsThis">
+         <string>Here you can set size of the edge barrier between different screens. The barrier adds additional distance you have to move your pointer before it crosses the edge onto the other screen. This makes it easier to access user interface elements like Plasma Panels that are located on an edge between screens.</string>

@@ -1,0 +1,1172 @@
+From 6c9458debbc13a6d60ec15401b11b405eb6c2a02 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 08:59:49 +0500
+Subject: [PATCH 10/34] System Settings: search finds settings and leads to the
+ control
+
+The search field now also matches the settings inside pages. A result shows
+the text of the setting with Category > Page > Section below it. Opening one
+opens the page, scrolls the control into view and frames it for a moment. It
+works for QML pages (QQuickItem tree) and QtWidgets pages without a change
+in the pages. Down moves to the results, Enter opens the first, Escape clears.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ app/CMakeLists.txt           |   6 +
+ app/ModuleView.cpp           |   7 +
+ app/ModuleView.h             |   5 +
+ app/SettingLocator.cpp       | 318 +++++++++++++++++++++++++++++++
+ app/SettingLocator.h         |  64 +++++++
+ app/SettingsSearchModel.cpp  | 353 +++++++++++++++++++++++++++++++++++
+ app/SettingsSearchModel.h    | 107 +++++++++++
+ app/SidebarMode.cpp          |  39 +++-
+ app/SidebarMode.h            |  11 ++
+ app/qml/CategoriesPage.qml   |  27 ++-
+ app/qml/SettingHighlight.qml |  39 ++++
+ 11 files changed, 972 insertions(+), 4 deletions(-)
+ create mode 100644 app/SettingLocator.cpp
+ create mode 100644 app/SettingLocator.h
+ create mode 100644 app/SettingsSearchModel.cpp
+ create mode 100644 app/SettingsSearchModel.h
+ create mode 100644 app/qml/SettingHighlight.qml
+
+diff --git a/app/CMakeLists.txt b/app/CMakeLists.txt
+index bdb78da..95b26f8 100644
+--- a/app/CMakeLists.txt
++++ b/app/CMakeLists.txt
+@@ -21,6 +21,11 @@ target_sources(systemsettings PRIVATE
+     MenuModel.h
+     MenuProxyModel.cpp
+     MenuProxyModel.h
++    SettingsSearchModel.cpp
++    SettingsSearchModel.h
++    settingsindex_p.h
++    SettingLocator.cpp
++    SettingLocator.h
+     SettingsLayoutTree.cpp
+     SettingsLayoutTree.h
+     settingslayout_p.h
+@@ -34,6 +39,7 @@ ecm_target_qml_sources(systemsettings SOURCES
+     qml/HamburgerMenuButton.qml
+     qml/IntroPage.qml
+     qml/Main.qml
++    qml/SettingHighlight.qml
+     qml/SideBarItem.qml
+     qml/SubCategoryPage.qml
+     RESOURCES
+diff --git a/app/ModuleView.cpp b/app/ModuleView.cpp
+index cf17f6e..30fff36 100644
+--- a/app/ModuleView.cpp
++++ b/app/ModuleView.cpp
+@@ -717,6 +717,13 @@ void ModuleView::requestActivation(const QVariantList &args)
+     }
+ }
+ 
++QWidget *ModuleView::currentPageContent() const
++{
++    KPageWidgetItem *page = d->mPageWidget->currentPage();
++    auto scrollArea = page ? qobject_cast<QScrollArea *>(page->widget()) : nullptr;
++    return scrollArea ? scrollArea->widget() : nullptr;
++}
++
+ KPluginMetaData ModuleView::activeModuleMetadata() const
+ {
+     KCModule *activeModule = d->mPages.value(d->mPageWidget->currentPage());
+diff --git a/app/ModuleView.h b/app/ModuleView.h
+index ed30d03..9cfe84f 100644
+--- a/app/ModuleView.h
++++ b/app/ModuleView.h
+@@ -140,6 +140,11 @@ public:
+      */
+     KPluginMetaData activeModuleMetadata() const;
+ 
++    /**
++     * The widget of the page that is shown (the contents of its scroll area), or nullptr if there is none.
++     */
++    QWidget *currentPageContent() const;
++
+ public Q_SLOTS:
+     /**
+      * Loads the module specified by menuItem.\n
+diff --git a/app/SettingLocator.cpp b/app/SettingLocator.cpp
+new file mode 100644
+index 0000000..040e8a9
+--- /dev/null
++++ b/app/SettingLocator.cpp
+@@ -0,0 +1,318 @@
++/*
++ * SPDX-FileCopyrightText: 2026 KDE Contributors
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "SettingLocator.h"
++
++#include "ModuleView.h"
++#include "SettingsSearchModel.h"
++#include "systemsettings_app_debug.h"
++
++#include <KPluginMetaData>
++
++#include <QAbstractButton>
++#include <QGroupBox>
++#include <QLabel>
++#include <QPainter>
++#include <QPropertyAnimation>
++#include <QQmlComponent>
++#include <QQmlEngine>
++#include <QQuickItem>
++#include <QQuickWidget>
++#include <QRegularExpression>
++#include <QScrollArea>
++#include <QStyle>
++
++#include <cmath>
++
++using namespace Qt::StringLiterals;
++
++namespace
++{
++// About one second of frames
++constexpr int retryInterval = 50;
++constexpr int maxTries = 20;
++constexpr int highlightDuration = 1500;
++
++/**
++ * The frame around a control of a QtWidgets page. Fades out after a moment, unless animations are turned off.
++ */
++class WidgetHighlight : public QWidget
++{
++    Q_OBJECT
++    Q_PROPERTY(qreal opacity MEMBER m_opacity)
++
++public:
++    WidgetHighlight(QWidget *target, QWidget *content)
++        : QWidget(content)
++    {
++        setAttribute(Qt::WA_TransparentForMouseEvents);
++        setAttribute(Qt::WA_NoSystemBackground);
++        const int margin = style()->pixelMetric(QStyle::PM_DefaultFrameWidth) + 2;
++        setGeometry(QRect(target->mapTo(content, QPoint(0, 0)), target->size()).adjusted(-margin, -margin, margin, margin));
++        raise();
++        show();
++
++        QTimer::singleShot(highlightDuration, this, [this]() {
++            const int duration = style()->styleHint(QStyle::SH_Widget_Animation_Duration);
++            if (duration <= 0) {
++                deleteLater();
++                return;
++            }
++            auto fade = new QPropertyAnimation(this, "opacity", this);
++            fade->setDuration(duration);
++            fade->setEndValue(0.0);
++            connect(fade, &QPropertyAnimation::valueChanged, this, qOverload<>(&QWidget::update));
++            connect(fade, &QPropertyAnimation::finished, this, &QObject::deleteLater);
++            fade->start();
++        });
++    }
++
++protected:
++    void paintEvent(QPaintEvent *) override
++    {
++        QPainter painter(this);
++        painter.setRenderHint(QPainter::Antialiasing);
++        painter.setOpacity(m_opacity);
++        QPen pen(palette().color(QPalette::Highlight), 2);
++        painter.setPen(pen);
++        painter.setBrush(Qt::NoBrush);
++        const qreal radius = style()->pixelMetric(QStyle::PM_DefaultFrameWidth) * 2 + 1;
++        painter.drawRoundedRect(QRectF(rect()).adjusted(1, 1, -1, -1), radius, radius);
++    }
++
++private:
++    qreal m_opacity = 1.0;
++};
++
++QString stripMarkup(const QString &text)
++{
++    static const QRegularExpression markup(u"<[^>]*>"_s);
++    return text.contains(u'<') ? QString(text).remove(markup) : text;
++}
++
++QString stringProperty(const QObject *object, const char *name)
++{
++    const QVariant value = object->property(name);
++    return value.metaType().id() == QMetaType::QString ? value.toString() : QString();
++}
++
++/**
++ * Kirigami.FormData.label of an item: an attached object, which is a child of the item
++ */
++QString formDataLabel(const QQuickItem *item)
++{
++    const auto children = item->children();
++    for (const QObject *child : children) {
++        if (QByteArray(child->metaObject()->className()).endsWith("FormLayoutAttached")) {
++            return stringProperty(child, "label");
++        }
++    }
++    return {};
++}
++
++bool isFlickable(const QQuickItem *item)
++{
++    return item->inherits("QQuickFlickable");
++}
++
++void scrollQuickItemIntoView(QQuickItem *item)
++{
++    for (QQuickItem *flick = item->parentItem(); flick; flick = flick->parentItem()) {
++        if (!isFlickable(flick)) {
++            continue;
++        }
++        const qreal viewHeight = flick->height();
++        const qreal contentHeight = flick->property("contentHeight").toReal();
++        if (contentHeight <= viewHeight + 1) {
++            continue; // does not scroll
++        }
++        auto *content = flick->property("contentItem").value<QQuickItem *>();
++        if (!content) {
++            continue;
++        }
++        const qreal top = item->mapToItem(content, QPointF(0, 0)).y();
++        const qreal height = item->height();
++        const qreal contentY = flick->property("contentY").toReal();
++        if (top >= contentY && top + height <= contentY + viewHeight) {
++            continue; // already visible
++        }
++        const qreal originY = flick->property("originY").toReal();
++        const qreal minY = originY - flick->property("topMargin").toReal();
++        const qreal maxY = qMax(minY, originY + contentHeight - viewHeight + flick->property("bottomMargin").toReal());
++        // In the middle of the view when there is room
++        const qreal wanted = top - (viewHeight - height) / 2;
++        flick->setProperty("contentY", qBound(minY, wanted, maxY));
++    }
++}
++
++void highlightQuickItem(QQuickItem *item)
++{
++    QQmlEngine *engine = qmlEngine(item);
++    if (!engine) {
++        return;
++    }
++    QQmlComponent component(engine, QUrl(u"qrc:/qt/qml/org/kde/systemsettings/SettingHighlight.qml"_s));
++    if (component.isError()) {
++        qCWarning(SYSTEMSETTINGS_APP_LOG) << component.errors();
++        return;
++    }
++    // The frame is a child of the control, so it moves with it and is destroyed with it
++    QObject *frame = component.createWithInitialProperties({{u"parent"_s, QVariant::fromValue(item)}});
++    if (!frame) {
++        qCWarning(SYSTEMSETTINGS_APP_LOG) << component.errors();
++    }
++}
++}
++
++SettingLocator::SettingLocator(ModuleView *view, QObject *parent)
++    : QObject(parent)
++    , m_view(view)
++{
++    m_timer.setInterval(retryInterval);
++    connect(&m_timer, &QTimer::timeout, this, &SettingLocator::attempt);
++}
++
++QString SettingLocator::normalised(const QString &text)
++{
++    return SettingsSearchModel::fold(SettingsSearchModel::visibleText(stripMarkup(text)));
++}
++
++void SettingLocator::locate(const QString &text, bool prefixOnly)
++{
++    m_timer.stop();
++    m_text = normalised(text);
++    m_prefixOnly = prefixOnly;
++    m_tries = 0;
++    if (m_text.isEmpty() || !m_view) {
++        return;
++    }
++    m_pluginId = m_view->activeModuleMetadata().pluginId();
++    // The page may not exist yet (it is created while the click is handled) or still be empty
++    QTimer::singleShot(0, this, &SettingLocator::attempt);
++}
++
++bool SettingLocator::matches(const QString &candidate) const
++{
++    if (candidate.isEmpty()) {
++        return false;
++    }
++    const QString text = normalised(candidate);
++    if (text == m_text) {
++        return true;
++    }
++    return m_prefixOnly && m_text.size() >= 3 && text.startsWith(m_text);
++}
++
++void SettingLocator::attempt()
++{
++    if (!m_view || m_view->activeModuleMetadata().pluginId() != m_pluginId) {
++        m_timer.stop();
++        return; // the user went elsewhere
++    }
++    QWidget *content = m_view->currentPageContent();
++    if (content && (tryQuick(content) || tryWidgets(content))) {
++        m_timer.stop();
++        return;
++    }
++    if (++m_tries >= maxTries) {
++        m_timer.stop();
++        qCDebug(SYSTEMSETTINGS_APP_LOG) << "No control with the text" << m_text << "found on" << m_pluginId;
++        return;
++    }
++    m_timer.start();
++}
++
++QQuickItem *SettingLocator::findItem(QQuickItem *item) const
++{
++    if (!item->isVisible()) {
++        return nullptr; // this includes everything below it
++    }
++    if (item->width() > 0 && item->height() > 0) {
++        if (matches(stringProperty(item, "text")) || matches(stringProperty(item, "title")) || matches(stringProperty(item, "label"))
++            || matches(formDataLabel(item))) {
++            return item;
++        }
++    }
++    const auto children = item->childItems();
++    for (QQuickItem *child : children) {
++        if (QQuickItem *found = findItem(child)) {
++            return found;
++        }
++    }
++    return nullptr;
++}
++
++bool SettingLocator::tryQuick(QWidget *content)
++{
++    QList<QQuickWidget *> quickWidgets = content->findChildren<QQuickWidget *>();
++    if (auto self = qobject_cast<QQuickWidget *>(content)) {
++        quickWidgets.prepend(self);
++    }
++    for (QQuickWidget *quickWidget : std::as_const(quickWidgets)) {
++        QQuickItem *root = quickWidget->rootObject();
++        if (!root) {
++            continue;
++        }
++        QQuickItem *item = findItem(root);
++        if (!item) {
++            continue;
++        }
++        scrollQuickItemIntoView(item);
++        highlightQuickItem(item);
++        if (item->activeFocusOnTab()) {
++            quickWidget->setFocus(Qt::OtherFocusReason);
++            item->forceActiveFocus(Qt::OtherFocusReason);
++        }
++        return true;
++    }
++    return false;
++}
++
++QWidget *SettingLocator::findWidget(QWidget *content) const
++{
++    const auto widgets = content->findChildren<QWidget *>();
++    for (QWidget *widget : widgets) {
++        if (!widget->isVisibleTo(content) || widget->width() <= 0 || widget->height() <= 0) {
++            continue;
++        }
++        if (auto label = qobject_cast<QLabel *>(widget)) {
++            if (matches(label->text())) {
++                return label->buddy() ? label->buddy() : label;
++            }
++        } else if (auto button = qobject_cast<QAbstractButton *>(widget)) {
++            if (matches(button->text())) {
++                return button;
++            }
++        } else if (auto group = qobject_cast<QGroupBox *>(widget)) {
++            if (matches(group->title())) {
++                return group;
++            }
++        }
++    }
++    return nullptr;
++}
++
++bool SettingLocator::tryWidgets(QWidget *content)
++{
++    QWidget *target = findWidget(content);
++    if (!target) {
++        return false;
++    }
++    for (QWidget *parent = target->parentWidget(); parent; parent = parent->parentWidget()) {
++        if (auto scrollArea = qobject_cast<QScrollArea *>(parent)) {
++            const int margin = target->fontMetrics().height() * 2;
++            scrollArea->ensureWidgetVisible(target, margin, margin);
++        }
++    }
++    if (target->focusPolicy() != Qt::NoFocus) {
++        target->setFocus(Qt::OtherFocusReason);
++    }
++    new WidgetHighlight(target, content);
++    return true;
++}
++
++#include "SettingLocator.moc"
++#include "moc_SettingLocator.cpp"
+diff --git a/app/SettingLocator.h b/app/SettingLocator.h
+new file mode 100644
+index 0000000..3566a70
+--- /dev/null
++++ b/app/SettingLocator.h
+@@ -0,0 +1,64 @@
++/*
++ * SPDX-FileCopyrightText: 2026 KDE Contributors
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef SETTINGLOCATOR_H
++#define SETTINGLOCATOR_H
++
++#include <QObject>
++#include <QPointer>
++#include <QString>
++#include <QTimer>
++
++class ModuleView;
++class QQuickItem;
++class QWidget;
++
++/**
++ * @brief Finds the control of a setting on the page that is shown, scrolls it into view and highlights it
++ *
++ * Works on any page, no page has to cooperate: it looks for a visible control, label or group with the given text,
++ * in the QtQuick item tree of a QML page or in the widgets of a QtWidgets page. Pages that fill themselves
++ * asynchronously are tried again for about a second.
++ */
++class SettingLocator : public QObject
++{
++    Q_OBJECT
++
++public:
++    explicit SettingLocator(ModuleView *view, QObject *parent = nullptr);
++
++    /**
++     * Looks for the control on the page that is shown now.
++     *
++     * @param text what the control says, as returned by SettingsSearchModel::controlText()
++     * @param prefixOnly the control's text has a value after the given text (a %1 placeholder)
++     */
++    void locate(const QString &text, bool prefixOnly);
++
++    /**
++     * Normalises a text the way the controls' texts are compared.
++     */
++    static QString normalised(const QString &text);
++
++private:
++    void attempt();
++    void finish(bool found);
++    bool matches(const QString &candidate) const;
++
++    QQuickItem *findItem(QQuickItem *root) const;
++    QWidget *findWidget(QWidget *root) const;
++    bool tryQuick(QWidget *pageContent);
++    bool tryWidgets(QWidget *pageContent);
++
++    QPointer<ModuleView> m_view;
++    QTimer m_timer;
++    QString m_pluginId;
++    QString m_text;
++    bool m_prefixOnly = false;
++    int m_tries = 0;
++};
++
++#endif
+diff --git a/app/SettingsSearchModel.cpp b/app/SettingsSearchModel.cpp
+new file mode 100644
+index 0000000..2a603b0
+--- /dev/null
++++ b/app/SettingsSearchModel.cpp
+@@ -0,0 +1,353 @@
++/*
++ * SPDX-FileCopyrightText: 2026 KDE Contributors
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "SettingsSearchModel.h"
++
++#include "MenuItem.h"
++#include "MenuModel.h"
++#include "settingsindex_p.h"
++
++#include <KLocalizedString>
++#include <KPluginMetaData>
++
++#include <QChar>
++#include <QHash>
++#include <QRegularExpression>
++#include <QSet>
++
++#include <algorithm>
++
++using namespace Qt::StringLiterals;
++
++namespace
++{
++// More would only be noise, and the list is meant to be read
++constexpr int maxSettingResults = 50;
++
++QString joinBreadcrumb(const QString &first, const QString &second)
++{
++    return i18ndc("systemsettings", "@item breadcrumb in search results, e.g. Appearance › Colors", "%1 › %2", first, second);
++}
++
++QStringList words(const QString &foldedText)
++{
++    QStringList list;
++    QString current;
++    for (const QChar c : foldedText) {
++        if (c.isLetterOrNumber()) {
++            current += c;
++        } else if (!current.isEmpty()) {
++            list << current;
++            current.clear();
++        }
++    }
++    if (!current.isEmpty()) {
++        list << current;
++    }
++    return list;
++}
++
++bool containsAll(const QString &haystack, const QStringList &needles)
++{
++    return std::all_of(needles.cbegin(), needles.cend(), [&haystack](const QString &needle) {
++        return haystack.contains(needle);
++    });
++}
++
++bool startsEveryWord(const QStringList &tokens, const QStringList &needles)
++{
++    return std::all_of(needles.cbegin(), needles.cend(), [&tokens](const QString &needle) {
++        return std::any_of(tokens.cbegin(), tokens.cend(), [&needle](const QString &token) {
++            return token.startsWith(needle);
++        });
++    });
++}
++}
++
++struct SettingsSearchModel::Page {
++    MenuItem *item;
++    QString name;
++    QString foldedName;
++    QStringList nameWords;
++    QString haystack; // folded name, keywords and breadcrumb
++};
++
++struct SettingsSearchModel::Setting {
++    const SettingsIndex::Entry *entry;
++    int page;
++    QString text; // as shown
++    QString foldedText;
++    QString foldedSection;
++    bool hasPlaceholder = false;
++};
++
++SettingsSearchModel::SettingsSearchModel(MenuItem *root, QObject *parent)
++    : QAbstractListModel(parent)
++{
++    collectPages(root);
++
++    QHash<QString, int> pageForKcm;
++    for (int i = 0; i < m_pages.size(); ++i) {
++        MenuItem *item = m_pages.at(i).item;
++        if (item->isLibrary()) {
++            pageForKcm.insert(item->metaData().pluginId(), i);
++        }
++    }
++    for (const SettingsIndex::Entry &entry : SettingsIndex::entries) {
++        const auto page = pageForKcm.constFind(QString::fromLatin1(entry.kcm));
++        if (page == pageForKcm.cend()) {
++            continue; // the page is not installed or not in the tree
++        }
++        Setting setting;
++        setting.entry = &entry;
++        setting.page = *page;
++        m_settings.append(setting);
++    }
++}
++
++SettingsSearchModel::~SettingsSearchModel() = default;
++
++void SettingsSearchModel::collectPages(MenuItem *item)
++{
++    for (MenuItem *child : std::as_const(item->children())) {
++        if (child->menu()) {
++            collectPages(child);
++            continue;
++        }
++        if (child->isHiddenInSearch()) {
++            continue;
++        }
++        Page page;
++        page.item = child;
++        page.name = child->name();
++        page.foldedName = fold(page.name);
++        page.nameWords = words(page.foldedName);
++        // Hidden but searchable pages count, like the ones that are in the sidebar
++        page.haystack = fold(child->keywords().join(u' ') + u' ' + child->breadcrumb());
++        m_pages.append(page);
++    }
++}
++
++QString SettingsSearchModel::fold(const QString &text)
++{
++    QString decomposed = text.normalized(QString::NormalizationForm_D);
++    decomposed.removeIf([](QChar c) {
++        return c.category() == QChar::Mark_NonSpacing;
++    });
++    return decomposed.toCaseFolded();
++}
++
++QString SettingsSearchModel::visibleText(const QString &translated)
++{
++    static const QRegularExpression markup(u"<[^>]*>|%(?:[0-9]+|n|L[0-9]+)"_s);
++    static const QRegularExpression mnemonic(u"&(?!&)"_s);
++    static const QRegularExpression spaces(u"\\s+"_s);
++    QString text = translated;
++    text.remove(markup);
++    text.remove(mnemonic);
++    text.replace(u"&&"_s, u"&"_s);
++    text.replace(spaces, u" "_s);
++    text = text.trimmed();
++    while (text.endsWith(u':') || text.endsWith(u"："_s)) {
++        text.chop(1);
++        text = text.trimmed();
++    }
++    return text;
++}
++
++void SettingsSearchModel::translateSettings()
++{
++    if (m_translated) {
++        return;
++    }
++    m_translated = true;
++    static const QRegularExpression placeholder(u"%(?:[0-9]+|n|L[0-9]+)"_s);
++    for (Setting &setting : m_settings) {
++        const SettingsIndex::Entry &entry = *setting.entry;
++        // The text is the KCM's own source string: its translation is in the KCM's domain, not ours
++        const QString translated = entry.domain ? i18nd(entry.domain, entry.text) : QString::fromUtf8(entry.text);
++        setting.hasPlaceholder = translated.contains(placeholder);
++        setting.text = visibleText(translated);
++        if (setting.text.isEmpty()) {
++            setting.text = visibleText(QString::fromUtf8(entry.text));
++        }
++        setting.foldedText = fold(setting.text);
++        setting.foldedSection = fold(QString::fromUtf8(entry.section));
++    }
++}
++
++QHash<int, QByteArray> SettingsSearchModel::roleNames() const
++{
++    QHash<int, QByteArray> names = QAbstractListModel::roleNames();
++    names[MenuModel::DepthRole] = "depth";
++    names[MenuModel::IsCategoryRole] = "isCategory";
++    names[MenuModel::IsKCMRole] = "isKCM";
++    names[MenuModel::DefaultIndicatorRole] = "showDefaultIndicator";
++    names[MenuModel::IconNameRole] = "iconName";
++    names[MenuModel::BreadcrumbRole] = "breadcrumb";
++    names[MenuModel::DescriptionRole] = "description";
++    names[ResultKindRole] = "resultKind";
++    return names;
++}
++
++int SettingsSearchModel::rowCount(const QModelIndex &parent) const
++{
++    return parent.isValid() ? 0 : m_results.size();
++}
++
++QVariant SettingsSearchModel::data(const QModelIndex &index, int role) const
++{
++    if (!index.isValid() || index.row() >= m_results.size()) {
++        return {};
++    }
++    const Result &result = m_results.at(index.row());
++    MenuItem *item = itemAt(index.row());
++    const bool isSetting = result.kind == SettingResult;
++
++    switch (role) {
++    case Qt::DisplayRole:
++        return isSetting ? m_settings.at(result.index).text : item->name();
++    case MenuModel::MenuItemRole:
++        return QVariant::fromValue(item);
++    case MenuModel::IconNameRole:
++        return item->iconName();
++    case MenuModel::BreadcrumbRole: {
++        if (!isSetting) {
++            return item->breadcrumb();
++        }
++        // Category › Page › Section
++        const QString section = QString::fromUtf8(m_settings.at(result.index).entry->section);
++        const QString path = item->breadcrumb().isEmpty() ? item->name() : joinBreadcrumb(item->breadcrumb(), item->name());
++        return section.isEmpty() ? path : joinBreadcrumb(path, section);
++    }
++    case MenuModel::DescriptionRole:
++        return isSetting ? QString() : item->comment();
++    case MenuModel::DepthRole:
++        return 0;
++    case MenuModel::IsCategoryRole:
++        return false;
++    case MenuModel::IsKCMRole:
++        return true;
++    case MenuModel::DefaultIndicatorRole:
++        return item->showDefaultIndicator();
++    case ResultKindRole:
++        return result.kind;
++    default:
++        return {};
++    }
++}
++
++MenuItem *SettingsSearchModel::itemAt(int row) const
++{
++    if (row < 0 || row >= m_results.size()) {
++        return nullptr;
++    }
++    const Result &result = m_results.at(row);
++    return m_pages.at(result.kind == PageResult ? result.index : m_settings.at(result.index).page).item;
++}
++
++SettingsSearchModel::ResultKind SettingsSearchModel::kindAt(int row) const
++{
++    return row >= 0 && row < m_results.size() ? m_results.at(row).kind : PageResult;
++}
++
++QString SettingsSearchModel::controlText(int row) const
++{
++    if (kindAt(row) != SettingResult) {
++        return {};
++    }
++    return m_settings.at(m_results.at(row).index).text;
++}
++
++bool SettingsSearchModel::controlTextHasPlaceholder(int row) const
++{
++    return kindAt(row) == SettingResult && m_settings.at(m_results.at(row).index).hasPlaceholder;
++}
++
++QString SettingsSearchModel::query() const
++{
++    return m_query;
++}
++
++void SettingsSearchModel::setQuery(const QString &query)
++{
++    if (query == m_query) {
++        return;
++    }
++    m_query = query;
++
++    struct Ranked {
++        int rank;
++        int order; // position among results of the same rank
++        Result result;
++        QString sortKey;
++    };
++    QList<Ranked> ranked;
++
++    const QString foldedQuery = fold(query.simplified());
++    const QStringList queryWords = words(foldedQuery);
++    if (!queryWords.isEmpty()) {
++        translateSettings();
++
++        for (int i = 0; i < m_pages.size(); ++i) {
++            const Page &page = m_pages.at(i);
++            int rank;
++            if (page.foldedName == foldedQuery) {
++                rank = 0;
++            } else if (startsEveryWord(page.nameWords, queryWords)) {
++                rank = 1;
++            } else if (containsAll(page.haystack, queryWords)) {
++                rank = 4;
++            } else {
++                continue;
++            }
++            ranked.append({rank, i, {i, PageResult}, QString()});
++        }
++
++        int settingCount = 0;
++        QList<Ranked> settings;
++        for (int i = 0; i < m_settings.size(); ++i) {
++            const Setting &setting = m_settings.at(i);
++            const Page &page = m_pages.at(setting.page);
++            const QString haystack = setting.foldedText + u' ' + setting.foldedSection + u' ' + page.haystack;
++            if (!containsAll(haystack, queryWords)) {
++                continue;
++            }
++            const int rank = setting.foldedText.startsWith(foldedQuery) ? 2 : 5;
++            settings.append({rank, i, {i, SettingResult}, setting.foldedText});
++        }
++        std::stable_sort(settings.begin(), settings.end(), [](const Ranked &a, const Ranked &b) {
++            return a.rank != b.rank ? a.rank < b.rank : a.sortKey.size() < b.sortKey.size();
++        });
++        // A control with the same text twice on a page (e.g. in two sections) is one result
++        QSet<QPair<int, QString>> seen;
++        for (const Ranked &r : std::as_const(settings)) {
++            if (settingCount >= maxSettingResults) {
++                break;
++            }
++            const Setting &setting = m_settings.at(r.result.index);
++            if (seen.contains({setting.page, setting.foldedText})) {
++                continue;
++            }
++            seen.insert({setting.page, setting.foldedText});
++            ranked.append(r);
++            ++settingCount;
++        }
++        // Pages keep the order of the tree within a rank; settings the order of their length
++        std::stable_sort(ranked.begin(), ranked.end(), [](const Ranked &a, const Ranked &b) {
++            return a.rank < b.rank;
++        });
++    }
++
++    beginResetModel();
++    m_results.clear();
++    for (const Ranked &r : std::as_const(ranked)) {
++        m_results.append(r.result);
++    }
++    endResetModel();
++}
++
++#include "moc_SettingsSearchModel.cpp"
+diff --git a/app/SettingsSearchModel.h b/app/SettingsSearchModel.h
+new file mode 100644
+index 0000000..00c3897
+--- /dev/null
++++ b/app/SettingsSearchModel.h
+@@ -0,0 +1,107 @@
++/*
++ * SPDX-FileCopyrightText: 2026 KDE Contributors
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef SETTINGSSEARCHMODEL_H
++#define SETTINGSSEARCHMODEL_H
++
++#include <QAbstractListModel>
++#include <QList>
++#include <QString>
++
++class MenuItem;
++
++namespace SettingsIndex
++{
++struct Entry;
++}
++
++/**
++ * @brief The results of the System Settings search: pages and the settings inside them
++ *
++ * A flat list. Pages are matched by their name and keywords, settings by the text of the control (from the generated
++ * index, see settingsindex_p.h), its section and the page they are on. The text of a setting is translated lazily,
++ * the first time a query is set, with the translation domain of the KCM that owns it.
++ *
++ * Matching ignores case and accents; every word of the query must match somewhere in a result.
++ * Results are ranked: exact page name, pages whose name words start with the query words, settings whose text starts
++ * with the query, other pages, other settings.
++ */
++class SettingsSearchModel : public QAbstractListModel
++{
++    Q_OBJECT
++
++public:
++    enum ResultKind {
++        PageResult,
++        SettingResult,
++    };
++    Q_ENUM(ResultKind)
++
++    enum Roles {
++        ResultKindRole = Qt::UserRole + 100,
++    };
++
++    /**
++     * @param root the root of the MenuItem tree. Only settings of pages in that tree are found.
++     */
++    explicit SettingsSearchModel(MenuItem *root, QObject *parent = nullptr);
++    ~SettingsSearchModel() override;
++
++    QHash<int, QByteArray> roleNames() const override;
++    int rowCount(const QModelIndex &parent = QModelIndex()) const override;
++    QVariant data(const QModelIndex &index, int role) const override;
++
++    void setQuery(const QString &query);
++    QString query() const;
++
++    /**
++     * The page a result belongs to.
++     */
++    MenuItem *itemAt(int row) const;
++
++    ResultKind kindAt(int row) const;
++
++    /**
++     * What the control of a setting result is called, normalised the same way as SettingLocator compares:
++     * translated, without mnemonics, placeholders and the trailing colon. Empty for pages.
++     */
++    QString controlText(int row) const;
++
++    /**
++     * Whether the text of the control contains a value in place of a %1 placeholder, so that only its start can be compared.
++     */
++    bool controlTextHasPlaceholder(int row) const;
++
++    /**
++     * Lower case, without accents. Used for all comparisons.
++     */
++    static QString fold(const QString &text);
++
++    /**
++     * Removes what is not part of the visible text of a translated string: mnemonics, markup, %1 placeholders and a
++     * trailing colon.
++     */
++    static QString visibleText(const QString &translated);
++
++private:
++    struct Page;
++    struct Setting;
++    struct Result {
++        int index; // into m_pages or m_settings
++        ResultKind kind;
++    };
++
++    void collectPages(MenuItem *item);
++    void translateSettings();
++
++    QList<Page> m_pages;
++    QList<Setting> m_settings;
++    QList<Result> m_results;
++    QString m_query;
++    bool m_translated = false;
++};
++
++#endif
+diff --git a/app/SidebarMode.cpp b/app/SidebarMode.cpp
+index 988e450..951755d 100644
+--- a/app/SidebarMode.cpp
++++ b/app/SidebarMode.cpp
+@@ -10,6 +10,8 @@
+ #include "MenuItem.h"
+ #include "MenuModel.h"
+ #include "MenuProxyModel.h"
++#include "SettingLocator.h"
++#include "SettingsSearchModel.h"
+ #include "ModuleView.h"
+ #include "SettingsLayoutTree.h"
+ #include "SidebarModel.h"
+@@ -128,6 +130,9 @@ public:
+     MenuModel *model = nullptr;
+     MenuProxyModel *categorizedModel = nullptr;
+     MenuProxyModel *searchModel = nullptr;
++    // Search results of System Settings: pages and settings. Info Center searches pages only, with searchModel.
++    SettingsSearchModel *settingsSearch = nullptr;
++    SettingLocator *locator = nullptr;
+     KDescendantsProxyModel *flatModel = nullptr;
+     ModuleView *moduleView = nullptr;
+     KActionCollection *collection = nullptr;
+@@ -199,7 +204,7 @@ QAbstractItemModel *SidebarMode::categoryModel() const
+ 
+ QAbstractItemModel *SidebarMode::searchModel() const
+ {
+-    return d->searchModel;
++    return d->settingsSearch ? static_cast<QAbstractItemModel *>(d->settingsSearch) : d->searchModel;
+ }
+ 
+ QAbstractItemModel *SidebarMode::subCategoryModel() const
+@@ -238,6 +243,7 @@ void SidebarMode::initEvent()
+ 
+     d->subCategoryModel = new SubcategoryModel(d->categorizedModel, this);
+     if (d->applicationMode == SystemSettings) {
++        d->settingsSearch = new SettingsSearchModel(rootItem(), this);
+         d->sidebarModel = new SidebarModel(d->categorizedModel, this);
+     }
+     d->mainWidget = new FocusHackWidget();
+@@ -249,6 +255,7 @@ void SidebarMode::initEvent()
+     qApp->setProperty("__qmlEngine", QVariant::fromValue(d->engine.get()));
+     d->moduleView = new ModuleView(d->engine, d->mainWidget);
+     connect(d->moduleView, &ModuleView::moduleChanged, this, &SidebarMode::moduleLoaded);
++    d->locator = new SettingLocator(d->moduleView, this);
+     connect(d->moduleView, &ModuleView::moduleSaved, this, &SidebarMode::updateDefaults);
+     d->quickWidget = nullptr;
+     moduleView()->setFaceType(KPageView::Plain);
+@@ -354,11 +361,39 @@ bool SidebarMode::loadModule(const QModelIndex &activeModule, const QStringList
+     return true;
+ }
+ 
++void SidebarMode::setSearchText(const QString &text)
++{
++    if (d->settingsSearch) {
++        d->settingsSearch->setQuery(text);
++    } else {
++        d->searchModel->setFilterRegularExpression(text);
++    }
++}
++
++bool SidebarMode::openSearchResult(int row)
++{
++    if (!d->settingsSearch) {
++        return false;
++    }
++    const QModelIndex index = d->settingsSearch->index(row, 0);
++    // Taken before the page is loaded: opening a page must not change what the results say
++    const bool isSetting = d->settingsSearch->kindAt(row) == SettingsSearchModel::SettingResult;
++    const QString text = d->settingsSearch->controlText(row);
++    const bool prefixOnly = d->settingsSearch->controlTextHasPlaceholder(row);
++    if (!loadModule(index)) {
++        return false;
++    }
++    if (isSetting) {
++        d->locator->locate(text, prefixOnly);
++    }
++    return true;
++}
++
+ void SidebarMode::updateActiveRows(const QModelIndex &activeModule, MenuItem *mi)
+ {
+     if (d->sidebarModel) {
+         d->sidebarModel->setCurrentItem(mi);
+-        const int searchRow = activeModule.model() == d->searchModel ? activeModule.row() : -1;
++        const int searchRow = activeModule.model() == searchModel() ? activeModule.row() : -1;
+         if (d->activeSearchRow != searchRow) {
+             d->activeSearchRow = searchRow;
+             Q_EMIT activeSearchRowChanged();
+diff --git a/app/SidebarMode.h b/app/SidebarMode.h
+index 34177b6..62f4725 100644
+--- a/app/SidebarMode.h
++++ b/app/SidebarMode.h
+@@ -141,6 +141,17 @@ public:
+     Q_INVOKABLE QString actionIconName(const QAction *action) const;
+     Q_INVOKABLE void showActionMenu(const QPoint &position);
+ 
++    /**
++     * Sets what the user searched for. Results are in searchModel.
++     */
++    Q_INVOKABLE void setSearchText(const QString &text);
++
++    /**
++     * Opens the page of a search result. For a setting it then scrolls to the control and highlights it.
++     * @return false if the page was not opened, because the user canceled leaving the current one
++     */
++    Q_INVOKABLE bool openSearchResult(int row);
++
+     /**
+      * Shows the page of the index.
+      * @return false if the page was not opened, because the user canceled leaving the current one
+diff --git a/app/qml/CategoriesPage.qml b/app/qml/CategoriesPage.qml
+index 1318bdf..fa26908 100644
+--- a/app/qml/CategoriesPage.qml
++++ b/app/qml/CategoriesPage.qml
+@@ -54,7 +54,7 @@ Kirigami.ScrollablePage {
+                 focus: !Kirigami.InputMethod.willShowOnActive
+                 Layout.fillWidth: true
+                 onTextChanged: {
+-                    systemsettings.searchModel.filterRegExp = text;
++                    systemsettings.setSearchText(text);
+                 }
+ 
+                 KeyNavigation.right: hamburgerMenuButton
+@@ -65,6 +65,20 @@ Kirigami.ScrollablePage {
+                 KeyNavigation.tab: KeyNavigation.right
+ 
+                 Keys.onDownPressed: event => rowLayout.Keys.downPressed(event)
++                Keys.onReturnPressed: event => openFirstResult(event)
++                Keys.onEnterPressed: event => openFirstResult(event)
++                Keys.onEscapePressed: event => {
++                    event.accepted = text.length > 0;
++                    text = "";
++                }
++
++                function openFirstResult(event: var): void {
++                    event.accepted = mainColumn.searchMode && mainColumn.accordion && categoryView.count > 0;
++                    if (event.accepted) {
++                        categoryView.currentIndex = 0;
++                        systemsettings.openSearchResult(0);
++                    }
++                }
+                 onActiveFocusChanged: {
+                     if (activeFocus) {
+                         systemsettings.giveFocus();
+@@ -189,6 +203,13 @@ Kirigami.ScrollablePage {
+         Keys.onTabPressed: {
+             systemsettings.focusNext();
+         }
++        Keys.onEscapePressed: event => {
++            event.accepted = mainColumn.searchMode;
++            if (event.accepted) {
++                searchField.text = "";
++                searchField.forceActiveFocus();
++            }
++        }
+ 
+         function accordionActivate(event: var): void {
+             event.accepted = showsAccordion && currentIndex >= 0;
+@@ -332,7 +353,9 @@ Kirigami.ScrollablePage {
+ 
+                 onClicked: {
+                     if (!enabled) { return; }
+-                    if (isKCM || mainColumn.searchMode || systemsettings.activeCategoryRow !== index) {
++                    if (mainColumn.searchMode && mainColumn.accordion) {
++                        systemsettings.openSearchResult(index);
++                    } else if (isKCM || mainColumn.searchMode || systemsettings.activeCategoryRow !== index) {
+                         systemsettings.loadModule(categoryView.model.index(index, 0));
+                     }
+                     if (!mainColumn.searchMode && root.pageStack.depth > 1) {
+diff --git a/app/qml/SettingHighlight.qml b/app/qml/SettingHighlight.qml
+new file mode 100644
+index 0000000..140dfa5
+--- /dev/null
++++ b/app/qml/SettingHighlight.qml
+@@ -0,0 +1,39 @@
++/*
++    SPDX-FileCopyrightText: 2026 KDE Contributors
++
++    SPDX-License-Identifier: LGPL-2.0-only
++*/
++
++import QtQuick
++import org.kde.kirigami as Kirigami
++
++// A frame around the control a search result led to. It is created as a child of that control, stays for a moment
++// and fades out.
++Rectangle {
++    id: root
++
++    anchors.fill: parent
++    anchors.margins: -Kirigami.Units.smallSpacing
++    z: 10000
++
++    color: "transparent"
++    border.width: 2
++    border.color: Kirigami.Theme.highlightColor
++    radius: Kirigami.Units.smallSpacing
++
++    Timer {
++        running: true
++        interval: 1500
++        onTriggered: fade.start()
++    }
++
++    // With animations turned off Kirigami.Units.longDuration is 0: the frame just disappears
++    NumberAnimation {
++        id: fade
++        target: root
++        property: "opacity"
++        to: 0
++        duration: Kirigami.Units.longDuration
++        onFinished: root.destroy()
++    }
++}

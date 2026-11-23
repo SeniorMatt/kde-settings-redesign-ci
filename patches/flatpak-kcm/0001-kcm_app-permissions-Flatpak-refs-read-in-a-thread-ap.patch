@@ -1,0 +1,423 @@
+From e9f67ec2aac3a55152c9a85e697c01fbc19be24c Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 14:31:08 +0500
+Subject: [PATCH] kcm_app-permissions: Flatpak refs read in a thread, app list
+ and gamemode lookup after the first frame
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Page type: Device (list of apps, each app a sub-page via ConfigModule.push; docs/page-design.md §1, already so in master:
+sidebar list with search, Permissions.qml per app, FlatpakPermissions.qml below it). No label, setting or permission
+changed. NOT BUILT YET (owner stopped heavy work); checked statically only.
+
+Changed:
+- "Manage Flatpak Settings" (per-app toolbar action) now waits for kcm.referencesLoaded.
+- Busy indicator in the app list after 150 ms while the list is read (kcm.appsModel.loading).
+- Relabel table inventory/relabel/kcm_app-permissions.tsv (outer repo; labels unchanged). 25 inventory rows kept (ksr
+  markers at the end of the QML/cpp files that hold them): inventory_check --kcm kcm_app-permissions --strict: 0 lost.
+
+Speed (cause found in code):
+- kcm.cpp constructor initialised m_references with FlatpakReference::allFlatpakReferences(): libflatpak lists the
+  installed refs of every system installation plus the user one and reads appdata of each (flatpakreference.cpp:133-177),
+  synchronously before the page. Now a QThread runs it (the references are moved to the GUI thread; destructor waits);
+  the "open app X" argument (args / activationRequested) is kept in m_pendingArgs and opened once both the main UI and the
+  references are ready (openPendingReference).
+- AppsModel::loadApps() (KApplicationTrader::query, may rebuild KSycoca) ran in the constructor: now QTimer::singleShot(0)
+  (ensureLoaded(), called early by openPendingReference if needed).
+- gamemodeAvailable() did a blocking activatableServiceNames().value() on first use: now an async ListActivatableNames
+  call, NOTIFY property.
+- The 11 PermissionStore tables were already read with async D-Bus calls (left as is).
+After numbers: pending, manager will measure.
+
+Not built yet; uncertain: QDBusConnectionInterface::asyncCall("ListActivatableNames") shape; libflatpak calls from a
+worker thread (separate installation objects, no shared state with the GUI thread); FlatpakReference objects created in
+the thread then moveToThread; ~AppPermissionsKCM is new in the header.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ appsmodel.cpp                       | 19 +++++-
+ appsmodel.h                         |  8 +++
+ flatpakpermission.cpp               |  3 +
+ kcm.cpp                             | 90 ++++++++++++++++++++++-------
+ kcm.h                               | 21 ++++++-
+ ui/AddEnvironmentVariableDialog.qml |  4 ++
+ ui/ApplyOrDiscardDialog.qml         |  3 +
+ ui/FlatpakPermissions.qml           |  3 +
+ ui/Permissions.qml                  | 13 ++++-
+ ui/SessionList.qml                  |  4 ++
+ ui/TextPromptDialog.qml             |  3 +
+ ui/main.qml                         | 13 +++++
+ 12 files changed, 161 insertions(+), 23 deletions(-)
+
+diff --git a/appsmodel.cpp b/appsmodel.cpp
+index de783c1..b11f346 100644
+--- a/appsmodel.cpp
++++ b/appsmodel.cpp
+@@ -7,11 +7,26 @@
+ 
+ #include <KApplicationTrader>
+ 
++#include <QTimer>
++
+ using namespace Qt::StringLiterals;
+ 
+ AppsModel::AppsModel(QObject *parent)
+ {
+-    loadApps();
++    // Before: loadApps() ran here, in the KCM constructor (a KSycoca query that can trigger a cache rebuild)
++    QTimer::singleShot(0, this, &AppsModel::ensureLoaded);
++}
++
++bool AppsModel::isLoading() const
++{
++    return !m_loaded;
++}
++
++void AppsModel::ensureLoaded()
++{
++    if (!m_loaded) {
++        loadApps();
++    }
+ }
+ 
+ void AppsModel::loadApps()
+@@ -21,6 +36,8 @@ void AppsModel::loadApps()
+         return !app->noDisplay();
+     });
+     endResetModel();
++    m_loaded = true;
++    Q_EMIT loadingChanged();
+ }
+ 
+ int AppsModel::rowCount(const QModelIndex &parent) const
+diff --git a/appsmodel.h b/appsmodel.h
+index 158dbed..b5bf679 100644
+--- a/appsmodel.h
++++ b/appsmodel.h
+@@ -12,6 +12,7 @@
+ class AppsModel : public QAbstractListModel
+ {
+     Q_OBJECT
++    Q_PROPERTY(bool loading READ isLoading NOTIFY loadingChanged)
+ public:
+     enum Roles {
+         AppIdRole = Qt::UserRole,
+@@ -26,7 +27,14 @@ public:
+ 
+     QString findIconNameById(const QString &id) const;
+ 
++    // The list of applications is read from KSycoca after the first frame (or earlier, when a caller needs it)
++    bool isLoading() const;
++    void ensureLoaded();
++Q_SIGNALS:
++    void loadingChanged();
++
+ private:
+     void loadApps();
+     QList<KService::Ptr> m_apps;
++    bool m_loaded = false;
+ };
+diff --git a/flatpakpermission.cpp b/flatpakpermission.cpp
+index 6c3a897..7c8876c 100644
+--- a/flatpakpermission.cpp
++++ b/flatpakpermission.cpp
+@@ -1645,3 +1645,6 @@ void FlatpakPermissionModel::writeToKConfig(KConfig &config) const
+ }
+ 
+ #include "moc_flatpakpermission.cpp"
++
++// Inventory rows built here (labels unchanged, markers for scripts/inventory_check.py):
++// ksr: kcm_app-permissions/Per-app-permission-name
+diff --git a/kcm.cpp b/kcm.cpp
+index d90496f..17e874e 100644
+--- a/kcm.cpp
++++ b/kcm.cpp
+@@ -16,7 +16,11 @@
+ 
+ #include <QDBusConnection>
+ #include <QDBusConnectionInterface>
++#include <QDBusPendingCallWatcher>
++#include <QDBusPendingReply>
++#include <QGuiApplication>
+ #include <QQmlEngine>
++#include <QThread>
+ 
+ #include <algorithm>
+ 
+@@ -26,7 +30,6 @@ using namespace Qt::StringLiterals;
+ 
+ AppPermissionsKCM::AppPermissionsKCM(QObject *parent, const KPluginMetaData &data, const QVariantList &args)
+     : KQuickManagedConfigModule(parent, data)
+-    , m_references(FlatpakReference::allFlatpakReferences())
+     , m_permissionStore(PermissionStore::instance())
+ 
+ {
+@@ -52,25 +55,73 @@ AppPermissionsKCM::AppPermissionsKCM(QObject *parent, const KPluginMetaData &dat
+     m_permissionStore->loadTable("wallpaper"_L1);
+     m_permissionStore->loadTable("input-capture"_L1);
+ 
+-    auto reference = indexFromArgs(args);
+-    if (reference) {
+-        connect(
+-            this,
+-            &KQuickConfigModule::mainUiReady,
+-            this,
+-            [this, reference] {
+-                const auto iconName = QVariant::fromValue(appsModel()->findIconNameById(reference->flatpakName()));
+-                push("FlatpakPermissions.qml"_L1, {{u"ref"_s, QVariant::fromValue(reference)}, {u"decoration"_s, iconName}});
+-            },
+-            Qt::SingleShotConnection);
+-    }
+-    connect(this, &KQuickConfigModule::activationRequested, this, [this](const QVariantList &args) {
+-        auto reference = indexFromArgs(args);
+-        if (reference) {
+-            const auto iconName = QVariant::fromValue(appsModel()->findIconNameById(reference->flatpakName()));
+-            push("FlatpakPermissions.qml"_L1, {{u"ref"_s, QVariant::fromValue(reference)}, {u"decoration"_s, iconName}});
++    // Before: the constructor read every installed Flatpak ref of the system and user installations through libflatpak
++    // (flatpak_installation_list_installed_refs_by_kind, reading appdata of each app) before the page could appear.
++    // Now a thread does it; the references (and the app a caller asked for in args) show up when it finishes.
++    m_pendingArgs = args;
++    m_referencesThread = QThread::create([this] {
++        m_loadedReferences = FlatpakReference::allFlatpakReferences();
++        for (const auto &reference : m_loadedReferences) {
++            reference->moveToThread(qApp->thread());
++        }
++    });
++    m_referencesThread->setParent(this);
++    connect(m_referencesThread, &QThread::finished, this, [this] {
++        m_references = std::move(m_loadedReferences);
++        m_loadedReferences.clear();
++        m_referencesThread->deleteLater();
++        m_referencesThread = nullptr;
++        m_referencesLoaded = true;
++        Q_EMIT referencesLoadedChanged();
++        openPendingReference();
++    });
++    m_referencesThread->start();
++
++    // Before: gamemodeAvailable() asked the session bus (blocking) when the first app page was opened.
++    auto *gamemodeCall = new QDBusPendingCallWatcher(QDBusConnection::sessionBus().interface()->asyncCall(u"ListActivatableNames"_s), this);
++    connect(gamemodeCall, &QDBusPendingCallWatcher::finished, this, [this](QDBusPendingCallWatcher *watcher) {
++        watcher->deleteLater();
++        const QDBusPendingReply<QStringList> reply = *watcher;
++        if (reply.isValid() && reply.value().contains(u"com.feralinteractive.GameMode"_s)) {
++            m_gamemodeAvailable = true;
++            Q_EMIT gamemodeAvailableChanged();
+         }
+     });
++
++    connect(this, &KQuickConfigModule::mainUiReady, this, [this] {
++        m_mainUiReady = true;
++        openPendingReference();
++    });
++    connect(this, &KQuickConfigModule::activationRequested, this, [this](const QVariantList &args) {
++        m_pendingArgs = args;
++        openPendingReference();
++    });
++}
++
++AppPermissionsKCM::~AppPermissionsKCM()
++{
++    if (m_referencesThread) {
++        m_referencesThread->wait();
++    }
++}
++
++void AppPermissionsKCM::openPendingReference()
++{
++    if (!m_mainUiReady || !m_referencesLoaded || m_pendingArgs.isEmpty()) {
++        return;
++    }
++    const auto reference = indexFromArgs(m_pendingArgs);
++    m_pendingArgs.clear();
++    if (reference) {
++        m_appsModel.ensureLoaded();
++        const auto iconName = QVariant::fromValue(appsModel()->findIconNameById(reference->flatpakName()));
++        push("FlatpakPermissions.qml"_L1, {{u"ref"_s, QVariant::fromValue(reference)}, {u"decoration"_s, iconName}});
++    }
++}
++
++bool AppPermissionsKCM::referencesLoaded() const
++{
++    return m_referencesLoaded;
+ }
+ 
+ FlatpakReference *AppPermissionsKCM::indexFromArgs(const QVariantList &args) const
+@@ -129,8 +180,7 @@ FlatpakReference *AppPermissionsKCM::flatpakRefForApp(const QString &appId)
+ 
+ bool AppPermissionsKCM::gamemodeAvailable() const
+ {
+-    static bool available = QDBusConnection::sessionBus().interface()->activatableServiceNames().value().contains(u"com.feralinteractive.GameMode"_s);
+-    return available;
++    return m_gamemodeAvailable;
+ }
+ 
+ #include "kcm.moc"
+diff --git a/kcm.h b/kcm.h
+index 4f97899..44fd7a3 100644
+--- a/kcm.h
++++ b/kcm.h
+@@ -12,13 +12,17 @@
+ 
+ #include <KQuickManagedConfigModule>
+ 
++#include <QVariantList>
++
+ class PermissionStore;
++class QThread;
+ 
+ class AppPermissionsKCM : public KQuickManagedConfigModule
+ {
+     Q_OBJECT
+     Q_PROPERTY(const AppsModel *appsModel READ appsModel CONSTANT)
+-    Q_PROPERTY(bool gamemodeAvailable READ gamemodeAvailable CONSTANT)
++    Q_PROPERTY(bool gamemodeAvailable READ gamemodeAvailable NOTIFY gamemodeAvailableChanged)
++    Q_PROPERTY(bool referencesLoaded READ referencesLoaded NOTIFY referencesLoadedChanged)
+ public:
+     /**
+      * This KCM manages permissions for Flatpak application. It can open any
+@@ -31,6 +35,13 @@ public:
+ 
+     Q_INVOKABLE FlatpakReference *flatpakRefForApp(const QString &appId);
+     bool gamemodeAvailable() const;
++    bool referencesLoaded() const;
++
++    ~AppPermissionsKCM() override;
++
++Q_SIGNALS:
++    void gamemodeAvailableChanged();
++    void referencesLoadedChanged();
+ 
+ public Q_SLOTS:
+     void load() override;
+@@ -39,8 +50,16 @@ public Q_SLOTS:
+ 
+ private:
+     FlatpakReference *indexFromArgs(const QVariantList &args) const;
++    void openPendingReference();
+ 
+     AppsModel m_appsModel;
+     std::vector<std::unique_ptr<FlatpakReference>> m_references;
++    // The installed Flatpak refs are read by libflatpak in a thread (see the constructor)
++    std::vector<std::unique_ptr<FlatpakReference>> m_loadedReferences;
++    QThread *m_referencesThread = nullptr;
++    bool m_referencesLoaded = false;
++    bool m_mainUiReady = false;
++    bool m_gamemodeAvailable = false;
++    QVariantList m_pendingArgs;
+     std::shared_ptr<PermissionStore> m_permissionStore;
+ };
+diff --git a/ui/AddEnvironmentVariableDialog.qml b/ui/AddEnvironmentVariableDialog.qml
+index e005026..9d2732e 100644
+--- a/ui/AddEnvironmentVariableDialog.qml
++++ b/ui/AddEnvironmentVariableDialog.qml
+@@ -81,3 +81,7 @@ Kirigami.PromptDialog {
+         close();
+     }
+ }
++
++// Inventory rows built here (labels unchanged, markers for scripts/inventory_check.py):
++// ksr: kcm_app-permissions/x
++// ksr: kcm_app-permissions/x-2
+diff --git a/ui/ApplyOrDiscardDialog.qml b/ui/ApplyOrDiscardDialog.qml
+index 9c77c8f..ed81aeb 100644
+--- a/ui/ApplyOrDiscardDialog.qml
++++ b/ui/ApplyOrDiscardDialog.qml
+@@ -50,3 +50,6 @@ Kirigami.PromptDialog {
+         button.forceActiveFocus(Qt.TabFocusReason);
+     }
+ }
++
++// Inventory rows built here (labels unchanged, markers for scripts/inventory_check.py):
++// ksr: kcm_app-permissions/ApplyDiscard
+diff --git a/ui/FlatpakPermissions.qml b/ui/FlatpakPermissions.qml
+index 00574fe..82dc54e 100644
+--- a/ui/FlatpakPermissions.qml
++++ b/ui/FlatpakPermissions.qml
+@@ -355,3 +355,6 @@ KCM.ScrollViewKCM {
+         }
+     }
+ }
++
++// Inventory rows built here (labels unchanged, markers for scripts/inventory_check.py):
++// ksr: kcm_app-permissions/Add-New
+diff --git a/ui/Permissions.qml b/ui/Permissions.qml
+index 266b0e2..882cd47 100644
+--- a/ui/Permissions.qml
++++ b/ui/Permissions.qml
+@@ -23,7 +23,8 @@ KCMUtils.SimpleKCM {
+ 
+     actions: [
+         Kirigami.Action {
+-            readonly property var ref: kcm.flatpakRefForApp(root.appId)
++            // The Flatpak refs are read after the first frame (kcm.referencesLoaded)
++            readonly property var ref: kcm.referencesLoaded ? kcm.flatpakRefForApp(root.appId) : null
+             visible: ref
+             text: i18nc("@action:intoolbar", "Manage Flatpak Settings")
+             icon.name: "flatpak-discover"
+@@ -33,6 +34,16 @@ KCMUtils.SimpleKCM {
+         }
+     ]
+ 
++    // ksr: kcm_app-permissions/Block-automatic-sleep-and-screen-locking
++    // ksr: kcm_app-permissions/Gain-higher-process-priority
++    // ksr: kcm_app-permissions/Take-screenshots
++    // ksr: kcm_app-permissions/Camera-access
++    // ksr: kcm_app-permissions/Location-accuracy
++    // ksr: kcm_app-permissions/Set-desktop-and-lock-screen-background
++    // ksr: kcm_app-permissions/Remote-control
++    // ksr: kcm_app-permissions/Control-pointer-keyboard-and-share-screen-with-other-apps-wi
++    // ksr: kcm_app-permissions/ScreenSharing
++    // ksr: kcm_app-permissions/InputCapture
+     component PermissionItem : KCM.PermissionItem {
+         appId: root.appId
+     }
+diff --git a/ui/SessionList.qml b/ui/SessionList.qml
+index 999595c..002a5d1 100644
+--- a/ui/SessionList.qml
++++ b/ui/SessionList.qml
+@@ -62,3 +62,7 @@ KCMUtils.ScrollViewKCM {
+         }
+     ]
+ }
++
++// Inventory rows built here (labels unchanged, markers for scripts/inventory_check.py):
++// ksr: kcm_app-permissions/Revoke
++// ksr: kcm_app-permissions/RevokeAll
+diff --git a/ui/TextPromptDialog.qml b/ui/TextPromptDialog.qml
+index ff1bb9b..aee6203 100644
+--- a/ui/TextPromptDialog.qml
++++ b/ui/TextPromptDialog.qml
+@@ -156,3 +156,6 @@ Kirigami.PromptDialog {
+         close();
+     }
+ }
++
++// Inventory rows built here (labels unchanged, markers for scripts/inventory_check.py):
++// ksr: kcm_app-permissions/PathPrompt
+diff --git a/ui/main.qml b/ui/main.qml
+index 0190bc8..f841a8c 100644
+--- a/ui/main.qml
++++ b/ui/main.qml
+@@ -85,6 +85,19 @@ KCMUtils.ScrollViewKCM
+         }
+     }
+ 
++    // The application list is read after the first frame; the spinner shows only if that takes over 150 ms
++    Timer {
++        id: busyDelay
++        interval: 150
++        running: kcm.appsModel.loading
++    }
++    QQC.BusyIndicator {
++        parent: appsView
++        anchors.centerIn: parent
++        running: kcm.appsModel.loading && !busyDelay.running
++        visible: running
++    }
++
+     KCMUtils.SimpleKCM {
+         id: placeholder
+         Kirigami.PlaceholderMessage {

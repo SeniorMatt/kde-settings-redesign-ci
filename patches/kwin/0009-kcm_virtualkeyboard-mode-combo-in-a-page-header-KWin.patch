@@ -1,0 +1,162 @@
+From e75933edd4f46153fc7e7a619f1941aa55d3d973 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 01:30:30 +0500
+Subject: [PATCH 09/12] kcm_virtualkeyboard: mode combo in a page header, KWin
+ mode read asynchronously
+
+Page type: Gallery (docs/page-design.md 5). Config keys (kwinrc Wayland/InputMethod), the D-Bus property
+org.kde.kwin.VirtualKeyboard.mode and its save path are unchanged.
+
+Moved / renamed:
+- The combo "Show Virtual Keyboard:" was a toolbar display component; it is now a FormLayout row in the page header
+  above the grid (a labelled control instead of a toolbar item). Label "Show virtual keyboard:" (sentence case),
+  entries "With touch and tablet" / "With touch, tablet and mouse" (were Title Case). Row kcm_virtualkeyboard/InputMethod.
+- Combo has Accessible.name. Grid, selection and double-click-to-save unchanged. Relabel: inventory/relabel/kcm_virtualkeyboard.tsv.
+- OverlayVirtualKeyboardOnWindows stays config-only (no UI existed). Inventory --strict: 0 lost.
+HIG ids: HIG-001/005, HIG-019, HIG-058 (labelled control, sentence case).
+
+Speed cause (code): the KcmVirtualKeyboard constructor read the mode with the generated proxy's mode(), a blocking D-Bus
+property call to KWin (kcmvirtualkeyboard.cpp:29), so the first frame waited on KWin (or its activation). Now the mode starts
+at KWin's default (TouchOnly), an async Properties.Get fills it in, and a user edit made before the answer wins
+(m_modeEdited). VirtualKeyboardsModel still runs KApplicationTrader::query synchronously (sycoca, in memory); left as is.
+After-numbers: pending, manager will measure. Not built yet. Unconfirmed without a build: that header: accepts a
+ColumnLayout with a FormLayout in GridViewKCM (documented as "header: Item").
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ .../virtualkeyboard/kcmvirtualkeyboard.cpp    | 30 +++++++++++-
+ src/kcms/virtualkeyboard/kcmvirtualkeyboard.h |  1 +
+ src/kcms/virtualkeyboard/ui/main.qml          | 46 +++++++++----------
+ 3 files changed, 53 insertions(+), 24 deletions(-)
+
+diff --git a/src/kcms/virtualkeyboard/kcmvirtualkeyboard.cpp b/src/kcms/virtualkeyboard/kcmvirtualkeyboard.cpp
+index 0941ec8..fe29d7f 100644
+--- a/src/kcms/virtualkeyboard/kcmvirtualkeyboard.cpp
++++ b/src/kcms/virtualkeyboard/kcmvirtualkeyboard.cpp
+@@ -16,6 +16,12 @@
+ #include <KLocalizedString>
+ #include <KPluginFactory>
+ 
++#include <QDBusConnection>
++#include <QDBusMessage>
++#include <QDBusPendingCallWatcher>
++#include <QDBusPendingReply>
++#include <QDBusVariant>
++
+ #include <virtualkeyboarddata.h>
+ #include <virtualkeyboardsettings.h>
+ 
+@@ -26,10 +32,31 @@ KcmVirtualKeyboard::KcmVirtualKeyboard(QObject *parent, const KPluginMetaData &m
+     , m_data(new VirtualKeyboardData(this))
+     , m_model(new VirtualKeyboardsModel(this))
+     , m_dbusInterface(std::make_unique<KWinVirtualKeyboard>())
+-    , m_mode(static_cast<KWinVirtualKeyboard::VirtualKeyboardMode>(m_dbusInterface->mode()))
++    , m_mode(KWinVirtualKeyboard::VirtualKeyboardMode::TouchOnly) // KWin's default until the async read below answers
+ {
+     qmlRegisterAnonymousType<VirtualKeyboardSettings>("org.kde.kwin.virtualkeyboardsettings", 1);
+     qmlRegisterType<KWinVirtualKeyboard>("org.kde.kwin.virtualkeyboard", 1, 0, "KWinVirtualKeyboard");
++
++    // The mode used to be read here with a blocking D-Bus property call, which stalls the first frame while KWin is
++    // busy or being activated. Ask asynchronously instead; a change made by the user in the meantime wins.
++    auto message = QDBusMessage::createMethodCall(QStringLiteral("org.kde.KWin"),
++                                                  QStringLiteral("/VirtualKeyboard"),
++                                                  QStringLiteral("org.freedesktop.DBus.Properties"),
++                                                  QStringLiteral("Get"));
++    message << QStringLiteral("org.kde.kwin.VirtualKeyboard") << QStringLiteral("mode");
++    auto *watcher = new QDBusPendingCallWatcher(QDBusConnection::sessionBus().asyncCall(message), this);
++    connect(watcher, &QDBusPendingCallWatcher::finished, this, [this](QDBusPendingCallWatcher *watcher) {
++        QDBusPendingReply<QDBusVariant> reply = *watcher;
++        watcher->deleteLater();
++        if (m_modeEdited || reply.isError()) {
++            return;
++        }
++        const int mode = reply.value().variant().toInt();
++        if (mode != static_cast<int>(m_mode)) {
++            m_mode = static_cast<KWinVirtualKeyboard::VirtualKeyboardMode>(mode);
++            Q_EMIT modeChanged(m_mode);
++        }
++    });
+ }
+ 
+ KcmVirtualKeyboard::~KcmVirtualKeyboard() = default;
+@@ -45,6 +72,7 @@ void KcmVirtualKeyboard::setMode(KWinVirtualKeyboard::VirtualKeyboardMode mode)
+         return;
+     }
+     m_mode = mode;
++    m_modeEdited = true;
+     Q_EMIT modeChanged(mode);
+     setNeedsSave(true);
+ }
+diff --git a/src/kcms/virtualkeyboard/kcmvirtualkeyboard.h b/src/kcms/virtualkeyboard/kcmvirtualkeyboard.h
+index 9f8a050..6888462 100644
+--- a/src/kcms/virtualkeyboard/kcmvirtualkeyboard.h
++++ b/src/kcms/virtualkeyboard/kcmvirtualkeyboard.h
+@@ -77,4 +77,5 @@ private:
+     VirtualKeyboardsModel *const m_model;
+     std::unique_ptr<KWinVirtualKeyboard> m_dbusInterface;
+     KWinVirtualKeyboard::VirtualKeyboardMode m_mode;
++    bool m_modeEdited = false;
+ };
+diff --git a/src/kcms/virtualkeyboard/ui/main.qml b/src/kcms/virtualkeyboard/ui/main.qml
+index 4ea1827..aba5b49 100644
+--- a/src/kcms/virtualkeyboard/ui/main.qml
++++ b/src/kcms/virtualkeyboard/ui/main.qml
+@@ -17,34 +17,34 @@ import org.kde.kwin.virtualkeyboard
+ KCM.GridViewKCM {
+     id: root
+ 
+-    actions: [
+-        Kirigami.Action {
+-            displayComponent: RowLayout {
+-                QQC2.Label {
+-                    text: i18nc("Selector label", "Show Virtual Keyboard:")
+-                }
++    // Page type: Gallery (docs/page-design.md 5). The one choice that is not a keyboard application sits above the grid.
++    header: ColumnLayout {
++        Kirigami.FormLayout {
++            Layout.fillWidth: true
++
++            QQC2.ComboBox {
++                id: visibilityComboBox
+ 
+-                QQC2.ComboBox {
+-                    id: visibilityComboBox
+-                    currentIndex: kcm.mode
+-                    flat: true
+-                    model: [
+-                        { label: i18n("Never"), value: KWinVirtualKeyboard.VirtualKeyboardMode.Off },
+-                        { label: i18n("With Touch and Tablet"), value: KWinVirtualKeyboard.VirtualKeyboardMode.TouchOnly },
+-                        { label: i18n("With Touch, Tablet, and Mouse"), value: KWinVirtualKeyboard.VirtualKeyboardMode.On },
+-                    ]
+-                    textRole: "label"
+-                    valueRole: "value"
++                // ksr: kcm_virtualkeyboard/InputMethod
++                Kirigami.FormData.label: i18nc("@label:listbox", "Show virtual keyboard:")
++                Accessible.name: Kirigami.FormData.label
++                currentIndex: kcm.mode
++                model: [
++                    { label: i18n("Never"), value: KWinVirtualKeyboard.VirtualKeyboardMode.Off },
++                    { label: i18n("With touch and tablet"), value: KWinVirtualKeyboard.VirtualKeyboardMode.TouchOnly },
++                    { label: i18n("With touch, tablet and mouse"), value: KWinVirtualKeyboard.VirtualKeyboardMode.On },
++                ]
++                textRole: "label"
++                valueRole: "value"
+ 
+-                    onActivated: kcm.mode = currentIndex
++                onActivated: kcm.mode = currentIndex
+ 
+-                    KCM.SettingHighlighter {
+-                        highlight: kcm.mode !== KWinVirtualKeyboard.VirtualKeyboardMode.TouchOnly
+-                    }
++                KCM.SettingHighlighter {
++                    highlight: kcm.mode !== KWinVirtualKeyboard.VirtualKeyboardMode.TouchOnly
+                 }
+             }
+-        },
+-    ]
++        }
++    }
+ 
+     view.model: kcm.model
+     view.currentIndex: kcm.model.inputMethodIndex(kcm.settings.inputMethod)

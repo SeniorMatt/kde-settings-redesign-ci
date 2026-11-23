@@ -1,0 +1,147 @@
+From c6d78e2925ab7320435b9471562221ec8426b138 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 15:07:43 +0500
+Subject: [PATCH] kcm_kaccounts: List page that builds its account model after
+ the first frame
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Page type: List (docs/page-design.md). It is the fallback when konlineaccounts is not installed, so wording and empty state
+now match kcm_konlineaccounts (branch ksr-pages): empty state 'No accounts configured' with an 'Add Account…' button
+(kcm_kaccounts/EmptyList; the 'Click Add Account…' explanation is replaced by the button), spinner only after 150 ms.
+Account rows, Add Account page action, Account Details, remove dialog and libaccounts calls unchanged.
+
+Speed (from code): KAccounts.AccountsModel was created with the page and reads all accounts/providers through
+libaccounts-qt before the first frame (main.qml). It is now created by a 0 ms Timer after the first frame; the empty
+message waits for it so it does not flash. After: pending, manager will measure.
+
+Markers (no label change) on AddAccount, AccountList, AvailableProviders, ServiceToggles, RemoveAccount;
+inventory/relabel/kcm_kaccounts.tsv in the outer repo.
+
+HIG: HIG-001, HIG-005, HIG-020.
+
+Not built yet. To check: view.count binding with a model that is null at first; AccountsModel has no ready flag, so
+'ready' is 'model object exists' (rows may still appear a moment later).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ src/kcm/ui/AccountDetails.qml    |  2 ++
+ src/kcm/ui/AvailableAccounts.qml |  1 +
+ src/kcm/ui/main.qml              | 42 +++++++++++++++++++++++++++++---
+ 3 files changed, 41 insertions(+), 4 deletions(-)
+
+diff --git a/src/kcm/ui/AccountDetails.qml b/src/kcm/ui/AccountDetails.qml
+index db35e78..77c9526 100644
+--- a/src/kcm/ui/AccountDetails.qml
++++ b/src/kcm/ui/AccountDetails.qml
+@@ -78,6 +78,7 @@ KCM.ScrollViewKCM {
+             leftPadding: Kirigami.Units.smallSpacing
+             visible: servicesList.count > 0
+             level: 3
++            // ksr: kcm_kaccounts/ServiceToggles (unchanged)
+             text: i18ndc("kaccounts-integration", "Heading for a list of services available with this account", "Use This Account For")
+         }
+     }
+@@ -85,6 +86,7 @@ KCM.ScrollViewKCM {
+     footer: RowLayout {
+         Controls.Button {
+             Layout.alignment: Qt.AlignRight
++            // ksr: kcm_kaccounts/RemoveAccount (unchanged)
+             text: i18nd("kaccounts-integration", "Remove This Account")
+             icon.name: "edit-delete-remove"
+             onClicked: accountRemover.open();
+diff --git a/src/kcm/ui/AvailableAccounts.qml b/src/kcm/ui/AvailableAccounts.qml
+index 285f300..55016be 100644
+--- a/src/kcm/ui/AvailableAccounts.qml
++++ b/src/kcm/ui/AvailableAccounts.qml
+@@ -17,6 +17,7 @@ import org.kde.kaccounts as KAccounts
+ 
+ KCM.ScrollViewKCM {
+     id: root
++    // ksr: kcm_kaccounts/AvailableProviders (unchanged)
+     title: i18nd("kaccounts-integration", "Add New Account")
+ 
+     headerPaddingEnabled: false // Let the InlineMessage touch the edges
+diff --git a/src/kcm/ui/main.qml b/src/kcm/ui/main.qml
+index 8474479..82259d5 100644
+--- a/src/kcm/ui/main.qml
++++ b/src/kcm/ui/main.qml
+@@ -22,18 +22,40 @@ KCM.ScrollViewKCM {
+ 
+     actions: [
+         Kirigami.Action {
++            // ksr: kcm_kaccounts/AddAccount (unchanged)
+             text: i18ndc("kaccounts-integration", "@action:button", "Add Account…")
+             icon.name: "list-add-symbolic"
+             onTriggered: kcm.push("AvailableAccounts.qml")
+         }
+     ]
+ 
++    // The accounts (libaccounts-qt reads every account and provider) are loaded after the first frame
++    property var accountsModel: null
++    Timer {
++        id: loadAccounts
++        interval: 0
++        running: true
++        onTriggered: kaccountsRoot.accountsModel = accountsModelComponent.createObject(kaccountsRoot)
++    }
++    Component {
++        id: accountsModelComponent
++        KAccounts.AccountsModel { }
++    }
++    // A spinner shows only if loading takes longer than 150 ms
++    Timer {
++        id: busyDelay
++        property bool elapsed: false
++        interval: 150
++        running: kaccountsRoot.accountsModel === null
++        onTriggered: elapsed = true
++    }
++
+     // Existing accounts
+     view: ListView {
+ 
+         clip: true
+ 
+-        model: KAccounts.AccountsModel { }
++        model: kaccountsRoot.accountsModel
+ 
+         delegate: Controls.ItemDelegate {
+             id: delegate
+@@ -48,6 +70,7 @@ KCM.ScrollViewKCM {
+                     return i18nd("kaccounts-integration", "%1 account", model.providerName)
+                 }
+             }
++            // ksr: kcm_kaccounts/AccountList (row text unchanged)
+             icon.name: model.iconName
+ 
+             contentItem: RowLayout {
+@@ -80,12 +103,23 @@ KCM.ScrollViewKCM {
+         }
+ 
+         Kirigami.PlaceholderMessage {
+-            visible: view.count === 0
++            // ksr: kcm_kaccounts/EmptyList ("No accounts added yet" -> "No accounts configured", like kcm_konlineaccounts)
++            visible: kaccountsRoot.accountsModel !== null && view.count === 0
+             anchors.centerIn: parent
+             width: parent.width - (Kirigami.Units.largeSpacing * 4)
+             icon.name: "internet-services"
+-            text: i18ndc("kaccounts-integration", "A text shown when a user has not yet added any accounts", "No accounts added yet")
+-            explanation: xi18ndc("kaccounts-integration", "@info", "Click <interface>Add Account…</interface> to add one")
++            text: i18ndc("kaccounts-integration", "A text shown when a user has not yet added any accounts", "No accounts configured")
++            helpfulAction: Kirigami.Action {
++                text: i18ndc("kaccounts-integration", "@action:button", "Add Account…")
++                icon.name: "list-add-symbolic"
++                onTriggered: kcm.push("AvailableAccounts.qml")
++            }
++        }
++
++        Controls.BusyIndicator {
++            anchors.centerIn: parent
++            running: visible
++            visible: kaccountsRoot.accountsModel === null && busyDelay.elapsed
+ 
+         }
+     }

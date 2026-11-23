@@ -1,0 +1,83 @@
+From 2edbbb933dc0dc0f23a7370467db4e442b17ffb6 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 09:07:19 +0500
+Subject: [PATCH 15/34] SettingLocator: switch to the tab that holds the
+ control
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ app/SettingLocator.cpp | 46 +++++++++++++++++++++++++++++++-----------
+ 1 file changed, 34 insertions(+), 12 deletions(-)
+
+diff --git a/app/SettingLocator.cpp b/app/SettingLocator.cpp
+index 040e8a9..5682888 100644
+--- a/app/SettingLocator.cpp
++++ b/app/SettingLocator.cpp
+@@ -23,6 +23,8 @@
+ #include <QQuickWidget>
+ #include <QRegularExpression>
+ #include <QScrollArea>
++#include <QStackedWidget>
++#include <QTabWidget>
+ #include <QStyle>
+ 
+ #include <cmath>
+@@ -271,25 +273,45 @@ bool SettingLocator::tryQuick(QWidget *content)
+     return false;
+ }
+ 
++static QString widgetText(const QWidget *widget)
++{
++    if (auto label = qobject_cast<const QLabel *>(widget)) {
++        return label->text();
++    }
++    if (auto button = qobject_cast<const QAbstractButton *>(widget)) {
++        return button->text();
++    }
++    if (auto group = qobject_cast<const QGroupBox *>(widget)) {
++        return group->title();
++    }
++    return {};
++}
++
+ QWidget *SettingLocator::findWidget(QWidget *content) const
+ {
++    QWidget *hidden = nullptr;
+     const auto widgets = content->findChildren<QWidget *>();
+     for (QWidget *widget : widgets) {
+-        if (!widget->isVisibleTo(content) || widget->width() <= 0 || widget->height() <= 0) {
++        if (!matches(widgetText(widget))) {
+             continue;
+         }
+-        if (auto label = qobject_cast<QLabel *>(widget)) {
+-            if (matches(label->text())) {
+-                return label->buddy() ? label->buddy() : label;
+-            }
+-        } else if (auto button = qobject_cast<QAbstractButton *>(widget)) {
+-            if (matches(button->text())) {
+-                return button;
+-            }
+-        } else if (auto group = qobject_cast<QGroupBox *>(widget)) {
+-            if (matches(group->title())) {
+-                return group;
++        if (widget->isVisibleTo(content) && widget->width() > 0 && widget->height() > 0) {
++            auto label = qobject_cast<QLabel *>(widget);
++            return label && label->buddy() ? label->buddy() : widget;
++        }
++        if (!hidden && !widget->isVisibleTo(content)) {
++            hidden = widget;
++        }
++    }
++    // On a page of a tab widget that is not the current one: show that page, the next attempt finds the control
++    for (QWidget *parent = hidden; parent && parent != content; parent = parent->parentWidget()) {
++        if (auto stack = qobject_cast<QStackedWidget *>(parent->parentWidget())) {
++            if (auto tabs = qobject_cast<QTabWidget *>(stack->parentWidget())) {
++                tabs->setCurrentWidget(parent);
++            } else {
++                stack->setCurrentWidget(parent);
+             }
++            break;
+         }
+     }
+     return nullptr;

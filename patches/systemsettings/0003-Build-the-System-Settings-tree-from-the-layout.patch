@@ -1,0 +1,478 @@
+From f66fdab6ff75915a9e89537079a1366285f47bb1 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 08:15:50 +0500
+Subject: [PATCH 03/22] Build the System Settings tree from the layout
+
+Groups, categories and pages come from settingslayout_p.h in layout order.
+Pages the layout does not list are placed through its fallback table, so
+none disappears. Info Center pages become search-only Technical Details.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ app/CMakeLists.txt         |   3 +
+ app/SettingsBase.cpp       |  27 +++
+ app/SettingsLayoutTree.cpp | 330 +++++++++++++++++++++++++++++++++++++
+ app/SettingsLayoutTree.h   |  39 +++++
+ 4 files changed, 399 insertions(+)
+ create mode 100644 app/SettingsLayoutTree.cpp
+ create mode 100644 app/SettingsLayoutTree.h
+
+diff --git a/app/CMakeLists.txt b/app/CMakeLists.txt
+index b197a73..c65d1d5 100644
+--- a/app/CMakeLists.txt
++++ b/app/CMakeLists.txt
+@@ -19,6 +19,9 @@ target_sources(systemsettings PRIVATE
+     MenuModel.h
+     MenuProxyModel.cpp
+     MenuProxyModel.h
++    SettingsLayoutTree.cpp
++    SettingsLayoutTree.h
++    settingslayout_p.h
+     ModuleView.cpp
+     ModuleView.h
+ )
+diff --git a/app/SettingsBase.cpp b/app/SettingsBase.cpp
+index 0c5f0e0..f9eaff0 100644
+--- a/app/SettingsBase.cpp
++++ b/app/SettingsBase.cpp
+@@ -7,10 +7,15 @@
+  */
+ 
+ #include "SettingsBase.h"
++#include "MenuItem.h"
+ #include "ModuleView.h"
++#include "SettingsLayoutTree.h"
+ #include "SidebarMode.h"
++#include "settingslayout_p.h"
+ #include "kcmmetadatahelpers.h"
+ 
++#include <algorithm>
++
+ #include <QFileInfo>
+ #include <QFontDatabase>
+ #include <QGuiApplication>
+@@ -18,6 +23,7 @@
+ #include <QMenu>
+ #include <QMenuBar>
+ #include <QScreen>
++#include <QSet>
+ #include <QTimer>
+ #include <QUrlQuery>
+ #include <QtGlobal>
+@@ -96,6 +102,21 @@ void SettingsBase::initApplication()
+     // Prepare the menu of all modules
+     auto source = m_mode == SidebarMode::InfoCenter ? MetaDataSource::KInfoCenter : MetaDataSource::SystemSettings;
+     pluginModules = findKCMsMetaData(source) << findExternalKCMModules(source);
++    if (m_mode == SidebarMode::SystemSettings) {
++        // The Info Center pages are listed as Technical Details and found by search
++        QSet<QString> known;
++        for (const auto &metaData : std::as_const(pluginModules)) {
++            known.insert(metaData.pluginId());
++        }
++        for (const auto &metaData : findKCMsMetaData(MetaDataSource::KInfoCenter)) {
++            const bool isDetails = std::ranges::any_of(SettingsLayout::detailsPages, [&metaData](const SettingsLayout::Page &page) {
++                return SettingsLayoutTree::idCandidates(QString::fromLatin1(page.kcm)).contains(metaData.pluginId());
++            });
++            if (isDetails && !known.contains(metaData.pluginId())) {
++                pluginModules << metaData;
++            }
++        }
++    }
+ 
+     const QStringList dirs = QStandardPaths::locateAll(QStandardPaths::AppDataLocation, QStringLiteral("categories"), QStandardPaths::LocateDirectory);
+     categories = KFileUtils::findAllUniqueFiles(dirs, QStringList(QStringLiteral("*.desktop")));
+@@ -175,6 +196,12 @@ void SettingsBase::initToolBar()
+ 
+ void SettingsBase::initMenuList(MenuItem *parent)
+ {
++    if (m_mode == SidebarMode::SystemSettings && parent == rootModule) {
++        // System Settings has a fixed layout (settingslayout_p.h), the category files only place pages the layout lacks
++        homeModule = SettingsLayoutTree::build(parent, pluginModules, categories);
++        return;
++    }
++
+     // look for any categories inside this level, and recurse into them
+     for (const QString &category : std::as_const(categories)) {
+         const KDesktopFile file(category);
+diff --git a/app/SettingsLayoutTree.cpp b/app/SettingsLayoutTree.cpp
+new file mode 100644
+index 0000000..683a63f
+--- /dev/null
++++ b/app/SettingsLayoutTree.cpp
+@@ -0,0 +1,330 @@
++/*
++ * SPDX-FileCopyrightText: 2026 KDE Settings Redesign contributors
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "SettingsLayoutTree.h"
++
++#include "MenuItem.h"
++#include "settingslayout_p.h"
++
++#include "../systemsettings_app_debug.h"
++
++#include <KConfigGroup>
++#include <KDesktopFile>
++#include <KLocalizedString>
++
++#include <QHash>
++#include <QSet>
++
++#include <algorithm>
++#include <iterator>
++#include <span>
++
++using namespace Qt::StringLiterals;
++
++namespace
++{
++// Pages the layout does not list come after the ones it does
++constexpr int fallbackOrder = 1000;
++
++QString joinBreadcrumb(const QString &first, const QString &second)
++{
++    return i18ndc("systemsettings", "@item breadcrumb in search results, e.g. Appearance › Colors", "%1 › %2", first, second);
++}
++
++QStringList splitKeywords(const KLazyLocalizedString &keywords)
++{
++    if (keywords.isEmpty()) {
++        return {};
++    }
++    QStringList list = keywords.toString().split(u',', Qt::SkipEmptyParts);
++    for (QString &keyword : list) {
++        keyword = keyword.trimmed();
++    }
++    list.removeAll(QString());
++    return list;
++}
++
++QString translated(const KLazyLocalizedString &string)
++{
++    return string.isEmpty() ? QString() : string.toString();
++}
++
++bool contains(const auto &array, const QString &id)
++{
++    return std::any_of(std::begin(array), std::end(array), [&id](const char *entry) {
++        return id == QLatin1String(entry);
++    });
++}
++
++QStringList idCandidatesFor(const QString &id)
++{
++    QStringList candidates{id};
++    for (const auto &alias : SettingsLayout::idAliases) {
++        if (id == QLatin1String(alias.alias)) {
++            candidates << QString::fromLatin1(alias.id);
++        } else if (id == QLatin1String(alias.id)) {
++            candidates << QString::fromLatin1(alias.alias);
++        }
++    }
++    return candidates;
++}
++
++void sortTree(MenuItem *item)
++{
++    item->sortChildrenByWeight();
++    for (MenuItem *child : std::as_const(item->children())) {
++        sortTree(child);
++    }
++}
++
++class Builder
++{
++public:
++    Builder(MenuItem *root, const QList<KPluginMetaData> &modules, const QStringList &categoryFiles)
++        : m_root(root)
++        , m_categoryFiles(categoryFiles)
++    {
++        for (const auto &module : modules) {
++            if (module.isHidden() || contains(SettingsLayout::neverShow, module.pluginId())) {
++                continue;
++            }
++            if (!m_modules.contains(module.pluginId())) {
++                m_modules.insert(module.pluginId(), module);
++            }
++        }
++    }
++
++    MenuItem *build();
++
++private:
++    MenuItem *categoryItem(const QString &id);
++    MenuItem *addPage(MenuItem *category, const KPluginMetaData &module, const SettingsLayout::Page *layout, int order);
++    KPluginMetaData findModule(const char *id, const char *orApp = nullptr) const;
++    void addListedPages();
++    void addTechnicalDetails();
++    void addUnlistedPages();
++    QString fallbackCategory(const KPluginMetaData &module) const;
++
++    MenuItem *const m_root;
++    const QStringList m_categoryFiles;
++    QHash<QString, KPluginMetaData> m_modules;
++    QSet<QString> m_placed;
++    QHash<QString, MenuItem *> m_groups;
++    QHash<QString, MenuItem *> m_categories;
++};
++
++KPluginMetaData Builder::findModule(const char *id, const char *orApp) const
++{
++    const auto candidates = idCandidatesFor(QString::fromLatin1(id));
++    for (const QString &candidate : candidates) {
++        const auto it = m_modules.constFind(candidate);
++        if (it != m_modules.cend()) {
++            return it.value();
++        }
++    }
++    if (orApp) {
++        return m_modules.value(QString::fromLatin1(orApp));
++    }
++    return {};
++}
++
++MenuItem *Builder::categoryItem(const QString &id)
++{
++    if (MenuItem *item = m_categories.value(id)) {
++        return item;
++    }
++    int order = 0;
++    for (const auto &category : SettingsLayout::categories) {
++        ++order;
++        if (id != QLatin1String(category.id)) {
++            continue;
++        }
++        MenuItem *group = m_groups.value(QString::fromLatin1(category.group));
++        if (!group) {
++            break;
++        }
++        auto item = new MenuItem(true, group);
++        item->setLayoutCategory(id, translated(category.name), QString::fromLatin1(category.icon), translated(category.description), order);
++        m_categories.insert(id, item);
++        return item;
++    }
++    return nullptr;
++}
++
++MenuItem *Builder::addPage(MenuItem *category, const KPluginMetaData &module, const SettingsLayout::Page *layout, int order)
++{
++    auto item = new MenuItem(false, category);
++    item->setMetaData(module);
++    item->setOrder(order);
++    item->addKeywords({category->name()});
++    if (layout) {
++        item->setNameOverride(translated(layout->name), translated(layout->description));
++        item->addKeywords(splitKeywords(layout->keywords));
++    }
++    item->setBreadcrumb(category->name());
++    item->setHiddenInSidebar(contains(SettingsLayout::hiddenButSearchable, module.pluginId()));
++    m_placed.insert(module.pluginId());
++    return item;
++}
++
++void Builder::addListedPages()
++{
++    for (const auto &category : SettingsLayout::categories) {
++        int order = 0;
++        for (const auto &page : std::span(category.pages, category.pageCount)) {
++            ++order;
++            const KPluginMetaData module = findModule(page.kcm, page.orApp);
++            if (!module.isValid() || m_placed.contains(module.pluginId())) {
++                continue;
++            }
++            // A category exists only once it has a page, so empty ones never show up
++            if (MenuItem *item = categoryItem(QString::fromLatin1(category.id))) {
++                addPage(item, module, &page, order);
++            }
++        }
++    }
++}
++
++void Builder::addTechnicalDetails()
++{
++    // The details are listed after the pages of the category that has the About page
++    MenuItem *category = nullptr;
++    QString aboutName;
++    const QStringList aboutIds = idCandidatesFor(QString::fromLatin1(SettingsLayout::detailsParent));
++    for (MenuItem *candidate : std::as_const(m_categories)) {
++        for (MenuItem *child : std::as_const(candidate->children())) {
++            if (child->isLibrary() && aboutIds.contains(child->metaData().pluginId())) {
++                category = candidate;
++                aboutName = child->name();
++            }
++        }
++    }
++
++    int order = fallbackOrder;
++    for (const auto &page : std::span(SettingsLayout::detailsPages)) {
++        const KPluginMetaData module = findModule(page.kcm);
++        if (!module.isValid() || m_placed.contains(module.pluginId())) {
++            continue;
++        }
++        if (!category) {
++            category = categoryItem(u"system"_s);
++        }
++        if (!category) {
++            return;
++        }
++        const QString detailsName = translated(SettingsLayout::detailsName);
++        MenuItem *item = addPage(category, module, &page, ++order);
++        item->setHiddenInSidebar(true);
++        item->addKeywords({detailsName, aboutName});
++        QString path = category->name();
++        if (!aboutName.isEmpty()) {
++            path = joinBreadcrumb(path, aboutName);
++        }
++        item->setBreadcrumb(joinBreadcrumb(path, detailsName));
++    }
++}
++
++QString Builder::fallbackCategory(const KPluginMetaData &module) const
++{
++    // The parent of each old category, to walk up when the page's own category is not in the table
++    QHash<QString, QString> parentOf;
++    for (const QString &file : m_categoryFiles) {
++        const KDesktopFile desktopFile(file);
++        const KConfigGroup group = desktopFile.desktopGroup();
++        QString parent = group.readEntry("X-KDE-System-Settings-Parent-Category-V2");
++        if (parent.isEmpty()) {
++            parent = group.readEntry("X-KDE-System-Settings-Parent-Category");
++        }
++        parentOf.insert(group.readEntry("X-KDE-System-Settings-Category"), parent);
++    }
++
++    const QStringList starts = {module.value(u"X-KDE-System-Settings-Parent-Category-V2"_s), module.value(u"X-KDE-System-Settings-Parent-Category"_s)};
++    for (const QString &start : starts) {
++        QString old = start;
++        for (int depth = 0; !old.isEmpty() && depth < 10; ++depth) {
++            for (const auto &entry : SettingsLayout::fallback) {
++                if (old == QLatin1String(entry.oldCategory)) {
++                    return QString::fromLatin1(entry.category);
++                }
++            }
++            old = parentOf.value(old);
++        }
++    }
++    for (const auto &entry : SettingsLayout::fallback) {
++        if (QLatin1String(entry.oldCategory).isEmpty()) {
++            return QString::fromLatin1(entry.category);
++        }
++    }
++    return u"system"_s;
++}
++
++void Builder::addUnlistedPages()
++{
++    // The same order as the KCM list, so the result does not depend on hash order
++    QList<KPluginMetaData> unplaced;
++    for (const auto &module : std::as_const(m_modules)) {
++        if (!m_placed.contains(module.pluginId())) {
++            unplaced << module;
++        }
++    }
++    std::sort(unplaced.begin(), unplaced.end(), [](const KPluginMetaData &a, const KPluginMetaData &b) {
++        return QString::compare(a.pluginId(), b.pluginId(), Qt::CaseInsensitive) < 0;
++    });
++
++    for (const auto &module : std::as_const(unplaced)) {
++        MenuItem *category = categoryItem(fallbackCategory(module));
++        if (!category) {
++            category = categoryItem(u"system"_s);
++        }
++        if (!category) {
++            qCWarning(SYSTEMSETTINGS_APP_LOG) << "No category for" << module.pluginId();
++            continue;
++        }
++        qCDebug(SYSTEMSETTINGS_APP_LOG) << "Page" << module.pluginId() << "is not in the layout, put in" << category->layoutCategoryId();
++        addPage(category, module, nullptr, fallbackOrder + module.value(u"X-KDE-Weight"_s, 100));
++    }
++}
++
++MenuItem *Builder::build()
++{
++    // The home page has a nameless group of its own, so it is the first row of the sidebar
++    auto homeGroup = new MenuItem(true, m_root);
++    homeGroup->setLayoutCategory(QString(), QString(), QString(), QString(), 0, true);
++    MenuItem *home = nullptr;
++    const KPluginMetaData homeModule = findModule(SettingsLayout::homePage);
++    if (homeModule.isValid()) {
++        home = new MenuItem(false, homeGroup);
++        home->setMetaData(homeModule);
++        home->setHiddenInSearch(true);
++        m_placed.insert(homeModule.pluginId());
++    }
++
++    int order = 0;
++    for (const auto &group : SettingsLayout::groups) {
++        auto item = new MenuItem(true, m_root);
++        item->setLayoutCategory(QString(), translated(group.name), QString(), QString(), ++order);
++        m_groups.insert(QString::fromLatin1(group.id), item);
++    }
++
++    addListedPages();
++    addTechnicalDetails();
++    addUnlistedPages();
++
++    sortTree(m_root);
++    return home;
++}
++
++} // namespace
++
++QStringList SettingsLayoutTree::idCandidates(const QString &id)
++{
++    return idCandidatesFor(id);
++}
++
++MenuItem *SettingsLayoutTree::build(MenuItem *root, const QList<KPluginMetaData> &modules, const QStringList &categoryFiles)
++{
++    return Builder(root, modules, categoryFiles).build();
++}
+diff --git a/app/SettingsLayoutTree.h b/app/SettingsLayoutTree.h
+new file mode 100644
+index 0000000..26e3426
+--- /dev/null
++++ b/app/SettingsLayoutTree.h
+@@ -0,0 +1,39 @@
++/*
++ * SPDX-FileCopyrightText: 2026 KDE Settings Redesign contributors
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#pragma once
++
++#include <KPluginMetaData>
++
++#include <QList>
++#include <QStringList>
++
++class MenuItem;
++
++/**
++ * Builds the System Settings menu tree from the fixed layout in settingslayout_p.h
++ * instead of the category .desktop files.
++ *
++ * The tree is: root -> groups (sidebar sections) -> categories -> pages. The home page sits in an unnamed group
++ * of its own, before the other groups. Order is the order of the layout, not X-KDE-Weight.
++ */
++namespace SettingsLayoutTree
++{
++
++/**
++ * @param root An empty root item
++ * @param modules All pages found on this system
++ * @param categoryFiles The category .desktop files, used to place pages the layout does not list
++ * @return The home page item, or nullptr if it is not installed
++ */
++MenuItem *build(MenuItem *root, const QList<KPluginMetaData> &modules, const QStringList &categoryFiles);
++
++/**
++ * @return all ids a page may be installed under: @p id itself and the ids it is an alias of or has as an alias
++ */
++QStringList idCandidates(const QString &id);
++
++}

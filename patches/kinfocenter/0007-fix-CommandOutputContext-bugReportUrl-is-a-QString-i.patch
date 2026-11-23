@@ -1,0 +1,25 @@
+From 60723f7a3568d7022172539925a320f5ca89f2f6 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 01:57:28 +0500
+Subject: [PATCH 7/9] fix: CommandOutputContext bugReportUrl is a QString in
+ KOSRelease
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ src/CommandOutputContext.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/CommandOutputContext.cpp b/src/CommandOutputContext.cpp
+index c74fd43..35955af 100644
+--- a/src/CommandOutputContext.cpp
++++ b/src/CommandOutputContext.cpp
+@@ -79,7 +79,7 @@ CommandOutputContext::CommandOutputContext(QObject *parent)
+ QUrl CommandOutputContext::bugReportUrl() const
+ {
+     if (!m_bugReportUrlRead) {
+-        m_bugReportUrl = KOSRelease().bugReportUrl();
++        m_bugReportUrl = QUrl(KOSRelease().bugReportUrl());
+         m_bugReportUrlRead = true;
+     }
+     return m_bugReportUrl;

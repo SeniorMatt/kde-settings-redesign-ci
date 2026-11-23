@@ -1,0 +1,72 @@
+From 56095d1135b56dee5e5ae29bdfe71b983e80a0ad Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 13:22:26 +0500
+Subject: [PATCH 05/31] kcm_workspace: cap hint label width so the form keeps
+ two columns
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/workspaceoptions/ui/main.qml | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/kcms/workspaceoptions/ui/main.qml b/kcms/workspaceoptions/ui/main.qml
+index a826b3f..5dd6344 100644
+--- a/kcms/workspaceoptions/ui/main.qml
++++ b/kcms/workspaceoptions/ui/main.qml
+@@ -64,6 +64,7 @@ KCM.SimpleKCM {
+         }
+ 
+         QQC2.Label {
++            Layout.maximumWidth: Kirigami.Units.gridUnit * 16
+             Layout.fillWidth: true
+             Layout.leftMargin: Kirigami.Units.gridUnit
+             text: doubleClick.Accessible.description
+@@ -88,6 +89,7 @@ KCM.SimpleKCM {
+         }
+ 
+         QQC2.Label {
++            Layout.maximumWidth: Kirigami.Units.gridUnit * 16
+             Layout.fillWidth: true
+             Layout.leftMargin: Kirigami.Units.gridUnit
+             text: singleClick.Accessible.description
+@@ -144,6 +146,7 @@ KCM.SimpleKCM {
+                 spacing: Kirigami.Units.smallSpacing
+ 
+                 QQC2.Label {
++                    Layout.maximumWidth: Kirigami.Units.gridUnit * 16
+                     Layout.fillWidth: true
+                     Layout.preferredWidth: Kirigami.Units.gridUnit * 16
+                     text: i18nc("Test double-click speed", "Double-click the folder to test. If it does not change its appearance, increase double-click interval.")
+@@ -240,6 +243,7 @@ KCM.SimpleKCM {
+         }
+ 
+         QQC2.Label {
++            Layout.maximumWidth: Kirigami.Units.gridUnit * 16
+             Layout.fillWidth: true
+             Layout.leftMargin: Kirigami.Units.gridUnit
+             text: scrollbarLeftClickNavigatesByPage.Accessible.description
+@@ -353,6 +357,7 @@ KCM.SimpleKCM {
+         }
+ 
+         QQC2.Label {
++            Layout.maximumWidth: Kirigami.Units.gridUnit * 16
+             Layout.fillWidth: true
+             Layout.leftMargin: Kirigami.Units.gridUnit
+             text: dndBehaviorAsk.Accessible.description
+@@ -377,6 +382,7 @@ KCM.SimpleKCM {
+         }
+ 
+         QQC2.Label {
++            Layout.maximumWidth: Kirigami.Units.gridUnit * 16
+             Layout.fillWidth: true
+             Layout.leftMargin: Kirigami.Units.gridUnit
+             text: dndBehaviorMove.Accessible.description
+@@ -460,6 +466,7 @@ KCM.SimpleKCM {
+         }
+ 
+         QQC2.Label {
++            Layout.maximumWidth: Kirigami.Units.gridUnit * 16
+             Layout.fillWidth: true
+             Layout.leftMargin: Kirigami.Units.gridUnit
+             visible: KWindowSystem.isPlatformWayland
