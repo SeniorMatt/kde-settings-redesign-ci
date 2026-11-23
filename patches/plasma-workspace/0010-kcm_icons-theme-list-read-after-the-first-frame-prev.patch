@@ -1,7 +1,7 @@
 From d1dc7e15498f30cb65553abd31c96653fcc04996 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 14:20:11 +0500
-Subject: [PATCH 10/24] kcm_icons: theme list read after the first frame,
+Subject: [PATCH 10/25] kcm_icons: theme list read after the first frame,
  previews staggered, empty and busy states
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

@@ -1,7 +1,7 @@
 From 7cba57c79fb12485cee9576330bf240ed729faeb Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 23:43:39 +0500
-Subject: [PATCH 19/24] fix(kcm_colors): keep the grid at the top unless the
+Subject: [PATCH 19/25] fix(kcm_colors): keep the grid at the top unless the
  selected scheme is mostly below the first screen, not built yet
 
 CI shot (build/ci-shots/shots/kcm_colors.png): 34555dd still ended with the first row cut off. The selected scheme was in row 2

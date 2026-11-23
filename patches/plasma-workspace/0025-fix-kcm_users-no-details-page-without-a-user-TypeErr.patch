@@ -1,0 +1,57 @@
+From 0f77a7dbdeafac343707dd72e017d154ba791e8f Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 17:10:37 +0500
+Subject: [PATCH 25/25] fix(kcm_users): no details page without a user
+ (TypeErrors in UserDetailsPage)
+
+Cause: getCurrentUser() returns null when no listed account is the logged-in
+one (and the page was pushed regardless), so ~20 bindings read properties of
+null. Now the page is pushed with the current user, else the first listed
+user, else not at all. Not built yet; Avatar.qml:72 'double to QSizeF' is in
+Kirigami's template, not from our code.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/users/src/ui/main.qml | 17 +++++++++++++++--
+ 1 file changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/kcms/users/src/ui/main.qml b/kcms/users/src/ui/main.qml
+index 4e8d04f..55399d0 100644
+--- a/kcms/users/src/ui/main.qml
++++ b/kcms/users/src/ui/main.qml
+@@ -73,11 +73,21 @@ KCM.ScrollViewKCM {
+ 
+     // The accounts are listed asynchronously (kcm.userModel.loaded); the list and the user page appear when they are read.
+     property bool detailsPushed: false
++    // The logged-in user, or the first listed one when none matches (getCurrentUser() is null then);
++    // the details page must never be created without a user.
++    function startUser() {
++        return kcm.userModel.getCurrentUser()
++            ?? kcm.userModel.data(kcm.userModel.index(0, 0), UsersKCM.UserModel.UserRole) ?? null;
++    }
+     function pushFirstDetailsPage() {
+         if (!Kirigami.Settings.isMobile && !detailsPushed && kcm.userModel.loaded) {
++            const user = startUser();
++            if (!user) {
++                return;
++            }
+             detailsPushed = true;
+             // Push users page on desktop for two pane layout
+-            kcm.push("UserDetailsPage.qml", { user: kcm.userModel.getCurrentUser() })
++            kcm.push("UserDetailsPage.qml", { user })
+         }
+     }
+ 
+@@ -114,7 +124,10 @@ KCM.ScrollViewKCM {
+         // This can be used to pop KCM stack in downstream KCM
+         if (!Kirigami.Settings.isMobile) {
+             kcm.pop()
+-            kcm.push("UserDetailsPage.qml", { user: kcm.userModel.getCurrentUser() })
++            const user = startUser();
++            if (user) {
++                kcm.push("UserDetailsPage.qml", { user })
++            }
+         }
+     }
+ 

@@ -1,7 +1,7 @@
 From 06c56e352c99924ca6132a8aac9766b8aa0873ea Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 14:24:31 +0500
-Subject: [PATCH 09/31] kcm_touchpad: skip the duplicate blocking device read
+Subject: [PATCH 09/32] kcm_touchpad: skip the duplicate blocking device read
  on the first load; page layout kept
 
 Page type: Form (one Kirigami.Form per device, Device selector shown only with 2+ touchpads, rows hidden for hardware the

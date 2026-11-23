@@ -1,7 +1,7 @@
 From 81ca7ef8d12ee8fd5207d434aaa5b8ba35276d5a Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sun, 22 Nov 2026 02:19:48 +0500
-Subject: [PATCH 19/31] kcm_touchscreen: Device page as one form, device picker
+Subject: [PATCH 19/32] kcm_touchscreen: Device page as one form, device picker
  only when there is a choice, display mapping explained
 
 Page type: Device with a single device in practice, kept as one Form (docs/page-design.md). Kcm API, KWinDevices model,

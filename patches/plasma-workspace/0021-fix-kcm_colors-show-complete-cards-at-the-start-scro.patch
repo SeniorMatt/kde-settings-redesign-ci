@@ -1,7 +1,7 @@
 From 3c01b43d032d585f5b71016f52aab1bf02204a09 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sun, 22 Nov 2026 00:30:32 +0500
-Subject: [PATCH 21/24] fix(kcm_colors): show complete cards at the start:
+Subject: [PATCH 21/25] fix(kcm_colors): show complete cards at the start:
  scroll once when the selected card is not fully inside the first screen, not
  built yet
 

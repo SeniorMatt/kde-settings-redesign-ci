@@ -1,7 +1,7 @@
 From 3dada20146cda20da6caa8cb8e962b3c151c6d88 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 14:00:53 +0500
-Subject: [PATCH 07/31] kcm_access: area list with one Form page per area;
+Subject: [PATCH 07/32] kcm_access: area list with one Form page per area;
  screen-reader D-Bus calls cached and async
 
 Page type: List (main) + Form (each area), docs/page-design.md. kaccessrc/kwinrc keys, KWin effect calls, kded

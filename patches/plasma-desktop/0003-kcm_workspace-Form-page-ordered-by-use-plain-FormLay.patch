@@ -1,7 +1,7 @@
 From 5caae06dcfe57ae6a497397de98b91f406ee3c64 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 10:49:47 +0500
-Subject: [PATCH 03/31] kcm_workspace: Form page ordered by use, plain
+Subject: [PATCH 03/32] kcm_workspace: Form page ordered by use, plain
  FormLayout instead of Kirigami.Form
 
 Page type: Form (docs/page-design.md). Config keys, kcfg files, D-Bus signals and behaviour are unchanged.

@@ -1,7 +1,7 @@
 From a26f505e7094de01d6ec422b5cdef721c0410c6e Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 14:11:06 +0500
-Subject: [PATCH 07/24] kcm_nightlight: state line first, mode as three
+Subject: [PATCH 07/25] kcm_nightlight: state line first, mode as three
  options, schedule and preview built after the first frame
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

@@ -1,7 +1,7 @@
 From bae85da3491cba62fdc08f789d18669474e40f78 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sun, 22 Nov 2026 02:07:53 +0500
-Subject: [PATCH 16/31] kcm_smserver: Ignored applications as its own form row
+Subject: [PATCH 16/32] kcm_smserver: Ignored applications as its own form row
  so the form stays in wide mode
 
 The indented Label+TextField row was the widest form item; at the System Settings page width it pushed

@@ -1,7 +1,7 @@
 From 042a1152cdc6a0e0a4a2bc050e08eaac90349437 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Mon, 23 Nov 2026 15:06:00 +0500
-Subject: [PATCH 29/31] kcm_mouse: "No mouse found" placeholder, null-safe
+Subject: [PATCH 29/32] kcm_mouse: "No mouse found" placeholder, null-safe
  backend access, scrolling as its own section
 
 Page type: Device/Form (Kirigami.Form). Same section names and wording as the reworked kcm_touchpad: General, Left and

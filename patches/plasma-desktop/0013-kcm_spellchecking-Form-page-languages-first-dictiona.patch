@@ -1,7 +1,7 @@
 From 4a44bdb269eaee890e1df1e983d5d5e7a4c81cfb Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sun, 22 Nov 2026 01:30:35 +0500
-Subject: [PATCH 13/31] kcm_spellchecking: Form page, languages first,
+Subject: [PATCH 13/32] kcm_spellchecking: Form page, languages first,
  dictionary model bound after the first frame
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

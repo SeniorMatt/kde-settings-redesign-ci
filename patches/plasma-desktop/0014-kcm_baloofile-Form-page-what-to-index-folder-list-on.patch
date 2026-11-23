@@ -1,7 +1,7 @@
 From 6a4a558e218563167f70a34a7884cf04f82112e4 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sun, 22 Nov 2026 01:31:47 +0500
-Subject: [PATCH 14/31] kcm_baloofile: Form page (what to index), folder list
+Subject: [PATCH 14/32] kcm_baloofile: Form page (what to index), folder list
  on a Locations sub-page, indexer state loaded after the first frame
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

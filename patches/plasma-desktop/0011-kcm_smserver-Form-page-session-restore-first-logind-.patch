@@ -1,7 +1,7 @@
 From 06cf7d3311cd11393f587846ddd6af3b619cbd56 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sun, 22 Nov 2026 01:29:31 +0500
-Subject: [PATCH 11/31] kcm_smserver: Form page, session restore first, logind
+Subject: [PATCH 11/32] kcm_smserver: Form page, session restore first, logind
  questions asynchronous
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

@@ -1,7 +1,7 @@
 From cf609d24cf62bdd1d49f432730c716f7d99b5e36 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 14:04:16 +0500
-Subject: [PATCH 05/24] kcm_lookandfeel: theme list read in batches after the
+Subject: [PATCH 05/25] kcm_lookandfeel: theme list read in batches after the
  first frame, Apply dialog built on first use, Day/Night as a Form
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

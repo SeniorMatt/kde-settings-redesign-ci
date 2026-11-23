@@ -1,7 +1,7 @@
 From 0dd0c506c9833804628c6860384f547fd9aacee4 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 11:06:19 +0500
-Subject: [PATCH 01/24] kcm_fonts: fonts first, text rendering section,
+Subject: [PATCH 01/25] kcm_fonts: fonts first, text rendering section,
  previews only when asked
 
 Page type: Form (docs/page-design.md). Config keys, KConfigXT, D-Bus and behaviour unchanged.

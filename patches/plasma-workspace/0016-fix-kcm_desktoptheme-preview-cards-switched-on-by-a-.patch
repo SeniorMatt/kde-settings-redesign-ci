@@ -1,7 +1,7 @@
 From 7c4a1a22e4417c1e2e6816f6d2bc6e295c3497f6 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 19:04:31 +0500
-Subject: [PATCH 16/24] fix(kcm_desktoptheme): preview cards switched on by a
+Subject: [PATCH 16/25] fix(kcm_desktoptheme): preview cards switched on by a
  per-card Timer instead of an asynchronous Loader (page hang), not built yet
 
 Opening the page hung systemsettings in the first headless run. Static reading of 1fbed45 found no binding loop in

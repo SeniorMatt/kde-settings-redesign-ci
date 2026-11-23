@@ -1,7 +1,7 @@
 From a5447aa81f9d5f99f3d96aff005df239e59648e7 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sun, 22 Nov 2026 01:33:13 +0500
-Subject: [PATCH 15/31] kcm_recentFiles: what to remember first, History
+Subject: [PATCH 15/32] kcm_recentFiles: what to remember first, History
  section last; application list and QML engine started after the first frame
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

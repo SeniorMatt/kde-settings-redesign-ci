@@ -1,7 +1,7 @@
 From 1fbed45a2abcdd2a0669e2690f4dd88959c375df Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 14:20:40 +0500
-Subject: [PATCH 11/24] kcm_desktoptheme: theme list read after the first
+Subject: [PATCH 11/25] kcm_desktoptheme: theme list read after the first
  frame, previews built one card at a time, empty and busy states
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

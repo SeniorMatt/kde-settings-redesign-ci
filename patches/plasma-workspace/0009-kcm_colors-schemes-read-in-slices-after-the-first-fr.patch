@@ -1,7 +1,7 @@
 From 737b84cdfd2fb49a0ee0bec124983100fe529f9f Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 14:14:44 +0500
-Subject: [PATCH 09/24] kcm_colors: schemes read in slices after the first
+Subject: [PATCH 09/25] kcm_colors: schemes read in slices after the first
  frame, accent color labelled, colour dialog built on use
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

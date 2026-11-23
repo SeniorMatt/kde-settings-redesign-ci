@@ -1,7 +1,7 @@
 From 61fbe26849b1b2c09549e70a574b2600fc676395 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sun, 22 Nov 2026 02:14:51 +0500
-Subject: [PATCH 18/31] kcm_recentFiles: ExcludedApplicationView tolerates a
+Subject: [PATCH 18/32] kcm_recentFiles: ExcludedApplicationView tolerates a
  missing applicationModel
 
 'Cannot read property enabled of null' was logged when the view was created or destroyed without the context property

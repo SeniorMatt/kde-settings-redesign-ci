@@ -1,0 +1,27 @@
+From 2dd6393f773930423c3d15b6c6e6b598ace8dc15 Mon Sep 17 00:00:00 2001
+From: Senior Matthew <SeniorMatt@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 16:06:42 +0500
+Subject: [PATCH 32/32] kcm_mouse: no 'No pointer device found' header over the
+ 'No mouse found' placeholder
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X5N5x9eWzmrq6QYrYLwQnk
+---
+ kcms/mouse/kcm.cpp | 4 +---
+ 1 file changed, 1 insertion(+), 3 deletions(-)
+
+diff --git a/kcms/mouse/kcm.cpp b/kcms/mouse/kcm.cpp
+index 58c3d98..d61fa9e 100644
+--- a/kcms/mouse/kcm.cpp
++++ b/kcms/mouse/kcm.cpp
+@@ -111,9 +111,7 @@ void KCMMouse::load()
+     if (!m_inputBackend->load()) {
+         setSaveLoadMessage(Message::error(i18n("Error while loading values. See logs for more information. Please restart this configuration module.")));
+     }
+-    if (!m_inputBackend->deviceCount()) {
+-        setHotplugMessage(Message::information(i18n("No pointer device found. Connect now.")));
+-    }
++    // no device: the page's "No mouse found" placeholder says it; a header message on top would repeat it
+     setNeedsSave(false);
+ }
+ 

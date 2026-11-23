@@ -1,7 +1,7 @@
 From 6af5626f6f6c34b4691674902ea84b25add1600b Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sun, 22 Nov 2026 01:27:59 +0500
-Subject: [PATCH 22/24] kcm_soundtheme: theme list built after the first frame,
+Subject: [PATCH 22/25] kcm_soundtheme: theme list built after the first frame,
  link to per-event sounds
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

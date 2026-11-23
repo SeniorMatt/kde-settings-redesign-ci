@@ -1,7 +1,7 @@
 From 56095d1135b56dee5e5ae29bdfe71b983e80a0ad Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 13:22:26 +0500
-Subject: [PATCH 05/31] kcm_workspace: cap hint label width so the form keeps
+Subject: [PATCH 05/32] kcm_workspace: cap hint label width so the form keeps
  two columns
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

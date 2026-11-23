@@ -1,7 +1,7 @@
 From 4babbe40d79633ce2d44a9dc6159805184ba7b41 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sun, 22 Nov 2026 01:33:25 +0500
-Subject: [PATCH 24/24] kcm_regionandlang: Form page (Language, Formats, Paper
+Subject: [PATCH 24/25] kcm_regionandlang: Form page (Language, Formats, Paper
  and Contacts), pickers as pushed sub-pages
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

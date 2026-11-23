@@ -1,7 +1,7 @@
 From 34555dd0fdabb0ea2d09c01fb8915b0a82fe5d59 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 19:05:38 +0500
-Subject: [PATCH 18/24] fix(kcm_colors): position the scheme grid once after
+Subject: [PATCH 18/25] fix(kcm_colors): position the scheme grid once after
  the async fill (first row was cut off), not built yet
 
 Cause: GridViewInternal.qml onCurrentIndexChanged calls positionViewAtIndex(currentIndex, Contain); with the deferred fill the

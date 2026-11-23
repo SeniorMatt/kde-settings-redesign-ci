@@ -1,7 +1,7 @@
 From 4298b127c364151e7d956d03041116ed1730f551 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Mon, 23 Nov 2026 15:08:22 +0500
-Subject: [PATCH 31/31] kcm_krunnersettings: Form page with Position first,
+Subject: [PATCH 31/32] kcm_krunnersettings: Form page with Position first,
  History and Search Plugins sections
 
 Page type: Form (FormLayout, as the sibling kcm_plasmasearch page). Position on screen stays first (unlabelled-section rule);

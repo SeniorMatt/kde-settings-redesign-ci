@@ -1,7 +1,7 @@
 From 9b0448905f6923bb9201ff3ac2f946fc90db9d68 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 14:25:08 +0500
-Subject: [PATCH 14/24] kcm_users: accounts and fingerprint device read
+Subject: [PATCH 14/25] kcm_users: accounts and fingerprint device read
  asynchronously, avatar scan on first use
 
 Page type: List with a per-user Form page (docs/page-design.md section 1, Device-like). The existing two-pane layout

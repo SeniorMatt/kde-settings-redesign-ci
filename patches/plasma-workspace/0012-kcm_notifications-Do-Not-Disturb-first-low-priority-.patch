@@ -1,7 +1,7 @@
 From 3b8269f9c0f6568d092cd616b008bc6c63af86b9 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 14:22:01 +0500
-Subject: [PATCH 12/24] kcm_notifications: Do Not Disturb first, low priority
+Subject: [PATCH 12/25] kcm_notifications: Do Not Disturb first, low priority
  in its own section, application lists read after the first frame
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

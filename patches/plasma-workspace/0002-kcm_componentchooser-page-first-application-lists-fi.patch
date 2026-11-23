@@ -1,7 +1,7 @@
 From f857ce0c275975d30613b898a0e931d20f10c6b6 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 11:07:46 +0500
-Subject: [PATCH 02/24] kcm_componentchooser: page first, application lists
+Subject: [PATCH 02/25] kcm_componentchooser: page first, application lists
  filled afterwards
 
 Page type: Form (docs/page-design.md). mimeapps.list writes, terminal kcfg keys, KLauncher call and behaviour

@@ -1,7 +1,7 @@
 From 35b6a58a138c489e7b632987ec930bbb2f324a55 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 23:48:16 +0500
-Subject: [PATCH 20/24] fix(kcm_users): async account list never finished
+Subject: [PATCH 20/25] fix(kcm_users): async account list never finished
  without a system bus (page stuck on the busy indicator)
 
 With no system D-Bus (headless CI, containers) ListCachedUsers()/GetAll() return an already-failed pending call whose watcher

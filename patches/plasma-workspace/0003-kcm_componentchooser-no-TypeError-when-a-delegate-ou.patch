@@ -1,7 +1,7 @@
 From 3b71f530064f4583ee888d1ab551ef3f0fc5717d Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 13:22:28 +0500
-Subject: [PATCH 03/24] kcm_componentchooser: no TypeError when a delegate
+Subject: [PATCH 03/25] kcm_componentchooser: no TypeError when a delegate
  outlives its view
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

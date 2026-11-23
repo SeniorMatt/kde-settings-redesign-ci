@@ -1,7 +1,7 @@
 From a7eb6c43e04a58fc6b3d391a5894b0239ca4ba07 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sun, 22 Nov 2026 02:07:53 +0500
-Subject: [PATCH 17/31] kcm_baloofile: no Pause button while baloo_file is not
+Subject: [PATCH 17/32] kcm_baloofile: no Pause button while baloo_file is not
  running; offer Start Indexer
 
 Monitor.toggleSuspendState needs the running baloo_file; with balooRunning false the state line also drops

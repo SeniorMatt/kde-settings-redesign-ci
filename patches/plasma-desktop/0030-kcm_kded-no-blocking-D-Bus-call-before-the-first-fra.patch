@@ -1,7 +1,7 @@
 From e54ed5e589339774358a7a88d7584976acf657d6 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Mon, 23 Nov 2026 15:06:49 +0500
-Subject: [PATCH 30/31] kcm_kded: no blocking D-Bus call before the first
+Subject: [PATCH 30/32] kcm_kded: no blocking D-Bus call before the first
  frame; module scan after it; empty-search message
 
 Page type: List (search + filter, then Startup / Load-on-Demand sections), unchanged structure and wording, so no relabel rows.

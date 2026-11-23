@@ -1,7 +1,7 @@
 From c0a6e3f01d3cf2b86cf8d47567b8a4c41450b790 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 14:27:47 +0500
-Subject: [PATCH 15/24] kcm_feedback: one Form, data-source programs started
+Subject: [PATCH 15/25] kcm_feedback: one Form, data-source programs started
  one by one after the first frame, Provider read once
 
 Page type: Form (docs/page-design.md). KUserFeedback settings (Global/FeedbackLevel), audit links and the

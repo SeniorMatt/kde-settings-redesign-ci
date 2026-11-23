@@ -1,7 +1,7 @@
 From e583ab6cc23152dd9e9be9bfdd035a5abc178bc3 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sun, 22 Nov 2026 02:25:00 +0500
-Subject: [PATCH 24/31] kcm_tablet: Device page with Display, Pen and Pad as
+Subject: [PATCH 24/32] kcm_tablet: Device page with Display, Pen and Pad as
  sub-pages instead of a tab bar; tablet events created after the first frame
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

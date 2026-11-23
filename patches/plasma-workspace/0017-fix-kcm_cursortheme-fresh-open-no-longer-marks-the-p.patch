@@ -1,7 +1,7 @@
 From c51426d0785e2ec37cf5ce0bf090cdd24fbd7473 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 19:05:25 +0500
-Subject: [PATCH 17/24] fix(kcm_cursortheme): fresh open no longer marks the
+Subject: [PATCH 17/25] fix(kcm_cursortheme): fresh open no longer marks the
  page changed (settle after the deferred fill), not built yet
 
 Cause: loadThemes() cleared needsSave right after updateSizeComboBox(), but assigning the model to the grid in the same turn

@@ -1,7 +1,7 @@
 From dcc6edeb38eaffaa3574ce0e577c20db66615031 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sun, 22 Nov 2026 02:23:37 +0500
-Subject: [PATCH 23/31] kcm_tablet: do not use the tablet protocol object when
+Subject: [PATCH 23/32] kcm_tablet: do not use the tablet protocol object when
  the compositor lacks zwp_tablet_manager_v2
 
 TabletEvents::TabletEvents called get_tablet_seat on a TabletManager that was never bound (weston and other compositors without

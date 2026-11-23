@@ -1,7 +1,7 @@
 From dd9a8ffaab45fdee85c3e88e31382dad29d4768f Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sun, 22 Nov 2026 02:22:32 +0500
-Subject: [PATCH 22/31] kcm_device_automounter: QtWidgets form reordered
+Subject: [PATCH 22/32] kcm_device_automounter: QtWidgets form reordered
  (option first, device list under a title), clearer column names, device list
  loaded after the first frame
 

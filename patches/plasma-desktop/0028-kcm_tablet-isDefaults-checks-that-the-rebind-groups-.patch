@@ -1,7 +1,7 @@
 From b4440fd23733e9afcf3fce01f0e09439bc637d08 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sun, 22 Nov 2026 04:29:29 +0500
-Subject: [PATCH 28/31] kcm_tablet: isDefaults checks that the rebind groups
+Subject: [PATCH 28/32] kcm_tablet: isDefaults checks that the rebind groups
  exist (isValid() is true for any named group)
 
 So Defaults was never disabled.

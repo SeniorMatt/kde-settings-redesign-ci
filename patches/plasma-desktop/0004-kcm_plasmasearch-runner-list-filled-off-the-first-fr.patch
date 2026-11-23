@@ -1,7 +1,7 @@
 From 66c46a2c25487dcd42d765d7007d6a5ad5dd8e10 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 10:52:21 +0500
-Subject: [PATCH 04/31] kcm_plasmasearch: runner list filled off the first
+Subject: [PATCH 04/32] kcm_plasmasearch: runner list filled off the first
  frame (worker-thread scan, two-step model fill)
 
 Page type: List (docs/page-design.md). krunnerrc keys, plugin ids, favorites order, config dialogs and D-Bus

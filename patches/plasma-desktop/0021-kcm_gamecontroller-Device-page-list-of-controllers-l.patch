@@ -1,7 +1,7 @@
 From 64da666dae5c85a94b8c27692c57bcd2502e7b74 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sun, 22 Nov 2026 02:21:37 +0500
-Subject: [PATCH 21/31] kcm_gamecontroller: Device page, list of controllers,
+Subject: [PATCH 21/32] kcm_gamecontroller: Device page, list of controllers,
  live test view on its own sub-page
 
 Page type: Device (docs/page-design.md). C++ (DeviceModel, Device, models, kcm pluginEnabled kcfg) unchanged. Not built yet.

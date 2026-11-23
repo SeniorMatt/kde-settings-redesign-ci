@@ -1,7 +1,7 @@
 From 0f05eec385e762543e692017857f930287cf019e Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sun, 22 Nov 2026 02:54:31 +0500
-Subject: [PATCH 26/31] kcm_tablet: Defaults is disabled only when every pen
+Subject: [PATCH 26/32] kcm_tablet: Defaults is disabled only when every pen
  and pad is at defaults (and with no tablet)
 
 TabletsModel::isDefaults() used any_of with |=, so one device at defaults made the whole page count as

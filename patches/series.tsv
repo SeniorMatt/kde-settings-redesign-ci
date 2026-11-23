@@ -13,7 +13,7 @@ kscreenlocker	plasma/kscreenlocker	c5d125c820f248a9d2346ae0692ecde56e51a3e7	ksr-
 kup	system/kup	27ed72e784475b01fb5552108a3b164891103626	ksr-pages	2
 kwalletmanager	utilities/kwalletmanager	e5963ae565c7494fecf94d6803ef35b7a9239f7f	ksr-pages	1
 kwin	plasma/kwin	6145dc66cfb1d05de4695030230ec8ae299d9e19	ksr-pages	12
-plasma-desktop	plasma/plasma-desktop	07bdbbd67b548fc703e26131899007dfeceb2593	ksr-pages	31
+plasma-desktop	plasma/plasma-desktop	07bdbbd67b548fc703e26131899007dfeceb2593	ksr-pages	32
 plasma-disks	plasma/plasma-disks	54bfe7ad89e72853a9d01eed445f34e78bd7bc0b	ksr-pages	1
 plasma-firewall	plasma/plasma-firewall	090c9d568f80d711d1653dcacec45a988643bb3f	ksr-pages	1
 plasma-keyboard	plasma/plasma-keyboard	948729373200d9e8e7142526ca6c76b0a87bdcd2	ksr-pages	1
@@ -21,7 +21,7 @@ plasma-login-manager	plasma/plasma-login-manager	ca714c373af75a91c54d447a4ef0eff
 plasma-nm	plasma/plasma-nm	366da03dc467e0fe5eacdcea06f6c71c2b8ccec6	ksr-pages	2
 plasma-pa	plasma/plasma-pa	13f5d86406d059697e049e98ada01f0a1c6ad3ec	ksr-pages	1
 plasma-thunderbolt	plasma/plasma-thunderbolt	d8a0acf305e56afc7c4a96bcf3727c8a95c3539c	ksr-pages	1
-plasma-workspace	plasma/plasma-workspace	6aa1cf7fa3b613db25595592e91a07a60c7c53e4	ksr-pages	24
+plasma-workspace	plasma/plasma-workspace	6aa1cf7fa3b613db25595592e91a07a60c7c53e4	ksr-pages	25
 plymouth-kcm	plasma/plymouth-kcm	77e9c085e0e0b1c9e1cb906922a0180e6d352c5f	ksr-pages	1
 powerdevil	plasma/powerdevil	cc2603b1553b505aa9cc57a0bbde93a51796119e	ksr-pages	1
 print-manager	utilities/print-manager	b93c7236f298040f5fc2b5268b1927b3a751dc4e	ksr-pages	1

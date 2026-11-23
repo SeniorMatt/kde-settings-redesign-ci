@@ -1,7 +1,7 @@
 From 88f088a62f020d251740bbf63c517d5c70110584 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 14:26:55 +0500
-Subject: [PATCH 10/31] kcm_splashscreen: theme packages read in batches after
+Subject: [PATCH 10/32] kcm_splashscreen: theme packages read in batches after
  the first frame, async previews, busy state
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

@@ -1,7 +1,7 @@
 From e93e7abc1a9c262ccf6d8ee895ad06f525be52f5 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 14:07:38 +0500
-Subject: [PATCH 06/24] kcm_nighttime: schedule first, map on a sub-page,
+Subject: [PATCH 06/25] kcm_nighttime: schedule first, map on a sub-page,
  position service created after the first frame
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

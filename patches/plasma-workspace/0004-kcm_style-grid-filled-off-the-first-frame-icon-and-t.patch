@@ -1,7 +1,7 @@
 From 163545ab36387d81ecfb80331d89003943b63500 Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 13:38:41 +0500
-Subject: [PATCH 04/24] kcm_style: grid filled off the first frame, icon and
+Subject: [PATCH 04/25] kcm_style: grid filled off the first frame, icon and
  toolbar options on a sub-page
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

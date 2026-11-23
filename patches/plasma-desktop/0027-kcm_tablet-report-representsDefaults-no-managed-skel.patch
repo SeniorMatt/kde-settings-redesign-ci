@@ -1,7 +1,7 @@
 From 32b09f1a4ba0badd8c9da18f9360952fa5822b2a Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sun, 22 Nov 2026 03:58:11 +0500
-Subject: [PATCH 27/31] kcm_tablet: report representsDefaults (no managed
+Subject: [PATCH 27/32] kcm_tablet: report representsDefaults (no managed
  skeleton does it), count 'sync with mouse' in isDefaults
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

@@ -1,7 +1,7 @@
 From 418e305778858e494cd39c7ff57ec1ebaf16efeb Mon Sep 17 00:00:00 2001
 From: Senior Matthew <SeniorMatt@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 14:12:53 +0500
-Subject: [PATCH 08/24] kcm_cursortheme: themes scanned after the first frame,
+Subject: [PATCH 08/25] kcm_cursortheme: themes scanned after the first frame,
  Launch Feedback on a sub-page
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
